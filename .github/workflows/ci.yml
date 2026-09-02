@@ -1,0 +1,25 @@
+# Runs in the PUBLIC mirror repo, where this file sits at the root. GitHub only
+# reads .github/ at a repository root, so this is inert in the monorepo the
+# directory is mirrored from.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: pre-build gate (ruff, mypy, pip-audit, pytest)
+        run: ./pre_build.sh
+
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: docker build
+        run: docker build -t mcp-browser .

@@ -1,0 +1,79 @@
+[project]
+name = "workspace-tool-browser"
+version = "0.1.0"
+description = "Toolspace sidecar (browser) — co-browsing agent POC: a shared server-side Chromium the agent and human co-drive"
+requires-python = ">=3.11"
+# Runtime deps. Mirror requirements.txt (the image installs that, not this).
+dependencies = [
+    "mcp>=1.2,<2",
+    "playwright>=1.40",
+    "uvicorn[standard]>=0.30",
+    "prometheus_client>=0.20",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",  # async MCP + WS handlers in tests
+    "pytest-cov>=5.0",
+    "ruff==0.15.17",  # pin exactly — formatter wrapping shifts between minors, must match CI
+    "mypy>=1.0",
+    "pip-audit>=2.7",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "S", "UP", "SIM", "RUF", "ASYNC", "PERF"]
+ignore = [
+    "E501",
+    "B008",
+    "S101",
+    "SIM108",
+    "UP042",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S105", "S106", "S108", "S603", "S607"]
+
+[tool.mypy]
+python_version = "3.11"
+files = ["src"]
+disallow_untyped_defs = false
+check_untyped_defs = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+warn_unreachable = true
+
+# Playwright ships type hints but the dev venv may not always install its
+# Chromium payload; ignore missing-stub noise from the driver import.
+[[tool.mypy.overrides]]
+module = ["playwright.*", "uvicorn.*"]
+ignore_missing_imports = true
+
+[tool.coverage.run]
+source = ["src"]
+branch = true
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = false
+exclude_lines = [
+    "pragma: no cover",
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+]

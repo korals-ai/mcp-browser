@@ -1,0 +1,26 @@
+# Run this MCP server locally and expose it on localhost:8096.
+#
+#   docker compose up
+#
+# Then point your agent at http://localhost:8096/mcp
+services:
+  browser:
+    build: .
+    image: mcp-browser
+    ports:
+      - "8096:8096"
+    volumes:
+      # The tools operate on paths, so whatever is mounted here is what the
+      # agent can read and write. Defaults to the directory you ran this from;
+      # override with WORKDIR=/path/to/project docker compose up
+      - "${WORKDIR:-.}:/work"
+    # Run as you, so files the tools create are owned by you on the host rather
+    # than by the image's unprivileged uid. Override on a non-1000 host with
+    # MCP_UID=$(id -u) MCP_GID=$(id -g) docker compose up  (UID is readonly in bash)
+    user: "${MCP_UID:-1000}:${MCP_GID:-1000}"
+    environment:
+      # The image's own HOME is not writable under a different uid; /tmp is.
+      HOME: /tmp
+    # Chromium needs more shared memory than Docker's 64 MB default or it will
+    # crash on content-heavy pages.
+    shm_size: 1gb

@@ -1,0 +1,19 @@
+# Runtime dependencies for the workspace-tool-browser sidecar image.
+# Keep in sync with [project.dependencies] in pyproject.toml.
+
+# MCP server SDK: FastMCP + Streamable HTTP transport. Exposes the browser_*
+# tools the agent calls over http://<pod>:8096/mcp, and pulls in Starlette,
+# which we also mount the /cobrowse WebSocket on.
+mcp>=1.2,<2
+
+# The real browser. Chromium is installed separately in the Dockerfile via
+# `playwright install`; this is just the driver library.
+playwright>=1.40
+
+# ASGI server for the combined /mcp + /cobrowse app. `standard` bundles the
+# websockets impl the co-browse plane needs.
+uvicorn[standard]>=0.30
+
+# Prometheus metrics exposed at /metrics on the pod port (scraped by the
+# ws-tool-browser PodMonitor). Co-browse session/viewer/chromium counters.
+prometheus_client>=0.20
