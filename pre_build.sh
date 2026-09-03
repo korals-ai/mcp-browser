@@ -40,23 +40,23 @@ HINT="  Install: $VENV/bin/pip install --index-url https://pypi.org/simple/ -e '
 [ -n "$PYTEST" ]    || fail "pytest not found. $HINT"
 [ -n "$PIP_AUDIT" ] || fail "pip-audit not found. $HINT"
 
-log "1/5 Format check (ruff format)..."
+log "1/6 Format check (ruff format)..."
 "$RUFF" format --check src tests || fail "ruff format (run: ruff format src tests)"
 log "  ✓ ruff format passed"
 
-log "2/5 Linting (ruff)..."
+log "2/6 Linting (ruff)..."
 "$RUFF" check src tests || fail "ruff"
 log "  ✓ ruff passed"
 
-log "3/5 Static typing (mypy)..."
+log "3/6 Static typing (mypy)..."
 "$MYPY" src || fail "mypy"
 log "  ✓ mypy passed"
 
-log "4/5 Dependency CVE scan (pip-audit)..."
+log "4/6 Dependency CVE scan (pip-audit)..."
 PIP_INDEX_URL=https://pypi.org/simple/ "$PIP_AUDIT" --no-deps -r requirements.txt || fail "pip-audit"
 log "  ✓ pip-audit passed"
 
-log "5/5 Running unit tests (with coverage)..."
+log "5/6 Running unit tests (with coverage)..."
 if "$PYTEST" --help 2>&1 | grep "coverage reporting" > /dev/null; then
   "$PYTEST" -q --cov=src --cov-report=term --cov-fail-under=0 || fail "pytest"
 else
@@ -64,5 +64,20 @@ else
   "$PYTEST" -q || fail "pytest"
 fi
 log "  ✓ pytest passed"
+
+
+log "6/6 Viewer typecheck (tsc over viewer/src)..."
+# standalone.ts is imported by nothing in chat-ui, so no other gate typechecks
+# it; without this step its first checker is the Docker viewer-builder stage —
+# after every pre-build gate is green. Guarded like it's chart-render guard:
+# skipped without node on PATH, enforced in ci-runner (which carries node).
+if command -v node >/dev/null 2>&1 && command -v npm >/dev/null 2>&1; then
+  ( cd "$SCRIPT_DIR/viewer" \
+      && npm install --no-audit --no-fund >/dev/null 2>&1 \
+      && npx tsc --noEmit ) || fail "viewer tsc (cd viewer && npx tsc --noEmit)"
+  log "  ✓ viewer tsc passed"
+else
+  log "  (node not on PATH; viewer tsc skipped — runs in ci-runner)"
+fi
 
 log "Pre-build checks complete ✓"

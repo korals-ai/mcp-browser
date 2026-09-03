@@ -8,3 +8,5 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 *.egg-info/
+# The viewer's local toolchain (npm install in viewer/).
+node_modules/
