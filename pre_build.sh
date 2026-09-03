@@ -73,7 +73,7 @@ log "6/6 Viewer typecheck (tsc over viewer/src)..."
 # skipped without node on PATH, enforced in ci-runner (which carries node).
 if command -v node >/dev/null 2>&1 && command -v npm >/dev/null 2>&1; then
   ( cd "$SCRIPT_DIR/viewer" \
-      && npm install --no-audit --no-fund >/dev/null 2>&1 \
+      && npm ci --no-audit --no-fund >/dev/null 2>&1 \
       && npx tsc --noEmit ) || fail "viewer tsc (cd viewer && npx tsc --noEmit)"
   log "  ✓ viewer tsc passed"
 else

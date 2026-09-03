@@ -26,8 +26,9 @@ FROM node:22-slim AS viewer-builder
 
 WORKDIR /viewer
 
-COPY viewer/package.json ./
-RUN npm install --no-audit --no-fund
+COPY viewer/package.json viewer/package-lock.json ./
+# ci, not install: honour the lockfile exactly, fail loudly if they disagree.
+RUN npm ci --no-audit --no-fund
 
 COPY viewer/tsconfig.json ./
 COPY viewer/src ./src
