@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>co-browse</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        --bg: #10131a;
+        --panel: #1a1f2b;
+        --line: #2b3342;
+        --fg: #e6e9ef;
+        --muted: #8b93a7;
+        --live: #3ddc97;
+      }
+      * { box-sizing: border-box; }
+      html, body { height: 100%; margin: 0; }
+      body {
+        background: var(--bg);
+        color: var(--fg);
+        font: 14px/1.4 ui-sans-serif, system-ui, -apple-system, sans-serif;
+        display: flex;
+        flex-direction: column;
+      }
+      header {
+        display: flex;
+        gap: 8px;
+        align-items: center;
+        padding: 8px 10px;
+        background: var(--panel);
+        border-bottom: 1px solid var(--line);
+      }
+      #address {
+        flex: 1;
+        height: 30px;
+        padding: 0 10px;
+        border-radius: 6px;
+        border: 1px solid var(--line);
+        background: var(--bg);
+        color: var(--fg);
+        font: inherit;
+      }
+      #status { color: var(--muted); font-size: 12px; white-space: nowrap; }
+      #status[data-live="true"] { color: var(--live); }
+      main { flex: 1; min-height: 0; padding: 10px; }
+      /* object-contain is the invariant the input mapping inverts — see
+         clientToRemote in input.ts. Changing it here silently misaligns clicks. */
+      #screen {
+        width: 100%;
+        height: 100%;
+        object-fit: contain;
+        display: block;
+        outline: none;
+        background: #000;
+        border-radius: 8px;
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <input id="address" placeholder="https://…" spellcheck="false" />
+      <span id="status">connecting…</span>
+    </header>
+    <main>
+      <!-- tabindex makes the canvas focusable so it receives key events. -->
+      <canvas id="screen" tabindex="0"></canvas>
+    </main>
+    <script type="module" src="./viewer.js"></script>
+  </body>
+</html>

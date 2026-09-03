@@ -9,8 +9,16 @@ downloads and uploads, and read console and network activity.
 
 It serves a **second plane on the same port**: `/cobrowse`, a WebSocket that streams a live CDP
 screencast of the session and accepts human input, so a person can watch the agent browse and
-take over mid-task. The server side of that is here in full. The viewer that renders it is not —
-it lives in a private application. The protocol is in `src/protocol.py` if you want to write one.
+take over mid-task.
+
+**And a viewer for it, at `/`.** Open `http://localhost:8096` after starting the container and you
+get a live picture of the browser the agent is driving: click, type, scroll, navigate — you and the
+agent share one session. This is the point of the tool. Driving a browser headlessly is a solved
+problem; watching one work, and taking the keyboard when it gets stuck, is not.
+
+The viewer is framework-free and served by the server itself, so there is nothing to build or host.
+Its wire protocol, canvas painting and coordinate mapping (`viewer/src/`) are the same source files
+the platform's own React viewer imports, so the two can never disagree about the format.
 
 ## Quickstart
 
@@ -21,14 +29,23 @@ docker compose up          # builds the image the first time
 Then register it with your agent. Claude Code:
 
 ```bash
-claude mcp add --transport http browser http://localhost:8096/mcp
+claude mcp add --transport http browser 'http://localhost:8096/mcp?chat_id=local'
 ```
 
 …or in a client config:
 
 ```json
-{"mcpServers": {"browser": {"type": "http", "url": "http://localhost:8096/mcp"}}}
+{"mcpServers": {"browser": {"type": "http", "url": "http://localhost:8096/mcp?chat_id=local"}}}
 ```
+
+Then open **http://localhost:8096** in a browser tab to watch it work.
+
+**The `?chat_id=` is required, not decorative.** Each id gets its own browser
+session and its own persisted profile, and the server rejects a tool call that
+carries none rather than quietly merging every caller into one shared profile
+and one cookie jar. `local` is just the value this README uses on both sides —
+the viewer reads the matching id from its own `?session=` (defaulting to
+`local`), so if you change one, change the other.
 
 ## How files reach the tools
 

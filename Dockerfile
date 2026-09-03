@@ -5,6 +5,9 @@
 #                  broker dials it for browser_open/snapshot/click/type.
 #   * /cobrowse  — the human view+input plane (WebSocket); the dispatcher proxies
 #                  the browser tab here for the live screencast.
+#   * /          — a bundled standalone viewer for that plane. The platform
+#                  serves its own React viewer and ignores this one; it exists so
+#                  the image is useful to someone running it on its own.
 # Both drive ONE shared Chrome session per chat — the co-browsing substrate.
 # Real Chrome (not Playwright's open-source Chromium) headed under a virtual
 # display: proprietary codecs/DRM, and far lower bot-wall friction on the real
@@ -14,6 +17,24 @@
 # Runs in its OWN per-tenant pod (pod: browser in the operator roster), NOT
 # co-located in the workspace pod — Chromium is far too heavy for the cold-start
 # critical path (same reasoning as the file-tool split, Jun 2026).
+
+# The standalone co-browse viewer. Bundled here so the running server can hand a
+# browser something to open — a co-browse plane with no client is only half the
+# tool. Its protocol/paint/input core is shared source with the platform's React
+# viewer, which imports the very same files, so the two cannot drift.
+FROM node:22-slim AS viewer-builder
+
+WORKDIR /viewer
+
+COPY viewer/package.json ./
+RUN npm install --no-audit --no-fund
+
+COPY viewer/tsconfig.json ./
+COPY viewer/src ./src
+COPY viewer/index.html ./
+RUN npx tsc --noEmit \
+ && npm run build \
+ && cp index.html static/
 
 FROM python:3.12-slim AS py-builder
 
@@ -60,6 +81,10 @@ WORKDIR /app
 
 COPY src ./src
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+COPY --from=viewer-builder /viewer/static ./viewer
+
+# Declared, not inferred: the server mounts a viewer only when told where one is.
+ENV BROWSER_VIEWER_DIR=/app/viewer
 # root-owned, sticky X socket dir so Xvfb (running as the unprivileged tool user)
 # places its display socket here without complaint; the entrypoint recreates it
 # if the runtime /tmp is a fresh mount.

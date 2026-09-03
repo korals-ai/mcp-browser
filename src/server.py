@@ -96,6 +96,10 @@ _CHAT_ID_PARAM = "chat_id"
 # the cap bounds the worst case of many chats co-browsing at once.
 _MAX_SESSIONS = int(os.environ.get("BROWSER_MAX_SESSIONS", "3"))
 
+# Where the built viewer bundle lives, when the image carries one. Empty
+# disables the root mount entirely rather than guessing a path.
+VIEWER_DIR = os.environ.get("BROWSER_VIEWER_DIR", "")
+
 # A session id used verbatim as a profile-dir NAME must be filesystem-safe: the id
 # reaches us from a URL the agent's MCP client sends, so a hostile ``chat_id`` like
 # ``../../etc`` could escape BROWSER_PROFILE_DIR. Accept only a conservative slug;
@@ -829,7 +833,7 @@ def build_app() -> Any:
     """
     from starlette.requests import Request
     from starlette.responses import Response
-    from starlette.routing import Route, WebSocketRoute
+    from starlette.routing import Mount, Route, WebSocketRoute
     from starlette.websockets import WebSocket
 
     app = mcp.streamable_http_app()
@@ -864,6 +868,19 @@ def build_app() -> Any:
     # the Starlette app in this version; the router's route list is the stable seam.
     app.router.routes.append(WebSocketRoute("/cobrowse/{session_id}", cobrowse_endpoint))
     app.router.routes.append(Route("/metrics", metrics_endpoint, methods=["GET"]))
+
+    # The bundled viewer, when one was built into the image. Mounted LAST and at
+    # the root so it can never shadow /mcp, /cobrowse or /metrics — Starlette
+    # matches routes in order. Its absence is not an error: the platform serves
+    # its own React viewer and does not need this one, so a build without the
+    # bundle simply has no root route.
+    if VIEWER_DIR and os.path.isdir(VIEWER_DIR):
+        from starlette.staticfiles import StaticFiles
+
+        app.router.routes.append(
+            Mount("/", app=StaticFiles(directory=VIEWER_DIR, html=True), name="viewer")
+        )
+        log.info("serving bundled co-browse viewer from %s", VIEWER_DIR)
 
     # Run the idle-session reaper alongside FastMCP's own lifespan (which starts the
     # streamable-HTTP session manager) — wrap, don't replace, so both run.

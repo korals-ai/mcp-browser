@@ -1,0 +1,14 @@
+{
+  "name": "cobrowse-viewer",
+  "private": true,
+  "type": "module",
+  "description": "Standalone co-browse viewer. Shares its protocol/paint/input core with the platform's React viewer, which imports these same files.",
+  "scripts": {
+    "build": "esbuild src/standalone.ts --bundle --format=esm --minify --outfile=static/viewer.js",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "esbuild": "^0.24.0",
+    "typescript": "^5.6.0"
+  }
+}

@@ -2,7 +2,8 @@
 #
 #   docker compose up
 #
-# Then point your agent at http://localhost:8096/mcp
+# Then point your agent at http://localhost:8096/mcp — and open
+# http://localhost:8096 in a tab to watch the browser the agent is driving.
 services:
   browser:
     build: .
