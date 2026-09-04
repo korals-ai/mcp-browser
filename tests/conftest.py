@@ -32,6 +32,8 @@ class FakeDriver(BrowserDriver):
         self.tables: list[list[list[str]]] = [[["a", "b"], ["1", "2"]]]
         self.logins: list[tuple[str, str]] = []
         self.login_result = True  # fill_login return value; tests can flip
+        self.wait_for_result = True  # wait_for return value; a False is a real timeout
+        self._reads = 0  # read-only calls, which record no arguments of their own
         self.inputs: list[tuple[str, dict[str, Any]]] = []
         self.viewports: list[tuple[int, int]] = []  # set_viewport calls
         # Cursor probe: recorded (x, y) calls + the value returned (per-test).
@@ -107,6 +109,7 @@ class FakeDriver(BrowserDriver):
         return True
 
     async def snapshot(self) -> list[Element]:
+        self._reads += 1
         return list(self._snapshot)
 
     async def click(self, ref: str) -> None:
@@ -119,9 +122,11 @@ class FakeDriver(BrowserDriver):
         self.scrolls.append((direction, amount))
 
     async def read(self) -> str:
+        self._reads += 1
         return self.page_text
 
     async def find_text(self, query: str) -> dict[str, Any]:
+        self._reads += 1
         count = self.page_text.lower().count(query.lower())
         return {"count": count, "snippet": query if count else ""}
 
@@ -132,6 +137,7 @@ class FakeDriver(BrowserDriver):
         return {"found": True, "ref": ref, "tag": "button", "text": "Fake"}
 
     async def get_table(self, ref: str | None = None) -> list[list[list[str]]]:
+        self._reads += 1
         return self.tables
 
     async def go_back(self) -> None:
@@ -143,9 +149,43 @@ class FakeDriver(BrowserDriver):
     async def reload(self) -> None:
         self.nav_ops.append("reload")
 
+    def calls_made(self) -> int:
+        """How many driver calls this fake has recorded, in total.
+
+        Lets a test assert that a code path reached the driver AT ALL without
+        naming which method — used to prove every allowlisted recipe tool has a
+        live executor branch rather than just its name in the source."""
+        return (
+            sum(
+                len(x)
+                for x in (
+                    self.opened,
+                    self.clicks,
+                    self.typed,
+                    self.scrolls,
+                    self.keys,
+                    self.selects,
+                    self.uploads,
+                    self.downloads,
+                    self.nav_ops,
+                    self.waited,
+                    self.logins,
+                    self.inputs,
+                    self.hovers,
+                    self.drags,
+                    self.scrolled_to,
+                    self.evals,
+                    self.frame_switches,
+                    self.waited_response,
+                    self.cursor_calls,
+                )
+            )
+            + self._reads
+        )
+
     async def wait_for(self, *, text: str | None, selector: str | None, timeout_ms: int) -> bool:
         self.waited.append({"text": text, "selector": selector, "timeout_ms": timeout_ms})
-        return True
+        return self.wait_for_result
 
     async def press_key(self, key: str) -> None:
         self.keys.append(key)
@@ -256,6 +296,7 @@ class FakeDriver(BrowserDriver):
         return list(self.options)
 
     async def get_links(self, cap: int = 200) -> list[dict[str, str]]:
+        self._reads += 1
         return list(self.links[:cap])
 
     async def eval_js(self, js: str) -> dict[str, Any]:

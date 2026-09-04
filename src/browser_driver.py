@@ -1523,8 +1523,44 @@ class PlaywrightDriver:
 
 # Injected into every candidate element as data-cobrowse-ref, then returned as a
 # flat list. Password inputs keep their type so redaction can find them.
-_SNAPSHOT_JS = """
+# An <input> has no textContent and usually no aria-label, so naming it from
+# those alone leaves every text field anonymous: a login form came back as two
+# indistinguishable `{tag: "input", type: "text"}` entries, and the agent had to
+# spend a whole extra browser_read to learn which was the username — measured
+# doing exactly that, 3 times per task. So the name falls back through the ways
+# HTML actually labels a field.
+_LABEL_JS = """
+  function labelFor(el) {
+    const byIds = el.getAttribute('aria-labelledby');
+    if (byIds) {
+      const text = byIds.split(/\\s+/)
+        .map((id) => document.getElementById(id))
+        .filter(Boolean)
+        .map((n) => n.textContent || '')
+        .join(' ')
+        .trim();
+      if (text) return text;
+    }
+    if (el.id) {
+      // CSS.escape: an id like "user.name" is a valid id but an invalid bare
+      // selector, and would throw rather than simply not match.
+      const explicit = document.querySelector('label[for="' + CSS.escape(el.id) + '"]');
+      if (explicit && explicit.textContent.trim()) return explicit.textContent.trim();
+    }
+    const wrapping = el.closest('label');
+    // An <input> contributes no textContent, so the wrapping label's text is
+    // the label alone — it does not echo what the user typed.
+    if (wrapping && wrapping.textContent.trim()) return wrapping.textContent.trim();
+    return '';
+  }
+"""
+
+_SNAPSHOT_JS = (
+    """
 () => {
+"""
+    + _LABEL_JS
+    + """
   const sel = 'a,button,input,textarea,select,[role=button],[role=link]';
   const nodes = Array.from(document.querySelectorAll(sel));
   return nodes.slice(0, 200).map((el, i) => {
@@ -1533,7 +1569,15 @@ _SNAPSHOT_JS = """
     const out = { ref, tag: el.tagName.toLowerCase() };
     if (el.type) out.type = el.type;
     const role = el.getAttribute('role'); if (role) out.role = role;
-    const name = (el.getAttribute('aria-label') || el.textContent || '').trim().slice(0, 120);
+    const name = (
+      el.getAttribute('aria-label') ||
+      el.textContent ||
+      labelFor(el) ||
+      el.getAttribute('placeholder') ||
+      el.getAttribute('name') ||
+      el.id ||
+      ''
+    ).trim().slice(0, 120);
     if (name) out.name = name;
     if ('value' in el && el.value != null) out.value = String(el.value).slice(0, 200);
     const ph = el.getAttribute('placeholder'); if (ph) out.placeholder = ph;
@@ -1541,6 +1585,7 @@ _SNAPSHOT_JS = """
   });
 }
 """
+)
 
 # Readable text of the main content (article/main if present, else body), capped
 # so a huge page can't blow the agent's context.

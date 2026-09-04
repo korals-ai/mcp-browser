@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import os
 import re
@@ -36,7 +37,7 @@ from mcp.server.fastmcp import FastMCP, Image
 from mcp.server.fastmcp.exceptions import ToolError
 from mcp.server.lowlevel.server import request_ctx
 
-from src import agent_ops, browser_driver, metrics, profile_gc
+from src import agent_ops, browser_driver, metrics, profile_gc, recipes
 from src.browser_driver import BrowserDriver, PlaywrightDriver
 from src.cobrowse_ws import CoBrowseConnection
 from src.portal_creds import read_portals
@@ -399,6 +400,66 @@ async def browser_type(ref: str, text: str, label: str = "") -> str:
     """
     await agent_ops.type_text(manager, _session_id(), ref, text)
     return "ok"
+
+
+@mcp.tool()
+async def browser_run_recipe(path: str, params: dict[str, str] | None = None) -> dict[str, Any]:
+    """Run a SAVED click-path for a site in one call — prefer this over driving
+    the browser step by step whenever a recipe exists for the task.
+
+    A recipe is a proven sequence (open, sign in, search, read) stored as a JSON
+    file in the workspace. Running it costs ONE tool call instead of one per
+    step, so it is dramatically faster and cheaper than navigating yourself.
+
+    Args:
+        path: Workspace path to the recipe JSON (e.g.
+            "skills/supplier-portal.recipe.json").
+        params: Values for the recipe's declared parameters, e.g.
+            ``{"keyword": "pumps"}``. Required ones are listed in the file.
+
+    Returns:
+        ``{status, steps_run, extracted}`` on success — ``extracted`` holds the
+        page content the recipe collected. On ``step_failed`` it names the step
+        index and why, which usually means the site changed: fall back to
+        driving the browser yourself from that point, and tell the user the
+        recipe needs re-recording.
+    """
+    resolved = _resolve_workspace_path(path)
+    if resolved is None:
+        return {"status": "path_not_allowed", "path": path}
+    if not await asyncio.to_thread(os.path.isfile, resolved):
+        return {"status": "not_found", "path": path}
+    try:
+        raw = json.loads(await asyncio.to_thread(_read_text, resolved))
+        recipe = recipes.parse(raw)
+    except json.JSONDecodeError as exc:
+        return {"status": "invalid_recipe", "reason": f"not valid JSON: {exc}"}
+    except recipes.RecipeError as exc:
+        return {"status": "invalid_recipe", "reason": str(exc)}
+    return await agent_ops.run_recipe(
+        manager, _session_id(), recipe, params or {}, portals=read_portals()
+    )
+
+
+@mcp.tool()
+async def browser_fill_form(fields: list[dict[str, str]], label: str = "") -> dict[str, Any]:
+    """Fill MANY fields on a form in one call — prefer this over repeated
+    ``browser_type`` whenever you are filling more than one field.
+
+    Args:
+        fields: One entry per field, in the order to fill them. Each is
+            ``{"ref": "<ref from a snapshot>", "value": "<what to enter>"}``,
+            plus ``"kind": "select"`` for a native ``<select>`` dropdown
+            (default ``"text"`` covers inputs and textareas).
+        label: What the person approving this should see, naming the FORM rather
+            than the fields (e.g. "the pizza order form"). This is a mutating
+            action, so it routes through the in-chat permission modal; without a
+            label the modal can only show a blob of refs and values.
+
+    Returns ``{filled, requested, fields}`` — a per-field result, because a
+    form can partly succeed and you need to know which half landed.
+    """
+    return await agent_ops.fill_form(manager, _session_id(), fields)
 
 
 @mcp.tool()
@@ -813,6 +874,11 @@ def _resolve_workspace_path(path: str) -> str | None:
     if resolved != _AGENT_HOME and not resolved.startswith(_AGENT_HOME + os.sep):
         return None
     return resolved
+
+
+def _read_text(path: str) -> str:
+    with open(path, encoding="utf-8") as fh:
+        return fh.read()
 
 
 def _ensure_parent(dest: str) -> None:

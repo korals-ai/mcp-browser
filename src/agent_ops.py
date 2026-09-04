@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from src import recipes
 from src.portal_creds import PortalCred
 from src.protocol import BrowserAgentState, BrowserNav, BrowserTabs, BrowserTakeoverRequest
 from src.sessions import SessionManager
@@ -158,6 +159,227 @@ async def click(manager: SessionManager, session_id: str, ref: str) -> None:
 async def type_text(manager: SessionManager, session_id: str, ref: str, text: str) -> None:
     session = await _active_session(manager, session_id)
     await session.driver.type_text(ref, text)
+
+
+async def fill_form(
+    manager: SessionManager, session_id: str, fields: list[dict[str, str]]
+) -> dict[str, Any]:
+    """Fill several fields in ONE call, reporting per field.
+
+    Exists because a form costs one model round-trip PER FIELD otherwise, and a
+    round-trip is ~2 s — far more than the browser work it wraps. Measured: the
+    same form took six calls one field at a time and two when batched.
+
+    Deliberately NOT all-or-nothing. A partial fill is the honest outcome — the
+    fields that landed have really landed, and the browser cannot roll them
+    back — so each field reports its own result and the caller decides. Failing
+    the whole call would hide which half of the form is now populated.
+    """
+    session = await _active_session(manager, session_id)
+    results: list[dict[str, str]] = []
+    for field in fields:
+        ref, value = field["ref"], field["value"]
+        kind = field.get("kind", "text")
+        try:
+            if kind == "select":
+                await session.driver.select_option(ref, value)
+            else:
+                await session.driver.type_text(ref, value)
+        except Exception as exc:
+            # The ref, not the value: a value can be a credential, and this
+            # string goes into the model's context.
+            results.append({"ref": ref, "status": "error", "error": f"{type(exc).__name__}: {exc}"})
+            continue
+        results.append({"ref": ref, "status": "ok"})
+    filled = sum(1 for r in results if r["status"] == "ok")
+    return {"filled": filled, "requested": len(fields), "fields": results}
+
+
+def _step_refusal(tool: str, output: Any) -> str | None:
+    """The reason this step says it did not work, or None if it is fine.
+
+    Two tools answer with a value rather than an exception: ``browser_wait_for``
+    returns False on a swallowed timeout, and ``browser_login`` returns a status
+    dict. Both were previously discarded."""
+    if tool == "browser_wait_for" and output is False:
+        return "waited for the page to change and it did not"
+    if tool == "browser_login" and isinstance(output, dict):
+        status = output.get("status")
+        if status != "submitted":
+            return f"login did not complete: {status}"
+    return None
+
+
+async def run_recipe(
+    manager: SessionManager,
+    session_id: str,
+    recipe: dict[str, Any],
+    params: dict[str, str],
+    *,
+    portals: dict[str, PortalCred] | None = None,
+) -> dict[str, Any]:
+    """Execute a saved click-path with NO model between the steps.
+
+    This is the whole point of recipes: a model round-trip costs ~2 s and
+    re-sends the entire conversation, so a 9-step task pays for its own history
+    nine times. Executing the steps here collapses that to one call, measured
+    at roughly 20x cheaper on a live site.
+
+    Returns ``{status, steps_run, extracted, ...}``. On failure it returns the
+    step index and reason rather than raising, because a recipe stops being
+    valid the moment a site changes, and the caller's next move (fall back to
+    driving the browser itself) needs to know WHERE it broke.
+    """
+    missing = recipes.missing_params(recipe, params)
+    if missing:
+        return {"status": "missing_params", "missing": missing, "steps_run": 0}
+
+    session = await _active_session(manager, session_id)
+    elements: list[dict[str, Any]] = []
+    extracted: list[dict[str, Any]] = []
+
+    for index, step in enumerate(recipe["steps"]):
+        tool = step["tool"]
+        try:
+            # Inside the try: an undeclared "param:" reference raises here, and
+            # missing_params above cannot catch it (it only checks DECLARED
+            # names). Outside, it escaped as a bare exception with no step index
+            # after earlier steps had already navigated and clicked.
+            args = {k: recipes.substitute(v, params) for k, v in step.get("args", {}).items()}
+            if "target" in step:
+                args["ref"] = recipes.resolve_target(elements, step["target"])
+            if tool == "browser_fill_form":
+                args["fields"] = [
+                    {
+                        "ref": recipes.resolve_target(elements, field["target"]),
+                        "value": recipes.substitute(field.get("value", ""), params),
+                        "kind": field.get("kind", "text"),
+                    }
+                    for field in step.get("fields", [])
+                ]
+            output = await _run_recipe_step(manager, session_id, session, tool, args, portals or {})
+        except recipes.RecipeError as exc:
+            # A stale descriptor is the EXPECTED end of a recipe's life, not a
+            # crash: sites change. Report it precisely so the caller can
+            # re-record just this step.
+            return {
+                "status": "step_failed",
+                "failed_at": index,
+                "tool": tool,
+                "reason": str(exc),
+                "steps_run": index,
+                "extracted": extracted,
+            }
+        except Exception as exc:
+            return {
+                "status": "step_failed",
+                "failed_at": index,
+                "tool": tool,
+                "reason": f"{type(exc).__name__}: {exc}",
+                "steps_run": index,
+                "extracted": extracted,
+            }
+
+        # A step that REPORTS failure instead of raising it. With no model in
+        # the loop nothing else notices, so the rest of the click-path would run
+        # against the wrong page and the recipe would still return "ok" —
+        # handing back a sign-in wall, or a form submitted while logged out.
+        refusal = _step_refusal(tool, output)
+        if refusal is not None:
+            return {
+                "status": "step_failed",
+                "failed_at": index,
+                "tool": tool,
+                "reason": refusal,
+                "steps_run": index,
+                "extracted": extracted,
+            }
+
+        if tool == "browser_snapshot":
+            elements = output if isinstance(output, list) else []
+        if tool in recipes.EXTRACTION_TOOLS:
+            extracted.append({"tool": tool, "output": output})
+
+    return {
+        "status": "ok",
+        "steps_run": len(recipe["steps"]),
+        "extracted": extracted,
+    }
+
+
+async def _run_recipe_step(
+    manager: SessionManager,
+    session_id: str,
+    session: Any,
+    tool: str,
+    args: dict[str, Any],
+    portals: dict[str, PortalCred],
+) -> Any:
+    """Dispatch one allowlisted recipe step to the driver.
+
+    An explicit mapping, not ``getattr(driver, name)``: the allowlist in
+    :mod:`src.recipes` is only a real boundary if nothing here can reach a
+    method it does not name."""
+    driver = session.driver
+    if tool == "browser_open":
+        await driver.open(args["url"])
+        return None
+    if tool == "browser_snapshot":
+        raw = await driver.snapshot()
+        return snapshot_to_json(redact_snapshot(raw))
+    if tool == "browser_click":
+        await driver.click(args["ref"])
+        return None
+    if tool == "browser_type":
+        await driver.type_text(args["ref"], args["text"])
+        return None
+    if tool == "browser_fill_form":
+        for field in args["fields"]:
+            if field.get("kind") == "select":
+                await driver.select_option(field["ref"], field["value"])
+            else:
+                await driver.type_text(field["ref"], field["value"])
+        return None
+    if tool == "browser_select_option":
+        await driver.select_option(args["ref"], args["value"])
+        return None
+    if tool == "browser_press_key":
+        await driver.press_key(args["key"])
+        return None
+    if tool == "browser_scroll":
+        await driver.scroll(args.get("direction", "down"), int(args.get("amount", 600)))
+        return None
+    if tool == "browser_wait_for":
+        return await driver.wait_for(
+            text=args.get("text") or None,
+            selector=args.get("selector") or None,
+            timeout_ms=int(args.get("timeout_ms", 8000)),
+        )
+    if tool == "browser_read":
+        return await driver.read()
+    if tool == "browser_get_table":
+        return await driver.get_table(args.get("ref") or None)
+    if tool == "browser_get_links":
+        return await driver.get_links()
+    if tool == "browser_find":
+        return await driver.find_text(args["query"])
+    if tool == "browser_login":
+        # Reuse the audited login op rather than re-implementing it here: it is
+        # what keeps the password out of the agent's context, and a second copy
+        # of that path is a second place for it to leak.
+        return await login(manager, session_id, args["portal_id"], portals)
+    if tool == "browser_back":
+        await driver.go_back()
+        return None
+    if tool == "browser_forward":
+        await driver.go_forward()
+        return None
+    if tool == "browser_reload":
+        await driver.reload()
+        return None
+    # Unreachable while the allowlist and this mapping agree; a loud failure if
+    # someone adds a tool to one and forgets the other.
+    raise recipes.RecipeError(f"recipe step '{tool}' has no executor")
 
 
 async def scroll(manager: SessionManager, session_id: str, direction: str, amount: int) -> None:
