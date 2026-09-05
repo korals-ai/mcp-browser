@@ -1,25 +1,19 @@
-"""Toolspace sidecar (browser) — co-browsing agent, POC v0.
+"""Toolspace sidecar (browser) — co-browsing agent.
 
-Serves TWO planes on ONE port:
+TWO planes on ONE port, acting on ONE Chromium session PER CHAT:
+  * ``/mcp``      — agent control plane (FastMCP streamable-HTTP), dialed by
+                    the in-pod broker.
+  * ``/cobrowse`` — human view+input plane (WebSocket), proxied by the
+                    dispatcher: live screencast out, clicks/keys in.
 
-  * ``/mcp``      — the agent control plane (FastMCP streamable-HTTP). The in-pod
-                    broker dials this; the agent gets ``browser_open`` /
-                    ``browser_snapshot`` / ``browser_click`` / ``browser_type``.
-  * ``/cobrowse`` — the human view+input plane (WebSocket). The dispatcher
-                    proxies the browser tab here; it streams the live screencast
-                    and forwards the human's clicks/keys.
-
-Both planes act on ONE Chromium session PER CHAT. The chat id rides in on each
-plane — a ``?chat_id=`` query param the in-pod broker adds to the agent's MCP
-requests (read here via :func:`_session_id`), and the ``/cobrowse/{session_id}``
-path the dispatcher proxies — so the agent's tools and the human's viewer for a
-given chat meet on that chat's OWN browser (isolated cookies/window/tabs). The
-agent plane is **chat_id-mandatory** (Pillar C): a tool call carrying no
-``?chat_id=`` is rejected — never silently merged into one ``shared`` profile,
-which would leak one chat's cookies/logins into another. The ``/cobrowse``
-viewer plane keeps :data:`SHARED_SESSION` only as a path-traversal safe-landing
-in the dir builders. See docs/plan/20260728T111318Z-cobrowse-per-chat-isolation.md
-and docs/plan/20260810T182738Z-cobrowse-profile-footprint.md (Pillar C).
+The chat id rides each plane (broker-added ``?chat_id=`` read via
+:func:`_session_id`; the ``/cobrowse/{session_id}`` path), so a chat's tools
+and viewer meet on that chat's OWN browser (isolated cookies/window/tabs).
+The agent plane is **chat_id-mandatory** (Pillar C): a call with no chat_id
+is rejected, never merged into one ``shared`` profile — that would leak one
+chat's cookies/logins into another. The viewer plane keeps
+:data:`SHARED_SESSION` only as the dir builders' path-traversal safe-landing.
+See docs/plan/20260728T111318Z-cobrowse-per-chat-isolation.md.
 """
 
 from __future__ import annotations
@@ -59,14 +53,12 @@ DISK_CACHE_SIZE = os.environ.get("BROWSER_DISK_CACHE_SIZE") or None
 
 
 def _tenant_volume_root() -> str:
-    """The tenant PVC mount root. CRITICAL: this is NOT the container's ``$HOME``.
-    The browser image runs as user ``tool`` with ``HOME=/home/tool`` (Chrome's
-    home), while the operator mounts the tenant volume at a FIXED path
-    (``/home/agent``) and anchors ``BROWSER_PROFILE_DIR`` (``…/.cobrowse/profile``)
-    there. Derive the mount from that anchor; fall back to ``$HOME`` only when no
-    volume is mounted (CI/local, where they coincide). Deriving from ``$HOME``
-    instead pointed both the file-ops guard AND the profile GC at ``/home/tool`` —
-    the GC's keep-set read empty and it fail-closed forever
+    """The tenant PVC mount root — NOT the container's ``$HOME`` (the image
+    runs as ``tool`` with ``HOME=/home/tool``; the volume mounts at
+    ``/home/agent``). Derive from the ``BROWSER_PROFILE_DIR`` anchor; fall
+    back to ``$HOME`` only with no volume (CI/local, where they coincide).
+    Deriving from ``$HOME`` once pointed the file-ops guard AND the profile
+    GC at ``/home/tool`` — the GC fail-closed forever
     (docs/incidents/2026-08-11-cobrowse-gc-projects-root-home.md)."""
     if PROFILE_DIR:  # <mount>/.cobrowse/profile → <mount>
         return os.path.dirname(os.path.dirname(PROFILE_DIR.rstrip("/")))
@@ -82,47 +74,40 @@ _AGENT_HOME = _tenant_volume_root()
 # per-chat profiles are orphaned — no call to the workspace pod. See profile_gc.
 PROJECTS_ROOT = os.path.join(_AGENT_HOME, ".claude", "projects")
 
-# The path-traversal safe-landing session id. Since Pillar C the agent plane
-# REJECTS a chat_id-less tool call (see _session_id), so this is no longer an
-# agent-plane fallback; it remains the /cobrowse viewer plane's default and the
-# dir builders' safe landing for a present-but-non-slug id (see _safe_dir_name).
+# Path-traversal safe-landing id. The agent plane REJECTS chat_id-less calls
+# (Pillar C, see _session_id); this remains the viewer plane's default and
+# the dir builders' safe landing for a present-but-non-slug id.
 SHARED_SESSION = "shared"
 
-# Query param the in-pod broker adds to the agent's MCP requests to name the chat
-# (see apps/workspace/src/mcp_config.py). Read off the live request below.
+# Query param the in-pod broker adds to name the chat
+# (apps/workspace/src/mcp_config.py).
 _CHAT_ID_PARAM = "chat_id"
 
-# Cap on concurrent Chromiums in one pod (env-overridable so stg can retune once
-# headed-Chrome memory is measured). The idle reaper closes walked-away sessions;
-# the cap bounds the worst case of many chats co-browsing at once.
+# Cap on concurrent Chromiums per pod (env-overridable). The idle reaper
+# closes walked-away sessions; this bounds the worst case.
 _MAX_SESSIONS = int(os.environ.get("BROWSER_MAX_SESSIONS", "3"))
 
 # Where the built viewer bundle lives, when the image carries one. Empty
 # disables the root mount entirely rather than guessing a path.
 VIEWER_DIR = os.environ.get("BROWSER_VIEWER_DIR", "")
 
-# A session id used verbatim as a profile-dir NAME must be filesystem-safe: the id
-# reaches us from a URL the agent's MCP client sends, so a hostile ``chat_id`` like
-# ``../../etc`` could escape BROWSER_PROFILE_DIR. Accept only a conservative slug;
-# anything else is refused BEFORE it becomes a path (callers fall back / reject).
+# The id arrives from a URL the agent's MCP client sends, and is used
+# verbatim as a profile-dir NAME — a hostile ``../../etc`` could escape
+# BROWSER_PROFILE_DIR. Only a conservative slug becomes a path.
 _SAFE_SESSION_ID = re.compile(r"[A-Za-z0-9_.-]{1,128}")
 
 
 def _session_id() -> str:
-    """The current chat's session id, from the live MCP request's ``?chat_id=``.
+    """The current chat's session id, from the live MCP request's
+    ``?chat_id=`` (via ``request_ctx``, so handlers need no ``Context`` arg).
 
-    Read off ``request_ctx`` (the low-level server's per-request ContextVar) so no
-    tool handler needs a ``Context`` parameter.
-
-    **Fail-closed (Pillar C): a tool CALL that arrives over HTTP with no
-    ``?chat_id=`` is rejected**, instead of silently sharing one ``shared``
-    profile across every chat — which would leak one chat's cookies/logins into
-    another. Only the agent's tool handlers read this; ``initialize`` /
-    ``tools/list`` / readiness are the broker's chat_id-less probes and never
+    **Fail-closed (Pillar C): an HTTP tool CALL with no ``?chat_id=`` is
+    rejected** rather than silently sharing one profile across chats (a
+    cookie/login leak). Only tool handlers read this — ``initialize`` /
+    ``tools/list`` / readiness are chat_id-less broker probes and never
     invoke a handler, so rejecting here never strips the toolset. A no-HTTP
-    scope (stdio / unit tests) has nothing to isolate and still returns
-    :data:`SHARED_SESSION`; the dir builders keep their own ``shared``
-    safe-landing (:func:`_safe_dir_name`) for a present-but-non-slug id."""
+    scope (stdio / unit tests) has nothing to isolate and returns
+    :data:`SHARED_SESSION`."""
     try:
         request = request_ctx.get().request
     except LookupError:
@@ -139,44 +124,39 @@ def _session_id() -> str:
 
 
 def _safe_dir_name(session_id: str) -> str:
-    """The session id as a single path segment, or :data:`SHARED_SESSION` if it
-    isn't a safe one. ``_SAFE_SESSION_ID``'s char class alone matches ``.`` and
-    ``..`` (both chars are in ``[A-Za-z0-9_.-]``), which as a profile-dir NAME
-    traverses out of the profile root — harmless under read/write today, but
-    catastrophic once the GC can rm/rename a profile path. Reject dot-only names
-    and any path separator explicitly before trusting the slug (B.4)."""
+    """The session id as a single path segment, else :data:`SHARED_SESSION`.
+    ``_SAFE_SESSION_ID``'s char class alone matches ``.`` and ``..`` — which
+    as a dir NAME traverse out of the profile root, catastrophic once the GC
+    can rm/rename a profile path — so dot-only names and path separators are
+    rejected explicitly (B.4)."""
     if session_id in (".", "..") or "/" in session_id or os.sep in session_id:
         return SHARED_SESSION
     return session_id if _SAFE_SESSION_ID.fullmatch(session_id) else SHARED_SESSION
 
 
 def _profile_dir_for(session_id: str) -> str | None:
-    """The per-chat Chromium profile dir under :data:`PROFILE_DIR`. None when no
-    volume is mounted (ephemeral, e.g. CI). Each chat gets its own subdir so their
-    persistent contexts don't fight over one user-data-dir's Singleton lock, and a
-    non-slug id can't traverse out of the profile root."""
+    """The per-chat Chromium profile dir under :data:`PROFILE_DIR`; None when
+    no volume is mounted (CI). Per-chat subdirs keep persistent contexts from
+    fighting over one user-data-dir's Singleton lock."""
     if not PROFILE_DIR:
         return None
     return os.path.join(PROFILE_DIR, _safe_dir_name(session_id))
 
 
 def _cache_dir_for(session_id: str) -> str | None:
-    """This chat's Chrome disk-cache dir under :data:`CACHE_DIR` (the node-disk
-    emptyDir), or None when no cache dir is configured. Per-session on purpose:
-    concurrent Chromes sharing one --disk-cache-dir corrupt the cache and leak
-    HTTP cache across chats. Same slug guard as the profile dir so a non-slug id
-    can't traverse out of the cache root."""
+    """This chat's Chrome disk-cache dir under :data:`CACHE_DIR` (node-disk
+    emptyDir), or None when unconfigured. Per-session on purpose: concurrent
+    Chromes sharing one --disk-cache-dir corrupt it and leak HTTP cache
+    across chats. Same slug guard as the profile dir."""
     if not CACHE_DIR:
         return None
     return os.path.join(CACHE_DIR, _safe_dir_name(session_id))
 
 
-# Opportunistic orphan-profile GC (:mod:`src.profile_gc`): reclaim per-chat
-# profiles whose chat was deleted while this pod was up. Triggered at container
-# boot and at session start — a natural "next use", NOT a standing timer —
-# throttled so a busy pod sweeps at most once per interval, and run in a worker
-# thread so it never blocks a launch. Boot drains the cold backlog; session-start
-# catches deletes that happen mid-uptime.
+# Opportunistic orphan-profile GC (:mod:`src.profile_gc`), triggered at
+# container boot (cold backlog) and session start (mid-uptime deletes) — a
+# natural "next use", not a standing timer. Throttled per interval; runs in a
+# worker thread so it never blocks a launch.
 _GC_MIN_INTERVAL_S = 600.0
 _gc_lock = asyncio.Lock()
 _gc_last_ts = 0.0
@@ -184,10 +164,8 @@ _bg_tasks: set[asyncio.Task[Any]] = set()
 
 
 async def _sweep_profiles_bg(force: bool = False) -> None:
-    """Run the profile GC in a worker thread (never blocks the event loop).
-    Throttled to ``_GC_MIN_INTERVAL_S`` unless ``force`` (boot); deduped via
-    ``_gc_lock`` so overlapping triggers collapse to one sweep. Best-effort —
-    ``run_sweep`` never raises."""
+    """Profile GC in a worker thread. Throttled unless ``force`` (boot);
+    ``_gc_lock`` collapses overlapping triggers. ``run_sweep`` never raises."""
     global _gc_last_ts
     if not PROFILE_DIR:
         return
@@ -201,25 +179,24 @@ async def _sweep_profiles_bg(force: bool = False) -> None:
 
 
 def _schedule_profile_gc(force: bool = False) -> None:
-    """Fire a throttled GC sweep without awaiting it — a session launch or
-    container boot must not wait on filesystem work. Holds a task ref so the
-    fire-and-forget sweep isn't GC'd mid-flight."""
+    """Fire a throttled GC sweep without awaiting — a launch/boot must not
+    wait on filesystem work. The task ref keeps it from being GC'd mid-flight."""
     task = asyncio.create_task(_sweep_profiles_bg(force=force))
     _bg_tasks.add(task)
     task.add_done_callback(_bg_tasks.discard)
 
 
 async def _playwright_factory(session_id: str) -> BrowserDriver:
-    """Mint a started real driver for one chat's session, with its own persistent
-    profile subdir + its own node-disk cache subdir. Injected into the manager in
-    prod; tests pass a fake factory."""
+    """Mint a started real driver for one chat's session (own profile + cache
+    subdirs). Injected into the manager in prod; tests pass a fake factory."""
     driver = PlaywrightDriver(
         profile_dir=_profile_dir_for(session_id),
         cache_dir=_cache_dir_for(session_id),
         disk_cache_size=DISK_CACHE_SIZE,
     )
     await driver.start()
-    _schedule_profile_gc()  # opportunistic orphan-profile reclaim (throttled, threaded)
+    log.info("cobrowse session started session=%s", session_id)
+    _schedule_profile_gc()
     return driver
 
 
@@ -230,9 +207,8 @@ _REAP_INTERVAL_S = 60.0
 
 
 async def _reap_idle_loop() -> None:
-    """Close idle, viewer-less chat sessions on a timer so a pod doesn't accumulate
-    walked-away Chromiums. Runs for the app's life (started/stopped by the lifespan).
-    A transient reap error is logged, not fatal — the loop must outlive one bad sweep."""
+    """Close idle, viewer-less sessions on a timer (walked-away Chromiums).
+    A reap error is logged, not fatal — the loop must outlive one bad sweep."""
     while True:
         await asyncio.sleep(_REAP_INTERVAL_S)
         try:
@@ -905,24 +881,25 @@ def build_app() -> Any:
     app = mcp.streamable_http_app()
 
     async def cobrowse_endpoint(ws: WebSocket) -> None:
-        # The path id is the chat id (the dispatcher proxies to /cobrowse/<chat_id>):
-        # the viewer meets the agent on THAT chat's session. Missing/blank → the
-        # shared fallback, matching the agent plane so the two never split.
+        # The path id is the chat id — the viewer meets the agent on THAT
+        # chat's session. Missing/blank → the shared fallback, matching the
+        # agent plane so the two never split.
         session_id = ws.path_params.get("session_id") or SHARED_SESSION
-        # The dispatcher sets ?control=0 for a WATCH-ONLY viewer (chat grant = view)
-        # and ?control=1 (or omits it) for a driver (edit/owner). Absent → drive, so
-        # an older dispatcher that doesn't send it behaves as before.
+        # ?control=0 = watch-only viewer; ?control=1 or absent = driver, so an
+        # older dispatcher that doesn't send it behaves as before.
         can_drive = ws.query_params.get("control") != "0"
         await ws.accept()
         metrics.inc_viewer_connection()
+        log.info("cobrowse viewer connected session=%s can_drive=%s", session_id, can_drive)
         adapter = _StarletteWsAdapter(ws)
         conn = CoBrowseConnection(manager, session_id, adapter, can_drive=can_drive)
         try:
             await conn.run()
         except Exception:
             metrics.inc_session_error()
-            log.exception("cobrowse connection error")
+            log.exception("cobrowse connection error session=%s", session_id)
         finally:
+            log.info("cobrowse viewer disconnected session=%s", session_id)
             with contextlib.suppress(Exception):
                 await ws.close()
 
@@ -930,16 +907,14 @@ def build_app() -> Any:
         body, content_type = metrics.render()
         return Response(content=body, media_type=content_type)
 
-    # Append rather than app.add_websocket_route(...) — the latter isn't typed on
-    # the Starlette app in this version; the router's route list is the stable seam.
+    # Append rather than app.add_websocket_route(...) — not typed on this
+    # Starlette version; the router's route list is the stable seam.
     app.router.routes.append(WebSocketRoute("/cobrowse/{session_id}", cobrowse_endpoint))
     app.router.routes.append(Route("/metrics", metrics_endpoint, methods=["GET"]))
 
-    # The bundled viewer, when one was built into the image. Mounted LAST and at
-    # the root so it can never shadow /mcp, /cobrowse or /metrics — Starlette
-    # matches routes in order. Its absence is not an error: the platform serves
-    # its own React viewer and does not need this one, so a build without the
-    # bundle simply has no root route.
+    # Bundled viewer, mounted LAST and at the root so it can never shadow
+    # /mcp, /cobrowse or /metrics (Starlette matches in order). Absence is
+    # fine — the platform serves its own React viewer.
     if VIEWER_DIR and os.path.isdir(VIEWER_DIR):
         from starlette.staticfiles import StaticFiles
 
@@ -948,27 +923,25 @@ def build_app() -> Any:
         )
         log.info("serving bundled co-browse viewer from %s", VIEWER_DIR)
 
-    # Run the idle-session reaper alongside FastMCP's own lifespan (which starts the
-    # streamable-HTTP session manager) — wrap, don't replace, so both run.
+    # Run the idle-session reaper alongside FastMCP's own lifespan — wrap,
+    # don't replace, so both run.
     mcp_lifespan = app.router.lifespan_context
 
     @contextlib.asynccontextmanager
     async def _lifespan_with_reaper(app_: Any) -> Any:
         async with mcp_lifespan(app_):
-            # Container-boot hygiene: clear stale Singleton* left on the tenant
-            # volume by hard-killed pods (only an in-Chrome quit unlinks them), so
-            # the strict S3 sync runs clean between sessions. Container-up ≠
-            # Chrome-up — no Chrome is running in THIS pod yet, and profiles owned
-            # by a live Chrome in ANOTHER pod are skipped via the per-profile
-            # flock. Best-effort; must never block serving.
+            # Boot hygiene: clear stale Singleton* left by hard-killed pods
+            # (only an in-Chrome quit unlinks them) so the strict S3 sync
+            # runs clean. No Chrome runs in THIS pod yet, and another pod's
+            # live profiles are skipped via the per-profile flock.
+            # Best-effort; must never block serving.
             if PROFILE_DIR:
                 with contextlib.suppress(Exception):
                     swept = browser_driver.clear_stale_profile_locks(PROFILE_DIR)
                     if swept:
                         log.info("boot sweep cleared stale browser locks in %d profiles", swept)
-                # Reclaim profiles orphaned while this pod was down (the cold
-                # backlog) off the durable volume — forced (bypass throttle),
-                # threaded, so a large backlog never delays readiness.
+                # Cold-backlog orphan reclaim — forced (bypass throttle),
+                # threaded so a large backlog never delays readiness.
                 _schedule_profile_gc(force=True)
             reaper = asyncio.create_task(_reap_idle_loop())
             try:
@@ -977,11 +950,10 @@ def build_app() -> Any:
                 reaper.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await reaper
-                # Graceful shutdown (SIGTERM → lifespan exit on a deploy/drain):
-                # close every live session. context.close() is an IN-CHROME quit —
-                # the only exit that unlinks Chrome's Singleton* locks — so a drain
-                # leaves every profile lock-free on the volume. Best-effort and
-                # bounded by the pod's terminationGracePeriod.
+                # Graceful shutdown: context.close() is an IN-CHROME quit —
+                # the only exit that unlinks Singleton* locks — so a drain
+                # leaves every profile lock-free on the volume. Best-effort,
+                # bounded by terminationGracePeriod.
                 with contextlib.suppress(Exception):
                     await manager.close_all()
 
@@ -991,30 +963,24 @@ def build_app() -> Any:
 
 class _StarletteWsAdapter:
     """Adapts a Starlette ``WebSocket`` to the ``send_json``/``receive_json``
-    surface :class:`CoBrowseConnection` expects, returning ``None`` on close so
-    the recv loop exits cleanly instead of raising.
+    surface :class:`CoBrowseConnection` expects; ``None`` on close so the recv
+    loop exits cleanly.
 
-    "The socket is gone" is a single fact (:attr:`_closed`), set by WHICHEVER
-    side discovers the disconnect first — a failed send OR a failed receive. This
-    matters because the two run in concurrent tasks (the screencast pump sends
-    while the recv loop receives) and Starlette surfaces a disconnect asymmetrically:
-    a send that hits ``OSError`` flips the socket's ``application_state`` to
-    DISCONNECTED and raises ``WebSocketDisconnect``; the recv guard then reads that
-    same state and raises a *bare* ``RuntimeError`` ('WebSocket is not connected'),
-    NOT a ``WebSocketDisconnect``. Catching only the latter on receive let that
-    ``RuntimeError`` escape and kill the whole handler — inflating
-    ``cobrowse_session_errors_total`` on ordinary session-ends. Both directions now
-    treat either exception as a clean close and short-circuit once closed."""
+    "Socket gone" is one fact (:attr:`_closed`) set by whichever concurrent
+    side discovers it first, because Starlette surfaces a disconnect
+    asymmetrically: a failed send raises ``WebSocketDisconnect``, after which
+    the recv guard raises a *bare* ``RuntimeError`` ('WebSocket is not
+    connected'). Catching only the former let the RuntimeError kill the whole
+    handler — inflating ``cobrowse_session_errors_total`` on ordinary
+    session-ends. Both directions treat either exception as a clean close."""
 
     def __init__(self, ws: Any) -> None:
         self._ws = ws
         self._closed = False
 
     async def send_json(self, data: dict[str, Any]) -> None:
-        # Best-effort: a client mid-disconnect makes Starlette's send raise
-        # (WebSocketDisconnect / RuntimeError). Swallow it — letting a failed push
-        # propagate would tear down the WHOLE handler, dropping the human's next
-        # input (e.g. a tab-close click) until they reconnect.
+        # Best-effort: a failed push propagating would tear down the WHOLE
+        # handler, dropping the human's next input until they reconnect.
         if self._closed:
             return
         from starlette.websockets import WebSocketDisconnect
@@ -1027,11 +993,9 @@ class _StarletteWsAdapter:
             log.debug("cobrowse: viewer socket gone on send; marking closed")
 
     async def receive_json(self) -> dict[str, Any] | None:
-        # A disconnect discovered on the send side (pump) flips application_state,
-        # so Starlette's receive guard raises a bare RuntimeError here rather than
-        # WebSocketDisconnect. Treat both as a clean close: return None so the recv
-        # loop exits normally and the handler's except-branch (which counts a
-        # session error) never runs.
+        # A send-side disconnect makes the receive guard raise a bare
+        # RuntimeError (see class docstring) — both are a clean close: return
+        # None so the error-counting except-branch never runs.
         if self._closed:
             return None
         from starlette.websockets import WebSocketDisconnect

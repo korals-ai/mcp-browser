@@ -41,146 +41,118 @@ _NETWORK_RING = 100
 _CONSOLE_TEXT_CAP = 2000
 _URL_CAP = 512
 
-# Screencast picture tuning. The three knobs balance each other and were set
-# TOGETHER — don't tune one in isolation:
-# - _DEVICE_SCALE 2: the context renders at 2x DPI so screencast JPEGs carry
-#   2x the CSS viewport's pixels (2560x1600 for the default 1280x800, more once
-#   a human resize grows the viewport — the 2x ratio holds) — this is what makes text
-#   crisp on the viewer's HiDPI display (at 1x the picture is blurry no matter
-#   the JPEG quality). CDP frame *metadata* stays in CSS px; the web viewer
-#   sizes its canvas from the JPEG's own pixels and its input math from the
-#   metadata (see apps/chat-ui/src/lib/cobrowsePaint.ts).
-# - _SCREENCAST_QUALITY 85: below ~60, JPEG ringing artifacts on text are
-#   visible even at native size; 85 keeps small UI text and thin strokes crisp.
-#   Frames are larger than at 70, but the pump only ever fans out the FRESHEST
-#   frame (stale ones are dropped), so steady-state egress stays bounded.
-# - _MIN_FRAME_INTERVAL_S: CDP emits up to ~60 fps while a page animates —
-#   frames no human needs. Capping fan-out at ~15 fps keeps scrolling and
-#   cursor motion visibly smooth (10 fps reads as steppy) while still discarding
-#   the bulk of CDP's frames. The pump fans out only the FRESHEST frame, so the
-#   cap bounds egress: worst case is ~15 x per-frame bytes per viewer. See the
-#   CoBrowseEgressHigh alert (infra/grafana_cloud/cobrowse_alerts.tf) for the
-#   per-pod ceiling this is expected to stay under.
+# Screencast picture tuning — the three knobs balance each other, set TOGETHER;
+# don't tune one in isolation:
+# - _DEVICE_SCALE 2: JPEGs carry 2x the CSS viewport's pixels, which is what
+#   keeps text crisp on a HiDPI display (1x is blurry at any JPEG quality).
+#   CDP frame *metadata* stays in CSS px; the viewer sizes its canvas from the
+#   JPEG's own pixels (apps/chat-ui/src/lib/cobrowsePaint.ts).
+# - _SCREENCAST_QUALITY 85: below ~60, JPEG ringing on text is visible even at
+#   native size.
+# - _MIN_FRAME_INTERVAL_S: CDP emits up to ~60 fps mid-animation; capping
+#   fan-out at ~15 fps stays visibly smooth (10 reads as steppy). The pump only
+#   fans out the FRESHEST frame, so the cap bounds egress at ~15 x per-frame
+#   bytes per viewer — the CoBrowseEgressHigh alert
+#   (infra/grafana_cloud/cobrowse_alerts.tf) holds the per-pod ceiling.
 _DEVICE_SCALE = 2
 _SCREENCAST_QUALITY = 85
 _MIN_FRAME_INTERVAL_S = 0.066
 
-# Bounds for a human-driven viewport resize (:meth:`PlaywrightDriver.set_viewport`).
-# The floor keeps a sliver-sized panel from rendering an unusable page; the ceiling
-# caps the screencast JPEG — which carries _DEVICE_SCALE x these pixels — so a
-# maximized panel on a 4K display can't balloon per-frame egress without limit.
+# Human-driven resize bounds (set_viewport). The floor keeps a sliver panel
+# from rendering an unusable page; the ceiling caps the screencast JPEG
+# (_DEVICE_SCALE x these pixels) so a 4K panel can't balloon per-frame egress.
 _MIN_VIEWPORT_W, _MIN_VIEWPORT_H = 400, 300
 _MAX_VIEWPORT_W, _MAX_VIEWPORT_H = 2560, 1600
 
-# Chromium launch flags that lower the automation fingerprint. Co-browse drives
-# REAL user portals (tender sites, supplier logins, Google) on the human's
-# behalf — a browser advertising itself as automated gets CAPTCHA-walled or
-# outright blocked, which breaks the feature for the user. Verified empirically:
-# `--disable-blink-features=AutomationControlled` flips `navigator.webdriver`
-# from true to false; stripping the "Headless" UA token (see `_clean_ua`) drops
-# the other dominant signal. This is not evasion for its own sake — it makes an
-# agent-driven session look like the ordinary browser session the human would
-# otherwise run themselves. (Residual signals like navigator.plugins=0 remain;
-# chasing full stealth is an arms race with no end and is out of scope.)
+# Lower the automation fingerprint: co-browse drives REAL user portals on the
+# human's behalf, and a browser advertising automation gets CAPTCHA-walled.
+# Verified: this flag flips `navigator.webdriver` to false; stripping the
+# "Headless" UA token (`_clean_ua`) drops the other dominant signal. Residual
+# signals remain — full stealth is an endless arms race, out of scope.
 _STEALTH_LAUNCH_ARGS = ["--disable-blink-features=AutomationControlled"]
 
-# Flags every containerized Chrome launch needs, independent of fingerprint. The
-# setuid/namespace sandbox can't initialize in the unprivileged per-tenant pod
-# (uid 65532, no CAP_SYS_ADMIN) — the pod itself (per-tenant, non-root,
-# egress-fenced) is the isolation boundary, so --no-sandbox is safe here.
-# K8s /dev/shm defaults to 64Mi (too small for Chrome's shared memory) → route it
-# to /tmp instead; the pod has no GPU → software rendering.
+# Chrome's setuid/namespace sandbox can't initialize in the unprivileged
+# per-tenant pod (uid 65532, no CAP_SYS_ADMIN); the pod itself (per-tenant,
+# non-root, egress-fenced) is the isolation boundary, so --no-sandbox is safe.
+# K8s /dev/shm is 64Mi (too small for Chrome) → /tmp; no GPU → software render.
 _CONTAINER_LAUNCH_ARGS = ["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"]
 
 
 def _launch_args() -> list[str]:
-    """The full Chrome arg list handed to every launch: fingerprint + container."""
     return [*_STEALTH_LAUNCH_ARGS, *_CONTAINER_LAUNCH_ARGS]
 
 
 def _env_headless() -> bool:
-    """Whether to launch Chrome headless. Prod runs HEADED (a real window under
-    Xvfb) for the lowest automation fingerprint on real portals; the test/CI
-    image has no X server, so the default is headless. ``BROWSER_HEADLESS=false``
-    (set in the pod image) → headed."""
+    """Prod runs HEADED (real window under Xvfb) for the lowest automation
+    fingerprint; the test/CI image has no X server, so the default is headless.
+    ``BROWSER_HEADLESS=false`` (set in the pod image) → headed."""
     return os.environ.get("BROWSER_HEADLESS", "true").strip().lower() not in ("false", "0", "no")
 
 
 def _env_executable_path() -> str | None:
-    """The pinned Chrome for Testing binary baked into the pod image
-    (``BROWSER_EXECUTABLE_PATH``). Unset (tests/CI) → Playwright's bundled
-    Chromium, so the unit suite needs no browser install."""
+    """The pinned Chrome for Testing binary baked into the pod image. Unset
+    (tests/CI) → Playwright's bundled Chromium, so no browser install needed."""
     return os.environ.get("BROWSER_EXECUTABLE_PATH") or None
 
 
 def _clean_ua(ua: str) -> str | None:
-    """Strip the ``Headless`` marker from a Chromium UA (``HeadlessChrome`` →
-    ``Chrome``), returning the cleaned string — or None if it needs no change.
-    Derived from the browser's OWN reported UA at runtime, so the Chrome version
-    never drifts out of sync with a hardcoded constant."""
+    """Strip the ``Headless`` UA marker; None if no change needed. Derived from
+    the browser's OWN reported UA so the Chrome version can't drift from a
+    hardcoded constant."""
     if "Headless" not in ua:
         return None
     return ua.replace("HeadlessChrome", "Chrome").replace("Headless", "")
 
 
 def _truncate_url(url: str) -> str:
-    """Cap a URL for the network log: collapse huge inline ``data:``/``blob:`` URIs
-    to a short scheme tag, and length-cap the rest with an ellipsis."""
+    """Cap a URL for the network log; inline ``data:``/``blob:`` URIs collapse
+    to their scheme tag so a payload never lands in the ring."""
     u = url or ""
     if u.startswith("data:") or u.startswith("blob:"):
         return u.split(",", 1)[0][:40]  # e.g. "data:image/png;base64" — not the payload
     return u if len(u) <= _URL_CAP else u[:_URL_CAP] + "…"
 
 
-# Where a session's open-tab set is recorded inside its (EFS-durable) profile dir,
-# so a pod/container restart can reopen the same tabs instead of one blank page.
-# Chrome ignores unknown files in its user-data-dir, so a sidecar file here is safe.
+# Open-tab set recorded inside the (EFS-durable) profile dir so a restart
+# reopens the same tabs. Chrome ignores unknown files in its user-data-dir.
 _OPEN_TABS_FILE = ".cobrowse_open_tabs.json"
-# Bound a restore: don't reopen a pathological number of tabs, and cap each tab's
-# load so one slow/hung URL can't stall the whole session start.
+# Bound a restore: cap the tab count, and cap each tab's load so one hung URL
+# can't stall the whole session start.
 _MAX_RESTORE_TABS = 20
 _RESTORE_GOTO_TIMEOUT_MS = 15000
 
-# Chrome's user-data-dir runs LIVE on the tenant volume (<profile_dir> itself), so
-# every cookie/login/IndexedDB write is durable the moment Chrome makes it —
-# continuous durability, no checkpoint interval, no coverage lists. The two costs of
-# this placement are handled at their owners: Chrome's Singleton* lock symlinks
-# (dangling by design) are cleared by US at every launch + container boot under a
-# per-profile flock, and the S3 sync layer is strict complete-or-nothing (a walker
-# skip can never silently truncate the backup — see apps/base-images/s3-sync).
+# Chrome's user-data-dir runs LIVE on the tenant volume, so every cookie/login/
+# IndexedDB write is durable the moment Chrome makes it. The two costs are
+# handled at their owners: Chrome's dangling Singleton* lock symlinks are
+# cleared by US at every launch + container boot under a per-profile flock, and
+# the S3 sync layer is strict complete-or-nothing (apps/base-images/s3-sync).
 # Design: docs/plan/20260731T123000Z-cobrowse-profile-durability.md;
 # incident: docs/incidents/2026-07-30-cobrowse-singleton-symlink-backup-erosion.md.
 #
-# One release earlier the durable store was a single tar.gz snapshot
-# (<profile_dir>/profile.tar.gz) of an ephemeral runtime dir; on first launch we
-# reverse-migrate it (extract to the profile root, delete the archive) so logins
-# carry over, then never write an archive again.
+# One release earlier the durable store was a tar.gz snapshot of an ephemeral
+# runtime dir; first launch reverse-migrates it (extract, delete the archive).
 _DURABLE_ARCHIVE = "profile.tar.gz"
 # tar tmp prefix the archive-era checkpointer staged (swept if a crash left one).
 _CKPT_TMP_PREFIX = ".profile.tar.gz.tmp-"
-# Cross-pod mutual exclusion for the profile: an fcntl flock held for the whole
-# session (launch → close). Chrome's own SingletonLock cannot serve this purpose
-# across pods — it encodes hostname+pid, and a dead pod's lock just makes the next
-# Chrome refuse with 'profile in use' — so we clear Chrome's lock and hold a real
-# one on the shared volume instead (EFS NFSv4 flocks; same pattern as the
-# workspace image's per-chat locks). Anyone clearing Singleton* — or
-# garbage-collecting a profile (:mod:`src.profile_gc`) — MUST hold this.
+# Cross-pod mutual exclusion: an fcntl flock held for the whole session
+# (launch → close). Chrome's own SingletonLock can't serve across pods — it
+# encodes hostname+pid, so a dead pod's lock just makes the next Chrome refuse
+# with 'profile in use'. EFS NFSv4 flocks, same pattern as the workspace
+# image's per-chat locks. Anyone clearing Singleton* — or garbage-collecting a
+# profile (:mod:`src.profile_gc`) — MUST hold this.
 #
-# The lock lives OUTSIDE the profile dir, in a sibling ``.cobrowse/locks/<id>.lock``
-# that is NEVER deleted, so the GC can rename-then-rm the profile dir without
-# unlinking the exclusion inode mid-delete. Were the lock inside the dir, a
-# concurrent launch would O_CREAT a fresh inode at the same path and flock it while
-# the dir is half-gone → SQLite/cookie corruption (a proven race). A launch and the
-# GC contend on this one stable inode instead. See B.1 in
+# The lock lives OUTSIDE the profile dir (sibling ``.cobrowse/locks/<id>.lock``,
+# NEVER deleted) so the GC can rename-then-rm the profile without unlinking the
+# exclusion inode mid-delete: a lock inside the dir lets a concurrent launch
+# O_CREAT a fresh inode and flock it while the dir is half-gone → SQLite/cookie
+# corruption (a proven race). See B.1 in
 # docs/plan/20260810T182738Z-cobrowse-profile-footprint.md.
 _LOCKS_SUBDIR = "locks"
 
 
 def profile_lock_path(profile_dir: str) -> str:
-    """Stable external flock path for the profile at ``profile_dir``:
-    ``.cobrowse/profile/<id>`` → ``.cobrowse/locks/<id>.lock``. Lives outside the
-    (deletable) profile subtree and is never unlinked, so a launch and the profile
-    GC mutually exclude on it across the profile's own deletion."""
+    """Stable external flock path: ``.cobrowse/profile/<id>`` →
+    ``.cobrowse/locks/<id>.lock`` (see the lock-placement block above)."""
     profile_dir = profile_dir.rstrip("/")
     chat_id = os.path.basename(profile_dir)
     cobrowse_root = os.path.dirname(os.path.dirname(profile_dir))
@@ -188,26 +160,23 @@ def profile_lock_path(profile_dir: str) -> str:
 
 
 def _clear_singleton_locks(profile_dir: str) -> None:
-    """Remove Chromium's ``Singleton{Lock,Cookie,Socket}`` from a persistent
-    profile. Only an in-Chrome quit unlinks them (SIGTERM/SIGKILL do not —
-    verified), and a next pod has a different hostname, so Chromium treats a stale
-    lock as 'profile in use by another computer' and refuses to launch. Clearing is
-    therefore load-bearing, and is only safe under the profile flock (the caller's
-    responsibility) — never delete a LIVE Chrome's locks."""
+    """Remove Chromium's ``Singleton{Lock,Cookie,Socket}``. Only an in-Chrome
+    quit unlinks them (SIGTERM/SIGKILL do not — verified), and the next pod has
+    a different hostname, so Chromium reads a stale lock as 'profile in use by
+    another computer' and refuses to launch. Only safe under the profile flock
+    (caller's responsibility) — never delete a LIVE Chrome's locks."""
     for name in ("SingletonLock", "SingletonCookie", "SingletonSocket"):
         with contextlib.suppress(OSError):
             os.remove(os.path.join(profile_dir, name))
 
 
-# Regenerable browser caches Chrome recreates on demand. `Cache` + `Code Cache`
-# are ALSO redirected off the PVC to the per-pod emptyDir (--disk-cache-dir), so
-# any copy left in the profile is stale (pre-redirect) dead weight; the rest
-# (GPU/shader/crx/Service-Worker caches) are un-relocatable but equally
-# regenerable. Deleting them at launch keeps the on-PVC profile to durable state
-# only (cookies/logins/IndexedDB) and stops cache accumulating across sessions +
-# syncing to S3 — the WorkspaceTenantBloat cause. The per-launch complement to the
-# boot-time orphan GC. Relative to the profile dir (root + Chrome's `Default`
-# sub-profile). See docs/plan/20260810T182738Z-cobrowse-profile-footprint.md.
+# Regenerable caches Chrome recreates on demand. `Cache`/`Code Cache` are also
+# redirected off the PVC (--disk-cache-dir), so an on-PVC copy is stale dead
+# weight; the GPU/shader/crx/Service-Worker tail is un-relocatable but equally
+# regenerable. Deleting at launch keeps the on-PVC profile to durable state
+# (cookies/logins/IndexedDB) and stops cache syncing to S3 — the
+# WorkspaceTenantBloat cause. Paths relative to the profile dir (root +
+# `Default`). See docs/plan/20260810T182738Z-cobrowse-profile-footprint.md.
 _REGENERABLE_CACHE_SUBDIRS = (
     "Cache",
     "Code Cache",
@@ -231,11 +200,9 @@ _REGENERABLE_CACHE_SUBDIRS = (
 
 
 def purge_regenerable_cache(profile_dir: str) -> int:
-    """Delete regenerable browser cache dirs from a profile (best-effort); returns
-    the count removed. MUST be called under the profile flock with no live Chrome
-    on the dir — Chrome regenerates what it needs on the next launch, and the
-    durable state (cookies/logins/IndexedDB) is untouched (only cache names are
-    matched, never Cookies/Local Storage/IndexedDB/Sessions)."""
+    """Delete regenerable cache dirs from a profile (best-effort); returns the
+    count removed. MUST run under the profile flock with no live Chrome on the
+    dir. Only cache names are matched — never Cookies/Local Storage/IndexedDB."""
     removed = 0
     for rel in _REGENERABLE_CACHE_SUBDIRS:
         target = os.path.join(profile_dir, rel)
@@ -247,12 +214,11 @@ def purge_regenerable_cache(profile_dir: str) -> int:
 
 
 def clear_stale_profile_locks(base_dir: str) -> int:
-    """Container-boot hygiene: sweep every chat profile under ``base_dir`` and
-    remove stale ``Singleton*`` left by hard-killed pods, so the S3 sync of the
-    tenant volume runs clean between sessions. Each profile is tried under a
-    NON-blocking flock — a held lock means a live Chrome (another pod) owns that
-    profile, and we must not touch its locks. Returns the number of profiles
-    swept. Best-effort: a boot sweep must never block serving."""
+    """Container-boot hygiene: remove stale ``Singleton*`` left by hard-killed
+    pods so the tenant-volume S3 sync runs clean. Each profile is tried under a
+    NON-blocking flock — a held lock means another pod's live Chrome owns it,
+    and we must not touch its locks. Returns the profile count swept.
+    Best-effort: a boot sweep must never block serving."""
     swept = 0
     try:
         entries = os.listdir(base_dir)
@@ -287,9 +253,7 @@ class BrowserDriver(Protocol):
     """Everything the pod needs from ONE browser session (with N tabs). Async
     throughout — every method touches the browser over CDP."""
 
-    async def open(self, url: str, *, new_tab: bool = False) -> None:
-        """Navigate the active tab to ``url`` (or open a new tab first)."""
-        ...
+    async def open(self, url: str, *, new_tab: bool = False) -> None: ...
 
     async def list_tabs(self) -> list[dict[str, Any]]:
         """The open tabs as ``[{id, title, url, active}]`` in tab order."""
@@ -310,17 +274,11 @@ class BrowserDriver(Protocol):
         the caller redacts — see :mod:`src.snapshot`)."""
         ...
 
-    async def click(self, ref: str) -> None:
-        """Click the element identified by a ref from a prior snapshot."""
-        ...
+    async def click(self, ref: str) -> None: ...
 
-    async def type_text(self, ref: str, text: str) -> None:
-        """Type ``text`` into the element identified by ``ref``."""
-        ...
+    async def type_text(self, ref: str, text: str) -> None: ...
 
-    async def scroll(self, direction: str, amount: int) -> None:
-        """Scroll the active tab ``up``/``down`` by ``amount`` pixels (viewing)."""
-        ...
+    async def scroll(self, direction: str, amount: int) -> None: ...
 
     # --- reading / understanding (view-only) --------------------------------
 
@@ -333,9 +291,7 @@ class BrowserDriver(Protocol):
         ``{count, snippet}``."""
         ...
 
-    async def screenshot(self) -> bytes:
-        """A PNG screenshot of the active tab's viewport."""
-        ...
+    async def screenshot(self) -> bytes: ...
 
     async def inspect(self, ref: str) -> dict[str, Any]:
         """Details of one element (tag, attributes, text, box, visible/enabled)."""
@@ -348,17 +304,11 @@ class BrowserDriver(Protocol):
 
     # --- history / reliability (view-only) ----------------------------------
 
-    async def go_back(self) -> None:
-        """Navigate back in history."""
-        ...
+    async def go_back(self) -> None: ...
 
-    async def go_forward(self) -> None:
-        """Navigate forward in history."""
-        ...
+    async def go_forward(self) -> None: ...
 
-    async def reload(self) -> None:
-        """Reload the active tab."""
-        ...
+    async def reload(self) -> None: ...
 
     async def wait_for(self, *, text: str | None, selector: str | None, timeout_ms: int) -> bool:
         """Wait until ``text`` appears (or CSS ``selector`` matches). False on
@@ -367,17 +317,11 @@ class BrowserDriver(Protocol):
 
     # --- extra actions (mutating — approved in chat) ------------------------
 
-    async def press_key(self, key: str) -> None:
-        """Press a key on the active tab (Enter/Escape/Tab/ArrowDown/…)."""
-        ...
+    async def press_key(self, key: str) -> None: ...
 
-    async def select_option(self, ref: str, value: str) -> None:
-        """Choose ``value`` in a native ``<select>`` identified by ``ref``."""
-        ...
+    async def select_option(self, ref: str, value: str) -> None: ...
 
-    async def upload_file(self, ref: str, path: str) -> None:
-        """Set a file input (``ref``) to a file at ``path`` on the tenant volume."""
-        ...
+    async def upload_file(self, ref: str, path: str) -> None: ...
 
     async def download(self, ref: str, dest_path: str) -> dict[str, Any]:
         """Click ``ref`` to trigger a download and save it to ``dest_path`` on the
@@ -401,9 +345,7 @@ class BrowserDriver(Protocol):
         """Set session-wide auto-handling of JS dialogs: ``accept`` or ``dismiss``."""
         ...
 
-    async def last_dialog(self) -> dict[str, Any] | None:
-        """The most recent auto-handled dialog, or None."""
-        ...
+    async def last_dialog(self) -> dict[str, Any] | None: ...
 
     # --- console / network observability ------------------------------------
 
@@ -423,13 +365,9 @@ class BrowserDriver(Protocol):
 
     # --- interaction extras -------------------------------------------------
 
-    async def hover(self, ref: str) -> None:
-        """Hover the pointer over the element ``ref`` (reveals hover menus)."""
-        ...
+    async def hover(self, ref: str) -> None: ...
 
-    async def drag(self, from_ref: str, to_ref: str) -> None:
-        """Drag the ``from_ref`` element onto the ``to_ref`` element."""
-        ...
+    async def drag(self, from_ref: str, to_ref: str) -> None: ...
 
     async def scroll_to(self, ref: str) -> bool:
         """Scroll ``ref`` into view. False if the ref isn't on the page."""
@@ -490,9 +428,7 @@ class BrowserDriver(Protocol):
         device scale (screencast crispness) is preserved."""
         ...
 
-    async def close(self) -> None:
-        """Tear down all tabs + the browser context."""
-        ...
+    async def close(self) -> None: ...
 
 
 class _Tab:
@@ -502,17 +438,15 @@ class _Tab:
         self.id = tab_id
         self.page = page
         self.cdp = cdp
-        # The Page.screencastFrame listener bound to THIS tab's CDP session while it
-        # is streaming (None otherwise). Stored so we remove the exact callable we
-        # registered — a per-tab closure that captures this cdp, so a late frame is
-        # acked to the session it came from, and removal never mismatches a shared
-        # handler across tabs.
+        # The Page.screencastFrame listener bound to THIS tab's CDP session while
+        # streaming (None otherwise). Stored so removal targets the exact callable
+        # registered — pyee removes by identity, and a per-tab closure acks a late
+        # frame to the session it came from.
         self._screencast_handler: Callable[[dict[str, Any]], Awaitable[None]] | None = None
-        # Which frame element ops act on (None = the page's main frame). A prior
-        # switch_frame pins a child frame here; reset on a tab switch.
+        # Which frame element ops act on (None = main). switch_frame pins a
+        # child here; reset on a tab switch.
         self.active_frame_key: str | None = None
-        # Bounded per-tab observability buffers (console + network), populated by
-        # the listeners _install_observers wires onto the page.
+        # Bounded per-tab console/network rings, fed by _install_observers.
         self.console_ring: deque[dict[str, Any]] = deque(maxlen=_CONSOLE_RING)
         self.network_ring: deque[dict[str, Any]] = deque(maxlen=_NETWORK_RING)
         self._observers_installed = False
@@ -533,25 +467,20 @@ class PlaywrightDriver:
         executable_path: str | None = None,
     ) -> None:
         self._viewport = viewport
-        # Chrome's user-data-dir, LIVE on the tenant volume: every write is durable
-        # the moment Chrome makes it (survives pod death via the PVC; survives reap
-        # via the strict S3 sync). None → fully ephemeral context (unit/CI runs).
+        # Chrome's user-data-dir, LIVE on the tenant volume (see the module-level
+        # durability block). None → fully ephemeral context (unit/CI runs).
         self._profile_dir = profile_dir or None
-        # Chrome's REGENERABLE disk cache (HTTP + Code Cache) is redirected here via
-        # --disk-cache-dir — a PER-SESSION dir on a node-disk emptyDir, OFF the EFS
-        # profile so it never syncs to S3. None → cache stays under the profile
-        # (unit/CI runs, or when BROWSER_CACHE_DIR is unset). disk_cache_size caps
-        # Chrome's own writes (bytes, --disk-cache-size). See the profile-footprint
-        # plan; per-session isolation is REQUIRED (concurrent Chromes corrupt a
-        # shared cache dir).
+        # Regenerable disk cache redirected to a PER-SESSION node-disk emptyDir
+        # dir, off the EFS profile so it never syncs to S3. Per-session is
+        # REQUIRED — concurrent Chromes corrupt a shared cache dir. None → cache
+        # stays under the profile (unit/CI). disk_cache_size caps Chrome's own
+        # writes (bytes).
         self._cache_dir = cache_dir or None
         self._disk_cache_size = disk_cache_size or None
-        # fd of the held per-profile flock (cross-pod mutual exclusion), held from
-        # start() until close(). None while not holding it.
+        # fd of the held per-profile flock, start() → close(). None = not held.
         self._profile_lock_fd: int | None = None
-        # Prod: headed real Chrome (Chrome for Testing) for the lowest bot-wall
-        # friction; tests/CI: headless bundled Chromium (no X server, no CfT
-        # binary). Env-derived unless a caller pins them explicitly.
+        # Prod: headed Chrome for Testing (lowest bot-wall friction); tests/CI:
+        # headless bundled Chromium. Env-derived unless a caller pins them.
         self._headless = _env_headless() if headless is None else headless
         self._executable_path = (
             _env_executable_path() if executable_path is None else executable_path
@@ -562,40 +491,35 @@ class PlaywrightDriver:
         self._tabs: list[_Tab] = []
         self._active_id: str | None = None
         self._tab_seq = 0
-        # Screencast: only the ACTIVE tab's CDP streams. Every attached viewer
-        # registers a frame sink here; the CDP capture + pump run once and fan the
-        # freshest frame out to ALL sinks, so N viewers share one capture. The set
-        # being non-empty IS "screencasting". On tab switch, capture moves CDP
-        # sessions but the sinks are unchanged.
+        # Screencast: only the ACTIVE tab's CDP streams. Each viewer registers a
+        # frame sink; the capture + pump run ONCE and fan the freshest frame to
+        # all sinks. The set being non-empty IS "screencasting". A tab switch
+        # moves the capture's CDP session; the sinks are unchanged.
         self._sinks: set[Callable[[str, dict[str, Any]], Awaitable[None]]] = set()
         self._latest_frame: tuple[str, dict[str, Any]] | None = None
         self._frame_ready: asyncio.Event | None = None
         self._pump_task: asyncio.Task[None] | None = None
-        # Fan-out rate cap (see _MIN_FRAME_INTERVAL_S). An instance attribute so
-        # tests can shrink it without patching the module constant.
+        # Instance attribute so tests can shrink it without patching the constant.
         self._min_frame_interval = _MIN_FRAME_INTERVAL_S
-        # The CDP session currently running the capture (the active tab's, while any
-        # viewer is attached). Tracked so teardown can prove it targets the session
-        # that was actually streaming and a late frame can tell it switched away.
+        # The CDP session actually running the capture — lets teardown prove it
+        # targets the streaming session, and a late frame tell it switched away.
         self._capturing_cdp: Any = None
-        # Session-wide policy for native JS dialogs (alert/confirm/prompt/
-        # beforeunload). Default DISMISS — auto-accepting a confirm would silently
-        # OK a "Delete?"/"Submit?"/beforeunload with no human in the loop. The
-        # agent opts into accept via the approval-gated browser_set_dialog_mode.
+        # Native JS dialog policy. Default DISMISS — auto-accepting a confirm
+        # would silently OK a "Delete?"/beforeunload with no human in the loop;
+        # accept is opted into via the approval-gated browser_set_dialog_mode.
         self._dialog_mode = "dismiss"
         self._last_dialog: dict[str, Any] | None = None
-        # Cleaned user-agent (Headless token stripped), computed once from the
-        # browser's own UA at start(). Applied to every tab's CDP session so
-        # navigator.userAgent + request headers carry it. None once we've
-        # confirmed the browser's UA already needs no cleaning.
+        # Cleaned UA (Headless token stripped), computed once from the browser's
+        # own UA at start() and pushed onto every tab's CDP session. None when
+        # the UA needs no cleaning.
         self._ua: str | None = None
         # True only while replaying saved tabs at start(): suppresses the
-        # navigation-triggered persistence so a half-restored set can't overwrite
-        # the file we're restoring FROM.
+        # navigation-triggered persistence so a half-restored set can't
+        # overwrite the file being restored FROM.
         self._replaying = False
-        # Last (urls, active) written, to skip redundant EFS writes — a main-frame
-        # framenavigated can re-fire with the SAME url (SPA History API churn), and
-        # rewriting an unchanged file every time is pure write amplification.
+        # Last (urls, active) written — a main-frame framenavigated can re-fire
+        # with the SAME url (SPA History churn), and rewriting an unchanged file
+        # is pure EFS write amplification.
         self._last_persisted: tuple[tuple[str, ...], int] | None = None
 
     def _next_tab_id(self) -> str:
@@ -636,33 +560,25 @@ class PlaywrightDriver:
             await cdp.send("Network.setUserAgentOverride", {"userAgent": self._ua})
 
     async def start(self) -> None:
-        """Launch Chromium + open the first tab. Import Playwright here so the
-        module imports cleanly on hosts without the browser installed.
-
-        With ``profile_dir`` set, Chromium runs against a **persistent**
-        user-data-dir — the profile dir itself, live on the tenant volume, so
-        cookies/logins are durable continuously. The launch takes the per-profile
-        flock first (cross-pod single-writer), reverse-migrates an archive-era
-        ``profile.tar.gz`` if one exists, and clears any stale Singleton* locks.
-        Without a profile dir, a throwaway ephemeral context is used (unit/CI runs,
-        or a pod with no volume)."""
-        from playwright.async_api import async_playwright  # lazy: heavy dep
+        """Launch Chromium + open the first tab. With ``profile_dir`` set, runs
+        a persistent user-data-dir live on the tenant volume: takes the
+        per-profile flock, reverse-migrates an archive-era ``profile.tar.gz``,
+        clears stale Singleton* locks. Without one, a throwaway ephemeral
+        context (unit/CI, or a pod with no volume)."""
+        # Lazy import so the module loads on hosts without Playwright installed.
+        from playwright.async_api import async_playwright
 
         try:
             self._playwright = await async_playwright().start()
             w, h = self._viewport
             if self._cache_dir:
-                # This session's own cache dir on the emptyDir (never the profile).
                 os.makedirs(self._cache_dir, exist_ok=True)
             if self._profile_dir:
                 os.makedirs(self._profile_dir, exist_ok=True)
                 self._acquire_profile_lock()  # cross-pod single-writer, held to close()
                 self._sweep_checkpoint_scratch()  # retire archive-era crash scratch
                 self._migrate_archived_profile()  # one-time: tar.gz → live dir
-                # Keep only durable state on the PVC: drop regenerable cache (the
-                # HTTP/Code cache already redirects to the emptyDir; this clears
-                # the stale on-PVC copy + the un-relocatable GPU/SW cache tail so
-                # it never accumulates across sessions). Under the flock, pre-launch.
+                # Keep only durable state on the PVC. Under the flock, pre-launch.
                 purged = purge_regenerable_cache(self._profile_dir)
                 if purged:
                     log.info("cobrowse purged %d regenerable cache dir(s) from profile", purged)
@@ -689,28 +605,23 @@ class PlaywrightDriver:
         metrics.inc_chromium_launch()
 
     async def _prime_ua_override(self, first: _Tab) -> None:
-        """Read the browser's own UA from the first tab; if it advertises Headless,
-        compute the cleaned UA and apply it to the first tab NOW (later tabs pick it
-        up via _apply_ua_override). Best-effort: a UA read/override failure must not
-        block the session — the browser still works, just less disguised."""
+        """Compute the cleaned UA from the first tab and apply it there NOW
+        (later tabs get it via _apply_ua_override). Best-effort: a failure must
+        not block the session — the browser still works, just less disguised."""
         with contextlib.suppress(Exception):
             raw = await first.page.evaluate("() => navigator.userAgent")
             self._ua = _clean_ua(str(raw))
             await self._apply_ua_override(first.cdp)
 
     def _cache_launch_args(self) -> list[str]:
-        """``--disk-cache-dir`` (+ ``--disk-cache-size`` cap) so Chrome's
-        regenerable HTTP/Code cache lands on this session's emptyDir subdir, NOT
-        the EFS profile. Empty when no cache dir is configured (unit/CI, or
-        BROWSER_CACHE_DIR unset). The dir is per-session (server._cache_dir_for);
-        a shared dir corrupts concurrent Chromes + leaks cache across chats."""
+        """``--disk-cache-dir`` (+ size cap) pointing Chrome's regenerable cache
+        at this session's emptyDir subdir, NOT the EFS profile. Empty when no
+        cache dir is configured (unit/CI)."""
         if not self._cache_dir:
             return []
         args = [f"--disk-cache-dir={self._cache_dir}"]
-        # str of bytes from BROWSER_DISK_CACHE_SIZE; ignore a non-numeric value
-        # rather than feed Chrome a flag it silently drops — but say so, don't
-        # swallow it (a mis-set cap would otherwise let the cache grow unbounded
-        # with no signal).
+        # A non-numeric cap is dropped rather than fed to Chrome — but loudly:
+        # silently ignoring it would let the cache grow unbounded with no signal.
         if self._disk_cache_size:
             if self._disk_cache_size.isdigit():
                 args.append(f"--disk-cache-size={self._disk_cache_size}")
@@ -742,27 +653,23 @@ class PlaywrightDriver:
         )
 
     # --- live-on-PVC profile: flock + one-time reverse migration ------------------
-    #
-    # Chrome runs directly on <profile_dir> (the tenant volume). The per-profile
-    # flock is the cross-pod single-writer guarantee Chrome's own SingletonLock
-    # cannot provide across pods; it is held for the whole session so no other pod
-    # can clear our live locks or double-launch on this profile.
 
     def _profile_lock_path(self) -> str:
         assert self._profile_dir is not None
         return profile_lock_path(self._profile_dir)
 
     def _acquire_profile_lock(self) -> None:
-        """Take the per-profile flock, non-blocking. A held lock means another pod's
-        live Chrome owns this profile — fail the launch loudly rather than corrupt a
-        shared profile or block a user request indefinitely."""
+        """Take the per-profile flock, non-blocking, held until close(). A held
+        lock means another pod's live Chrome owns this profile — fail the launch
+        loudly rather than corrupt a shared profile or block indefinitely."""
         lock_path = self._profile_lock_path()
-        os.makedirs(os.path.dirname(lock_path), exist_ok=True)  # external .cobrowse/locks/
+        os.makedirs(os.path.dirname(lock_path), exist_ok=True)
         fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError as exc:
             os.close(fd)
+            log.warning("cobrowse profile flock held by another session/pod: %s", lock_path)
             raise RuntimeError(
                 "browser profile is in use by another session/pod (profile flock held)"
             ) from exc
@@ -789,12 +696,10 @@ class PlaywrightDriver:
                         os.remove(os.path.join(self._profile_dir, name))
 
     def _migrate_archived_profile(self) -> None:
-        """One-time reverse migration from the archive-era layout: a previous image
-        kept the profile as <profile_dir>/profile.tar.gz (tar of the user-data-dir
-        root). Extract it onto the profile root so logins carry over, then delete
-        the archive — from here on the live dir IS the durable store. Idempotent: a
-        crash between extract and delete just re-extracts the same content next
-        launch. A corrupt archive is non-fatal (log + start fresh) but is kept for
+        """One-time reverse migration: extract an archive-era profile.tar.gz
+        onto the profile root so logins carry over, then delete the archive.
+        Idempotent — a crash between extract and delete re-extracts next launch.
+        A corrupt archive is non-fatal (log + start fresh) but kept for
         forensics rather than silently deleted."""
         if not self._profile_dir:
             return
@@ -819,13 +724,11 @@ class PlaywrightDriver:
     # --- open-tab persistence / restore (session continuity across restart) ---
 
     def _persist_open_tabs(self) -> None:
-        """Record the current tabs' URLs + active index into the profile dir, so a
-        restart can reopen them. No-op without a persistent profile or mid-replay.
-        Best-effort and non-fatal: a failed write must never break browsing.
-
-        Writes atomically (tmp + os.replace) so a crash mid-write can't leave a torn
-        file. If nothing worth restoring is open (only blank tabs), the file is
-        removed so a stale set doesn't linger."""
+        """Record tab URLs + active index into the profile dir for restart
+        restore. No-op without a persistent profile or mid-replay; best-effort —
+        a failed write must never break browsing. Atomic (tmp + os.replace) so a
+        crash can't leave a torn file; an all-blank tab set removes the file so
+        a stale set doesn't linger."""
         if not self._profile_dir or self._replaying:
             return
         try:
@@ -849,9 +752,8 @@ class PlaywrightDriver:
             log.debug("cobrowse persist open tabs failed", exc_info=True)
 
     def _read_saved_tabs(self) -> tuple[list[str], int] | None:
-        """The saved ``(urls, active_index)`` from a prior session, or None when
-        there's no profile dir / no file / a garbled file (treated as 'nothing to
-        restore', never an error)."""
+        """The saved ``(urls, active_index)``, or None — a missing/garbled file
+        is 'nothing to restore', never an error."""
         if not self._profile_dir:
             return None
         try:
@@ -864,14 +766,14 @@ class PlaywrightDriver:
         return (urls, active) if urls else None
 
     async def _restore_saved_tabs(self, first: _Tab) -> None:
-        """Reopen the saved tab set onto a freshly-launched persistent context: the
-        first saved URL on the already-adopted ``first`` tab, the rest as new tabs,
-        loaded concurrently (bounded) so many tabs don't serialize the session start.
-        A single failed/blank URL is skipped, not fatal. Restores the active tab."""
+        """Reopen the saved tab set: first URL on the already-adopted ``first``
+        tab, the rest as new tabs, loaded concurrently so many tabs don't
+        serialize session start. A failed/blank URL is skipped, not fatal."""
         saved = self._read_saved_tabs()
         if saved is None:
             return
         urls, active = saved
+        log.info("cobrowse restoring %d saved tab(s)", min(len(urls), _MAX_RESTORE_TABS))
         self._replaying = True
         try:
             targets: list[tuple[_Tab, str]] = []
@@ -886,8 +788,8 @@ class PlaywrightDriver:
         self._persist_open_tabs()  # normalize the file to what actually restored
 
     async def _safe_restore_goto(self, tab: _Tab, url: str) -> None:
-        """Navigate one restored tab, tolerating a blank/failed/slow URL — a dead
-        saved link must leave a usable (blank) tab, not abort the whole restore."""
+        """Navigate one restored tab — a dead saved link must leave a usable
+        (blank) tab, not abort the whole restore."""
         if not url or url == "about:blank":
             return
         with contextlib.suppress(Exception):
@@ -911,9 +813,9 @@ class PlaywrightDriver:
     # --- native dialogs (alert/confirm/prompt/beforeunload) -----------------
 
     def _install_dialog_handler(self, page: Any) -> None:
-        """Wire a dialog handler onto ONE page (every tab, at creation) so no tab
-        can wedge on an unhandled dialog. Reads self._dialog_mode LIVE at fire time,
-        so set_dialog_mode governs already-open tabs too."""
+        """Wired onto every tab at creation so no tab can wedge on an unhandled
+        dialog. Reads self._dialog_mode LIVE at fire time, so set_dialog_mode
+        governs already-open tabs too."""
 
         async def _on_dialog(dialog: Any) -> None:
             info: dict[str, Any] = {
@@ -949,8 +851,8 @@ class PlaywrightDriver:
     # --- console + network observability (bounded per-tab rings) -------------
 
     def _install_observers(self, tab: _Tab) -> None:
-        """Wire bounded console + network ring buffers onto ONE tab's page.
-        Idempotent (guarded) so re-adopting a tab never double-registers."""
+        """Wire the console + network rings onto one tab's page. Idempotent so
+        re-adopting a tab never double-registers."""
         if tab._observers_installed:
             return
         tab._observers_installed = True
@@ -1035,8 +937,8 @@ class PlaywrightDriver:
 
     @staticmethod
     def _frame_key(frame: Any, page: Any) -> str:
-        """A stable-enough identity for a child frame (name|url) so a pinned frame
-        stays re-findable across a page.frames re-read within the same document."""
+        """Stable-enough child-frame identity (name|url) so a pinned frame stays
+        re-findable across a page.frames re-read within the same document."""
         name = ""
         with contextlib.suppress(Exception):
             name = frame.name or ""
@@ -1046,9 +948,8 @@ class PlaywrightDriver:
         return f"{name}|{url}"
 
     def _active_frame(self) -> Any:
-        """The Playwright Frame element ops act on for the active tab. Defaults to
-        the main frame; a switch_frame pin resolves to a child unless it detached/
-        navigated away, in which case we fall back to main and clear the stale pin."""
+        """The Frame element ops act on: main, unless a switch_frame pin still
+        resolves — a detached/navigated-away pin falls back to main and clears."""
         tab = self._active()
         page = tab.page
         key = tab.active_frame_key
@@ -1135,11 +1036,9 @@ class PlaywrightDriver:
         if tab is None:
             return False
         was_active = tab_id == self._active_id
-        # Stop the closing tab's screencast on ITS OWN cdp first — while it's still
-        # the active tab — so teardown targets the session that was actually
-        # streaming. Once it's removed from self._tabs, _active() would fall back to
-        # the replacement and _activate would tear the screencast down against the
-        # WRONG session, leaking this one's listener + capture.
+        # Stop the closing tab's screencast on ITS OWN cdp first: once removed
+        # from self._tabs, _active() falls back to the replacement and teardown
+        # would target the WRONG session, leaking this one's listener + capture.
         if was_active and self._sinks:
             await self._stop_screencast_on(tab)
         self._tabs = [t for t in self._tabs if t.id != tab_id]
@@ -1197,13 +1096,10 @@ class PlaywrightDriver:
         return dict(result)
 
     async def screenshot(self) -> bytes:
-        # scale="css" pins the agent's screenshot to 1 px per CSS px (the live
-        # viewport, which a human resize may have changed from the 1280x800 default)
-        # regardless of the context's 2x _DEVICE_SCALE. The 2x rendering exists
-        # for the HUMAN screencast; without this cap every agent screenshot
-        # would carry 4x the pixels into model context — a silent per-step
-        # token-cost multiplier on every tenant's browsing, human watching or
-        # not. (Playwright's default scale is "device".)
+        # scale="css" (Playwright defaults to "device"): the 2x _DEVICE_SCALE
+        # exists for the HUMAN screencast — without this cap every agent
+        # screenshot would carry 4x the pixels into model context, a silent
+        # per-step token-cost multiplier on every tenant's browsing.
         data = await self._active().page.screenshot(type="png", scale="css")
         return bytes(data)
 
@@ -1302,9 +1198,8 @@ class PlaywrightDriver:
         return list(raw)
 
     async def eval_js(self, js: str) -> dict[str, Any]:
-        # Wrap so any value (incl. a returned Promise) is JSON-stringified and
-        # length-capped INSIDE the page, and a thrown error comes back as {error}
-        # instead of raising — a broken/hostile snippet can't crash the tool or
+        # The wrapper stringifies + length-caps INSIDE the page and returns
+        # throws as {error} — a broken/hostile snippet can't crash the tool or
         # dump an un-cappable blob into the agent's context.
         try:
             out = await self._active_frame().evaluate(_EVAL_WRAPPER_JS, js)
@@ -1326,11 +1221,10 @@ class PlaywrightDriver:
     # --- screencast (of the active tab) -------------------------------------
 
     async def add_frame_sink(self, sink: Callable[[str, dict[str, Any]], Awaitable[None]]) -> None:
-        # Start CDP capture + the pump on the FIRST viewer only; a 2nd viewer just
-        # joins the sink set (idempotent). Starting per-viewer would stack a
-        # duplicate CDP listener and leak an extra pump task per attach.
-        # `first` and the add are one atomic step (no await between them) — under
-        # asyncio's single loop two concurrent attaches can't both see `first`.
+        # Start capture + pump on the FIRST viewer only — per-viewer starts would
+        # stack duplicate CDP listeners and leak pump tasks. `first` and the add
+        # are one atomic step (no await between), so two concurrent attaches
+        # can't both see `first`.
         first = not self._sinks
         self._sinks.add(sink)
         metrics.set_frame_sinks(len(self._sinks))
@@ -1340,10 +1234,9 @@ class PlaywrightDriver:
             await self._start_screencast_on(self._active())
 
     async def _start_screencast_on(self, tab: _Tab) -> None:
-        # Register a per-tab listener that captures THIS tab's cdp, so a frame is
-        # always acked to the session it came from (see _on_frame). Store it on the
-        # tab so _stop_screencast_on removes the exact callable — pyee removal is by
-        # identity, and a shared handler couldn't be removed per-tab.
+        # A per-tab closure captures THIS tab's cdp so a frame is always acked
+        # to the session it came from (_on_frame); stored on the tab because
+        # pyee removes listeners by identity.
         async def _handler(params: dict[str, Any]) -> None:
             await self._on_frame(tab.cdp, params)
 
@@ -1352,9 +1245,8 @@ class PlaywrightDriver:
         tab.cdp.on("Page.screencastFrame", _handler)
         await tab.cdp.send(
             # everyNthFrame stays 1 — rate limiting lives in the pump (which
-            # always sends the FRESHEST frame), not at capture, so a throttled
-            # stream never shows a stale frame. Quality/size trade-offs are
-            # documented at _SCREENCAST_QUALITY.
+            # always fans the FRESHEST frame), so throttling never shows a
+            # stale frame.
             "Page.startScreencast",
             {"format": "jpeg", "quality": _SCREENCAST_QUALITY, "everyNthFrame": 1},
         )
@@ -1377,10 +1269,10 @@ class PlaywrightDriver:
             self._capturing_cdp = None
 
     async def _on_frame(self, origin_cdp: Any, params: dict[str, Any]) -> None:
-        # Ack CDP IMMEDIATELY so it keeps streaming — never gate on the viewer
-        # round-trip. Ack to the session the frame CAME FROM (origin_cdp), not
-        # whatever tab is active now: a frame from the old tab can still land here
-        # after a switch, and acking it to the new tab's session is wrong (F4).
+        # Ack CDP IMMEDIATELY so it keeps streaming (never gate on the viewer
+        # round-trip), and ack the session the frame CAME FROM: a frame from the
+        # old tab can still land after a switch, and acking it to the new tab's
+        # session is wrong (F4).
         sid = params.get("sessionId")
         if sid is not None:
             if self._capturing_cdp is not None and origin_cdp is not self._capturing_cdp:
@@ -1404,16 +1296,11 @@ class PlaywrightDriver:
             self._frame_ready.set()
 
     async def _screencast_pump(self) -> None:
-        """Forward the freshest frame to EVERY attached viewer, coalescing (drop
-        stale frames if a viewer is behind), keeping latency flat. One slow viewer
-        can't stall others — each send is independent and its errors are
-        swallowed (a dead sink is dropped by remove_frame_sink on disconnect).
-
-        Fan-out is rate-capped at ``_min_frame_interval``: CDP produces up to
-        ~60 fps during animation, and shipping them all is pure bandwidth waste
-        (see _MIN_FRAME_INTERVAL_S). Frames arriving during the throttle sleep
-        overwrite ``_latest_frame``, so the frame sent after the wait is always
-        the freshest — the cap trades fps, never latency-to-current-state."""
+        """Fan the freshest frame out to every sink, rate-capped at
+        ``_min_frame_interval`` (see _MIN_FRAME_INTERVAL_S). One slow viewer
+        can't stall others — each send is independent, errors swallowed. Frames
+        arriving during the throttle sleep overwrite ``_latest_frame``, so the
+        cap trades fps, never latency-to-current-state."""
         assert self._frame_ready is not None
         loop = asyncio.get_running_loop()
         last_sent_at = 0.0
@@ -1470,11 +1357,9 @@ class PlaywrightDriver:
         await self._active().cdp.send(method, params)
 
     async def cursor_at(self, x: float, y: float) -> str:
-        # Read the computed CSS cursor at the pointer in the TOP frame only — a
-        # cross-origin subframe's elementFromPoint is inaccessible and returns
-        # null, which we treat as "no reading" (the viewer keeps its default). The
-        # snippet is self-contained and swallows its own errors; evaluate() itself
-        # is wrapped so a destroyed context (mid-navigation) yields "" too.
+        # TOP frame only — a cross-origin subframe's elementFromPoint is
+        # inaccessible and returns null, read as "no reading" (viewer keeps its
+        # default cursor). evaluate() wrapped so a destroyed context yields "".
         try:
             out = await self._active().page.evaluate(_CURSOR_AT_JS, {"x": x, "y": y})
         except Exception:  # context destroyed by navigation, detached frame, …
@@ -1482,14 +1367,12 @@ class PlaywrightDriver:
         return out if isinstance(out, str) else ""
 
     async def set_viewport(self, width: int, height: int) -> None:
-        # Applied to EVERY tab, not just the active one: the viewport is otherwise a
-        # context-level default that new tabs inherit, so a resize would silently
-        # revert the moment the human/agent opens another tab. Clamped to sane
-        # bounds; set_viewport_size keeps the context's device_scale_factor, so the
-        # 2x screencast stays crisp. The screencast auto-adapts — CDP frame metadata
-        # now reports the new deviceWidth/Height and the viewer re-derives its canvas
-        # + input mapping from it (see _on_frame + apps/chat-ui/.../cobrowsePaint.ts). A
-        # no-op when unchanged so a debounced resize storm doesn't thrash CDP.
+        # Applied to EVERY tab: the viewport is otherwise a context-level
+        # default new tabs inherit, so a resize would silently revert the moment
+        # another tab opens. set_viewport_size keeps device_scale_factor (2x
+        # screencast stays crisp); the viewer re-derives canvas + input mapping
+        # from CDP frame metadata. No-op when unchanged so a debounced resize
+        # storm doesn't thrash CDP.
         w = max(_MIN_VIEWPORT_W, min(_MAX_VIEWPORT_W, width))
         h = max(_MIN_VIEWPORT_H, min(_MAX_VIEWPORT_H, height))
         if (w, h) == self._viewport:
@@ -1521,14 +1404,11 @@ class PlaywrightDriver:
         self._release_profile_lock()
 
 
-# Injected into every candidate element as data-cobrowse-ref, then returned as a
-# flat list. Password inputs keep their type so redaction can find them.
-# An <input> has no textContent and usually no aria-label, so naming it from
-# those alone leaves every text field anonymous: a login form came back as two
-# indistinguishable `{tag: "input", type: "text"}` entries, and the agent had to
-# spend a whole extra browser_read to learn which was the username — measured
-# doing exactly that, 3 times per task. So the name falls back through the ways
-# HTML actually labels a field.
+# Injected into every candidate element as data-cobrowse-ref. Password inputs
+# keep their type so redaction can find them. The label fallback chain exists
+# because an <input> has no textContent: a login form once came back as two
+# indistinguishable `{tag: "input", type: "text"}` entries, costing the agent a
+# whole extra browser_read per field — measured 3x per task.
 _LABEL_JS = """
   function labelFor(el) {
     const byIds = el.getAttribute('aria-labelledby');
