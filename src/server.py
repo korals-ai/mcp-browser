@@ -39,8 +39,12 @@ from src.sessions import SessionManager
 
 log = logging.getLogger("workspace-tool-browser")
 
-HOST = os.environ.get("WORKSPACE_TOOL_HOST", "0.0.0.0")  # noqa: S104 - pod-local
-PORT = int(os.environ.get("WORKSPACE_TOOL_PORT", "8096"))
+# REQUIRED, never defaulted (Tier 0.5). Both are declared in the image
+# (Dockerfile ENV) so the standalone container binds what it EXPOSEs; in-cluster
+# the operator overrides WORKSPACE_TOOL_PORT from the sidecar roster's `port:`.
+# A missing value CrashLoops instead of silently binding a guessed port.
+HOST = os.environ["WORKSPACE_TOOL_HOST"]
+PORT = int(os.environ["WORKSPACE_TOOL_PORT"])
 # When the tenant volume is mounted, the operator points this at a dir on it so
 # Chromium's profile (cookies/logins) survives a pod restart. Unset → ephemeral.
 PROFILE_DIR = os.environ.get("BROWSER_PROFILE_DIR") or None
@@ -62,7 +66,7 @@ def _tenant_volume_root() -> str:
     (docs/incidents/2026-08-11-cobrowse-gc-projects-root-home.md)."""
     if PROFILE_DIR:  # <mount>/.cobrowse/profile → <mount>
         return os.path.dirname(os.path.dirname(PROFILE_DIR.rstrip("/")))
-    return os.path.realpath(os.environ.get("HOME", "/home/agent"))
+    return os.path.realpath(os.environ["HOME"])
 
 
 # The tenant volume mount — browser_upload_file only accepts files under it, so
@@ -83,13 +87,17 @@ SHARED_SESSION = "shared"
 # (apps/workspace/src/mcp_config.py).
 _CHAT_ID_PARAM = "chat_id"
 
-# Cap on concurrent Chromiums per pod (env-overridable). The idle reaper
-# closes walked-away sessions; this bounds the worst case.
-_MAX_SESSIONS = int(os.environ.get("BROWSER_MAX_SESSIONS", "3"))
+# Cap on concurrent Chromiums per pod. REQUIRED: declared in the image
+# (Dockerfile ENV) and overridable per-env from the sidecar roster. The idle
+# reaper closes walked-away sessions; this bounds the worst case, and the pod's
+# memLimit is sized against it — so a silently-guessed cap is an OOM waiting to
+# happen, not a harmless default.
+_MAX_SESSIONS = int(os.environ["BROWSER_MAX_SESSIONS"])
 
-# Where the built viewer bundle lives, when the image carries one. Empty
-# disables the root mount entirely rather than guessing a path.
-VIEWER_DIR = os.environ.get("BROWSER_VIEWER_DIR", "")
+# Where the built viewer bundle lives. REQUIRED, declared in the image
+# (Dockerfile ENV): an explicit empty value disables the root mount — absence is
+# not a mode, because "no viewer" and "viewer path forgotten" must not look alike.
+VIEWER_DIR = os.environ["BROWSER_VIEWER_DIR"]
 
 # The id arrives from a URL the agent's MCP client sends, and is used
 # verbatim as a profile-dir NAME — a hostile ``../../etc`` could escape

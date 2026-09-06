@@ -84,15 +84,17 @@ def _launch_args() -> list[str]:
 
 def _env_headless() -> bool:
     """Prod runs HEADED (real window under Xvfb) for the lowest automation
-    fingerprint; the test/CI image has no X server, so the default is headless.
-    ``BROWSER_HEADLESS=false`` (set in the pod image) → headed."""
-    return os.environ.get("BROWSER_HEADLESS", "true").strip().lower() not in ("false", "0", "no")
+    fingerprint. REQUIRED (Tier 0.5): ``BROWSER_HEADLESS=false`` is declared in
+    the image, and the gate/CI declares ``true`` — an unset value must not decide
+    between "headed under an X server we may not have" and "headless" silently."""
+    return os.environ["BROWSER_HEADLESS"].strip().lower() not in ("false", "0", "no")
 
 
 def _env_executable_path() -> str | None:
-    """The pinned Chrome for Testing binary baked into the pod image. Unset
-    (tests/CI) → Playwright's bundled Chromium, so no browser install needed."""
-    return os.environ.get("BROWSER_EXECUTABLE_PATH") or None
+    """The pinned Chrome for Testing binary. REQUIRED, with an EXPLICIT empty
+    value as the declared sentinel for "use Playwright's bundled Chromium" (what
+    tests/CI set) — the image declares the real CfT path."""
+    return os.environ["BROWSER_EXECUTABLE_PATH"] or None
 
 
 def _clean_ua(ua: str) -> str | None:

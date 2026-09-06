@@ -86,6 +86,20 @@ COPY --from=viewer-builder /viewer/static ./viewer
 
 # Declared, not inferred: the server mounts a viewer only when told where one is.
 ENV BROWSER_VIEWER_DIR=/app/viewer
+
+# The rest of the server's REQUIRED config (src/server.py reads every one with
+# os.environ[...] — Tier 0.5, no code defaults). Declared here so the image is
+# self-contained for a standalone `docker compose up`; in-cluster the operator
+# overrides WORKSPACE_TOOL_PORT (roster `port:`) and BROWSER_MAX_SESSIONS /
+# CONNECTORS_CREDS_DIR from the sidecar roster + creds mount.
+ENV WORKSPACE_TOOL_HOST=0.0.0.0
+ENV WORKSPACE_TOOL_PORT=8096
+# Concurrent Chromiums per pod; memLimit is sized against this — keep them tuned
+# together (see the operator roster's comment).
+ENV BROWSER_MAX_SESSIONS=3
+# Where the per-tenant connectors Secret is mounted. The DIR is declared; a
+# tenant with no portal logins simply has no file at this path.
+ENV CONNECTORS_CREDS_DIR=/var/run/connectors-creds
 # root-owned, sticky X socket dir so Xvfb (running as the unprivileged tool user)
 # places its display socket here without complaint; the entrypoint recreates it
 # if the runtime /tmp is a fresh mount.

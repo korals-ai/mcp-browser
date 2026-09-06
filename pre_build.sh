@@ -40,6 +40,19 @@ HINT="  Install: $VENV/bin/pip install --index-url https://pypi.org/simple/ -e '
 [ -n "$PYTEST" ]    || fail "pytest not found. $HINT"
 [ -n "$PIP_AUDIT" ] || fail "pip-audit not found. $HINT"
 
+# src/ reads every one of these with os.environ[...] (no code defaults — Tier
+# 0.5), so the RUNNER supplies the test environment explicitly; a conftest
+# setdefault would reintroduce the hidden default the rule forbids. These are the
+# CI values, deliberately not the image's: headless with Playwright's bundled
+# Chromium (no X server, no CfT binary here), and no viewer bundle.
+export WORKSPACE_TOOL_HOST=0.0.0.0
+export WORKSPACE_TOOL_PORT=8096
+export BROWSER_MAX_SESSIONS=3
+export BROWSER_VIEWER_DIR=""
+export BROWSER_HEADLESS=true
+export BROWSER_EXECUTABLE_PATH=""
+export CONNECTORS_CREDS_DIR=/var/run/connectors-creds
+
 log "1/6 Format check (ruff format)..."
 "$RUFF" format --check src tests || fail "ruff format (run: ruff format src tests)"
 log "  ✓ ruff format passed"

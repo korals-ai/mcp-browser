@@ -36,9 +36,12 @@ class PortalCred:
     password: str
 
 
-def _creds_path() -> Path | None:
-    d = os.environ.get(_CREDS_DIR_ENV)
-    return Path(d) / _PORTAL_FILE if d else None
+def _creds_path() -> Path:
+    """The mounted-Secret path. REQUIRED (Tier 0.5): the dir is declared in the
+    image and the operator injects it with the creds mount, so a missing value is
+    a config bug — NOT the same thing as "this tenant has no portals", which is
+    the absent FILE at this path (read_portals returns {} for that)."""
+    return Path(os.environ[_CREDS_DIR_ENV]) / _PORTAL_FILE
 
 
 def read_portals(path: Path | None = None) -> dict[str, PortalCred]:
@@ -46,7 +49,7 @@ def read_portals(path: Path | None = None) -> dict[str, PortalCred]:
     absent/malformed (co-browsing is watch-capable with no portals — a missing
     file is normal, not an error)."""
     path = path if path is not None else _creds_path()
-    if path is None or not path.exists():
+    if not path.exists():
         return {}
     try:
         raw = json.loads(path.read_text())

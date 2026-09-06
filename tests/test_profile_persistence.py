@@ -10,6 +10,8 @@ from __future__ import annotations
 
 from typing import Any
 
+import pytest
+
 from src.browser_driver import PlaywrightDriver, _clear_singleton_locks
 
 
@@ -73,7 +75,7 @@ def test_clear_singleton_locks_removes_stale_and_is_safe_on_missing(tmp_path: An
 async def test_launch_persistent_makes_dir_clears_locks_and_launches(
     tmp_path: Any, monkeypatch: Any
 ) -> None:
-    monkeypatch.delenv("BROWSER_HEADLESS", raising=False)  # default → headless True
+    monkeypatch.setenv("BROWSER_HEADLESS", "true")  # declared, never defaulted
     profile = tmp_path / "profile"
     profile.mkdir()
     (profile / "SingletonLock").write_text("stale")
@@ -117,14 +119,20 @@ async def test_adopt_first_tab_opens_one_when_context_is_empty() -> None:
     assert d._tabs == [tab]
 
 
-def test_defaults_to_headless_bundled_when_env_unset(monkeypatch: Any) -> None:
-    # Tests/CI (no BROWSER_* env) → headless, Playwright's bundled Chromium, so
-    # the unit suite needs no X server and no CfT binary.
-    monkeypatch.delenv("BROWSER_HEADLESS", raising=False)
-    monkeypatch.delenv("BROWSER_EXECUTABLE_PATH", raising=False)
+def test_headless_bundled_when_ci_declares_it(monkeypatch: Any) -> None:
+    # The gate declares the CI values (pre_build.sh): headless + an EXPLICIT empty
+    # executable path, the sentinel for Playwright's bundled Chromium — so the
+    # unit suite needs no X server and no CfT binary. Both are REQUIRED reads, so
+    # an UNSET value raises rather than quietly picking this mode.
+    monkeypatch.setenv("BROWSER_HEADLESS", "true")
+    monkeypatch.setenv("BROWSER_EXECUTABLE_PATH", "")
     d = PlaywrightDriver()
     assert d._headless is True
     assert d._executable_path is None
+
+    monkeypatch.delenv("BROWSER_HEADLESS", raising=False)
+    with pytest.raises(KeyError):
+        PlaywrightDriver()
 
 
 async def test_launch_uses_headed_cft_binary_from_env(tmp_path: Any, monkeypatch: Any) -> None:
