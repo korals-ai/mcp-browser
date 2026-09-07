@@ -4,6 +4,12 @@ No Chromium — exercises the pure persistence + restore logic with fakes: recor
 the open-tab set to a file in the profile dir, reading it back, and replaying it
 onto a fresh persistent context (first URL on the adopted tab, the rest as new
 tabs, active restored). Real cookie/tab survival is the scratchpad + stg check.
+
+Persistence is TWO-PHASE: ``_persist_open_tabs`` snapshots on the event loop
+(it reads Playwright objects, which are not thread-safe) and
+``_do_persist_open_tabs`` writes on a thread. The tests below drive both,
+because a test that only snapshotted would assert against a file nobody wrote
+— and would have stayed green if the writer were deleted entirely.
 """
 
 from __future__ import annotations
@@ -52,49 +58,54 @@ def _tab(tab_id: str, url: str) -> _Tab:
     return _Tab(tab_id, _FakePage(url), _FakeCDP())
 
 
-def test_persist_and_read_round_trip(tmp_path: Path) -> None:
+async def test_persist_and_read_round_trip(tmp_path: Path) -> None:
     d = PlaywrightDriver(profile_dir=str(tmp_path))
     d._tabs = [_tab("t1", "https://a.example"), _tab("t2", "https://b.example")]
     d._active_id = "t2"
 
-    d._persist_open_tabs()
+    d._persist_open_tabs()  # snapshot on the loop...
+    await d._do_persist_open_tabs()  # ...write on a thread
 
     assert d._read_saved_tabs() == (["https://a.example", "https://b.example"], 1)
     on_disk = json.loads((tmp_path / _OPEN_TABS_FILE).read_text())
     assert on_disk == {"tabs": ["https://a.example", "https://b.example"], "active": 1}
 
 
-def test_persist_skips_redundant_write_when_unchanged(tmp_path: Path) -> None:
+async def test_persist_skips_redundant_write_when_unchanged(tmp_path: Path) -> None:
     # A main-frame framenavigated can re-fire with the same URL (SPA churn); an
     # unchanged set must not rewrite the file (EFS write amplification).
     d = PlaywrightDriver(profile_dir=str(tmp_path))
     d._tabs = [_tab("t1", "https://a.example")]
     d._active_id = "t1"
 
-    d._persist_open_tabs()  # first write
+    d._persist_open_tabs()
+    await d._do_persist_open_tabs()  # first write
     (tmp_path / _OPEN_TABS_FILE).unlink()  # remove it out from under the driver
     d._persist_open_tabs()  # same set → deduped, must NOT recreate
+    await d._do_persist_open_tabs()
 
     assert not (tmp_path / _OPEN_TABS_FILE).exists()
 
 
-def test_persist_is_noop_while_replaying(tmp_path: Path) -> None:
+async def test_persist_is_noop_while_replaying(tmp_path: Path) -> None:
     d = PlaywrightDriver(profile_dir=str(tmp_path))
     d._tabs = [_tab("t1", "https://a.example")]
     d._replaying = True
 
     d._persist_open_tabs()
+    await d._do_persist_open_tabs()
 
     assert not (tmp_path / _OPEN_TABS_FILE).exists()  # a mid-replay write can't clobber
 
 
-def test_persist_removes_file_when_only_blank_tabs(tmp_path: Path) -> None:
+async def test_persist_removes_file_when_only_blank_tabs(tmp_path: Path) -> None:
     (tmp_path / _OPEN_TABS_FILE).write_text('{"tabs": ["https://old"], "active": 0}')
     d = PlaywrightDriver(profile_dir=str(tmp_path))
     d._tabs = [_tab("t1", "about:blank")]
     d._active_id = "t1"
 
     d._persist_open_tabs()
+    await d._do_persist_open_tabs()
 
     # Nothing worth restoring → the stale set is cleared, not left to reopen "old".
     assert not (tmp_path / _OPEN_TABS_FILE).exists()

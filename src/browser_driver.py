@@ -201,6 +201,31 @@ _REGENERABLE_CACHE_SUBDIRS = (
 )
 
 
+def _write_open_tabs(profile_dir: str, urls: list[str], active: int) -> None:
+    """Write (or remove) the saved-tabs file. Pure filesystem — it is handed
+    plain data, never a Playwright object, so it is safe to run on a thread.
+
+    Atomic (tmp + ``os.replace``) so a crash can't leave a torn file; an
+    all-blank tab set removes the file so a stale set doesn't linger.
+    """
+    path = os.path.join(profile_dir, _OPEN_TABS_FILE)
+    if not any(u and u != "about:blank" for u in urls):
+        with contextlib.suppress(OSError):
+            os.remove(path)
+        return
+    tmp = f"{path}.tmp"
+    with open(tmp, "w") as f:
+        json.dump({"tabs": urls, "active": active}, f)
+    os.replace(tmp, path)
+
+
+def _prepare_persistent_dir(profile_dir: str) -> None:
+    """The two blocking steps that must happen immediately before Chromium
+    takes the profile: ensure the dir, clear stale Singleton locks."""
+    os.makedirs(profile_dir, exist_ok=True)
+    _clear_singleton_locks(profile_dir)
+
+
 def purge_regenerable_cache(profile_dir: str) -> int:
     """Delete regenerable cache dirs from a profile (best-effort); returns the
     count removed. MUST run under the profile flock with no live Chrome on the
@@ -523,6 +548,11 @@ class PlaywrightDriver:
         # with the SAME url (SPA History churn), and rewriting an unchanged file
         # is pure EFS write amplification.
         self._last_persisted: tuple[tuple[str, ...], int] | None = None
+        # Latest snapshot awaiting a write, and the writer that drains it. The
+        # Event is created in start(), not here: __init__ can run off a loop.
+        self._tab_persist_want: tuple[tuple[str, ...], int] | None = None
+        self._tab_persist_wake: asyncio.Event | None = None
+        self._tab_persist_task: asyncio.Task[None] | None = None
 
     def _next_tab_id(self) -> str:
         self._tab_seq += 1
@@ -574,14 +604,15 @@ class PlaywrightDriver:
             self._playwright = await async_playwright().start()
             w, h = self._viewport
             if self._cache_dir:
-                os.makedirs(self._cache_dir, exist_ok=True)
+                await asyncio.to_thread(os.makedirs, self._cache_dir, exist_ok=True)
             if self._profile_dir:
-                os.makedirs(self._profile_dir, exist_ok=True)
-                self._acquire_profile_lock()  # cross-pod single-writer, held to close()
-                self._sweep_checkpoint_scratch()  # retire archive-era crash scratch
-                self._migrate_archived_profile()  # one-time: tar.gz → live dir
-                # Keep only durable state on the PVC. Under the flock, pre-launch.
-                purged = purge_regenerable_cache(self._profile_dir)
+                # ONE hop for the whole pre-launch profile step. Every part of it
+                # blocks — mkdir, an flock, a directory sweep, a `tar -xzf`
+                # subprocess, and an rmtree of up to nineteen cache dirs — and it
+                # all runs on the loop this tool pod also serves its MCP calls and
+                # the human's co-browse WebSocket from. The archive migration
+                # alone is unbounded in the profile's size.
+                purged = await asyncio.to_thread(self._prepare_profile_dir)
                 if purged:
                     log.info("cobrowse purged %d regenerable cache dir(s) from profile", purged)
                 self._context = await self._launch_persistent(self._profile_dir, w, h)
@@ -599,9 +630,12 @@ class PlaywrightDriver:
             self._active_id = first.id
             await self._prime_ua_override(first)  # UA set before any restore navigation
             if self._profile_dir:
+                self._tab_persist_wake = asyncio.Event()
+                self._tab_persist_task = asyncio.create_task(self._tab_persist_writer())
                 await self._restore_saved_tabs(first)
         except Exception:
             metrics.inc_chromium_launch_failure()
+            await self._stop_tab_persist_writer()
             self._release_profile_lock()  # a failed launch must not wedge the profile
             raise
         metrics.inc_chromium_launch()
@@ -643,8 +677,7 @@ class PlaywrightDriver:
     async def _launch_persistent(self, profile_dir: str, w: int, h: int) -> Any:
         """Launch Chromium against a persistent user-data-dir, clearing any stale
         Singleton lock a crashed prior process left behind."""
-        os.makedirs(profile_dir, exist_ok=True)
-        _clear_singleton_locks(profile_dir)
+        await asyncio.to_thread(_prepare_persistent_dir, profile_dir)
         return await self._playwright.chromium.launch_persistent_context(
             profile_dir,
             headless=self._headless,
@@ -659,6 +692,30 @@ class PlaywrightDriver:
     def _profile_lock_path(self) -> str:
         assert self._profile_dir is not None
         return profile_lock_path(self._profile_dir)
+
+    def _prepare_profile_dir(self) -> int:
+        """Everything the profile needs before Chromium may touch it, as ONE
+        blocking unit: ensure the dir, take the cross-pod flock, retire
+        archive-era crash scratch, reverse-migrate a ``profile.tar.gz``, and
+        purge regenerable caches. Returns the purged-directory count.
+
+        Grouped rather than offloaded call-by-call because the steps are
+        strictly ordered — the flock must be held before anything reads or
+        writes the profile — and because five hops would cost five context
+        switches to buy exactly what one buys.
+
+        The flock is safe to take here: ``fcntl`` locks belong to the PROCESS,
+        not the thread that called ``flock``, so a lock acquired on a worker
+        thread is held by this pod and released by ``_release_profile_lock``
+        from wherever it runs.
+        """
+        assert self._profile_dir is not None
+        os.makedirs(self._profile_dir, exist_ok=True)
+        self._acquire_profile_lock()  # cross-pod single-writer, held to close()
+        self._sweep_checkpoint_scratch()  # retire archive-era crash scratch
+        self._migrate_archived_profile()  # one-time: tar.gz → live dir
+        # Keep only durable state on the PVC. Under the flock, pre-launch.
+        return purge_regenerable_cache(self._profile_dir)
 
     def _acquire_profile_lock(self) -> None:
         """Take the per-profile flock, non-blocking, held until close(). A held
@@ -726,32 +783,76 @@ class PlaywrightDriver:
     # --- open-tab persistence / restore (session continuity across restart) ---
 
     def _persist_open_tabs(self) -> None:
-        """Record tab URLs + active index into the profile dir for restart
-        restore. No-op without a persistent profile or mid-replay; best-effort —
-        a failed write must never break browsing. Atomic (tmp + os.replace) so a
-        crash can't leave a torn file; an all-blank tab set removes the file so
-        a stale set doesn't linger."""
+        """Record tab URLs + active index for restart restore.
+
+        SNAPSHOT ONLY — this reads Playwright objects, so it must stay on the
+        event loop (``page.url`` is a cached string, but the async API's objects
+        are not thread-safe and reading them from a worker thread is a bug
+        waiting for a version bump). The filesystem half is handed to
+        ``_tab_persist_writer``, which owns every write.
+
+        Deliberately still a plain ``def`` with the same name and the same four
+        call sites, because ONE of those call sites cannot await: Playwright
+        invokes ``on_frame_navigated`` synchronously from its own loop, and that
+        is the hottest of the four — every main-frame navigation. An offload
+        that only fixed the three awaitable call sites would have made the
+        ratchet green while leaving the busiest path blocking.
+
+        No-op without a persistent profile or mid-replay; best-effort — a failed
+        write must never break browsing.
+        """
         if not self._profile_dir or self._replaying:
             return
         try:
             urls = [t.page.url for t in self._tabs]
             active = next((i for i, t in enumerate(self._tabs) if t.id == self._active_id), 0)
-            key = (tuple(urls), active)
-            if key == self._last_persisted:
-                return  # unchanged since the last write — skip the EFS churn
-            path = os.path.join(self._profile_dir, _OPEN_TABS_FILE)
-            if not any(u and u != "about:blank" for u in urls):
-                with contextlib.suppress(OSError):
-                    os.remove(path)
-                self._last_persisted = key
-                return
-            tmp = f"{path}.tmp"
-            with open(tmp, "w") as f:
-                json.dump({"tabs": urls, "active": active}, f)
-            os.replace(tmp, path)
-            self._last_persisted = key
+        except Exception:
+            log.debug("cobrowse snapshot open tabs failed", exc_info=True)
+            return
+        # Last-write-wins by construction: the writer reads whatever this holds
+        # when it wakes, so a burst of navigations collapses to one EFS write
+        # and cannot land out of order.
+        self._tab_persist_want = (tuple(urls), active)
+        if self._tab_persist_wake is not None:
+            self._tab_persist_wake.set()
+
+    async def _do_persist_open_tabs(self) -> None:
+        """Write the pending snapshot, if it differs from what is on disk.
+
+        ``_last_persisted`` advances only after a SUCCESSFUL write — the same
+        rule the inline version followed. Marking it on the attempt would make a
+        failed write look persisted and suppress every retry after it.
+        """
+        want = self._tab_persist_want
+        if want is None or want == self._last_persisted or not self._profile_dir:
+            return
+        try:
+            await asyncio.to_thread(_write_open_tabs, self._profile_dir, list(want[0]), want[1])
         except Exception:
             log.debug("cobrowse persist open tabs failed", exc_info=True)
+            return
+        self._last_persisted = want
+
+    async def _tab_persist_writer(self) -> None:
+        """The single writer. One task, so writes are serialised and the file
+        can never be overtaken by a stale snapshot from a parallel thread."""
+        assert self._tab_persist_wake is not None
+        while True:
+            await self._tab_persist_wake.wait()
+            self._tab_persist_wake.clear()
+            await self._do_persist_open_tabs()
+
+    async def _stop_tab_persist_writer(self) -> None:
+        """Flush the pending write, then stop the writer. Flushing FIRST is the
+        point: the last thing a session does is close its tabs, and losing that
+        write is losing the restore."""
+        await self._do_persist_open_tabs()
+        task, self._tab_persist_task = self._tab_persist_task, None
+        if task is not None:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task
+        self._tab_persist_wake = None
 
     def _read_saved_tabs(self) -> tuple[list[str], int] | None:
         """The saved ``(urls, active_index)``, or None — a missing/garbled file
@@ -771,7 +872,10 @@ class PlaywrightDriver:
         """Reopen the saved tab set: first URL on the already-adopted ``first``
         tab, the rest as new tabs, loaded concurrently so many tabs don't
         serialize session start. A failed/blank URL is skipped, not fatal."""
-        saved = self._read_saved_tabs()
+        # The last blocking read on this path: an EFS open+parse before any tab
+        # is reopened. Small, and still on the loop that is about to drive the
+        # concurrent restore navigations below.
+        saved = await asyncio.to_thread(self._read_saved_tabs)
         if saved is None:
             return
         urls, active = saved
@@ -788,6 +892,9 @@ class PlaywrightDriver:
         finally:
             self._replaying = False
         self._persist_open_tabs()  # normalize the file to what actually restored
+        # Flushed rather than left to the writer: this is the state a crash
+        # immediately after start() must find on disk.
+        await self._do_persist_open_tabs()
 
     async def _safe_restore_goto(self, tab: _Tab, url: str) -> None:
         """Navigate one restored tab — a dead saved link must leave a usable
@@ -1401,6 +1508,7 @@ class PlaywrightDriver:
             await self._browser.close()
         if self._playwright is not None:
             await self._playwright.stop()
+        await self._stop_tab_persist_writer()
         # Chrome has exited and its writes are on the (durable) profile dir; release
         # the cross-pod flock so another pod may take this profile over.
         self._release_profile_lock()
