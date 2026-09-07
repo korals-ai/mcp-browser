@@ -336,7 +336,8 @@ async def browser_login(portal_id: str) -> dict[str, Any]:
         entered), ``unknown_portal`` (no such portal configured), or
         ``no_login_form`` (no login form found on the page).
     """
-    return await agent_ops.login(manager, _session_id(), portal_id, read_portals())
+    portals = await asyncio.to_thread(read_portals)
+    return await agent_ops.login(manager, _session_id(), portal_id, portals)
 
 
 @mcp.tool()
@@ -422,9 +423,8 @@ async def browser_run_recipe(path: str, params: dict[str, str] | None = None) ->
         return {"status": "invalid_recipe", "reason": f"not valid JSON: {exc}"}
     except recipes.RecipeError as exc:
         return {"status": "invalid_recipe", "reason": str(exc)}
-    return await agent_ops.run_recipe(
-        manager, _session_id(), recipe, params or {}, portals=read_portals()
-    )
+    portals = await asyncio.to_thread(read_portals)
+    return await agent_ops.run_recipe(manager, _session_id(), recipe, params or {}, portals=portals)
 
 
 @mcp.tool()
