@@ -40,6 +40,15 @@ HINT="  Install: $VENV/bin/pip install --index-url https://pypi.org/simple/ -e '
 [ -n "$PYTEST" ]    || fail "pytest not found. $HINT"
 [ -n "$PIP_AUDIT" ] || fail "pip-audit not found. $HINT"
 
+# The shared `toollog` package lives one level up; the image COPYs it next to
+# src and imports it as `toollog`. Put its parent on the import path so the
+# import resolves for mypy and pytest exactly as it does in the image (/app on
+# sys.path under `python -m`), and gate the package itself — it has no manifest,
+# so nothing else would.
+TL_PARENT="$(cd "$SCRIPT_DIR/.." && pwd)"
+export PYTHONPATH="$TL_PARENT${PYTHONPATH:+:$PYTHONPATH}"
+export MYPYPATH="$TL_PARENT${MYPYPATH:+:$MYPYPATH}"
+
 # src/ reads every one of these with os.environ[...] (no code defaults — Tier
 # 0.5), so the RUNNER supplies the test environment explicitly; a conftest
 # setdefault would reintroduce the hidden default the rule forbids. These are the
@@ -92,5 +101,9 @@ if command -v node >/dev/null 2>&1 && command -v npm >/dev/null 2>&1; then
 else
   log "  (node not on PATH; viewer tsc skipped — runs in ci-runner)"
 fi
+
+log "Gating the shared toollog package..."
+bash "$TL_PARENT/toollog/check.sh" "$RUFF" "$MYPY" "$PYTEST" || fail "toollog"
+log "  ✓ toollog passed"
 
 log "Pre-build checks complete ✓"

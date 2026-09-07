@@ -26,13 +26,13 @@ FROM node:22-slim AS viewer-builder
 
 WORKDIR /viewer
 
-COPY viewer/package.json viewer/package-lock.json ./
+COPY workspace-tools/browser/viewer/package.json workspace-tools/browser/viewer/package-lock.json ./
 # ci, not install: honour the lockfile exactly, fail loudly if they disagree.
 RUN npm ci --no-audit --no-fund
 
-COPY viewer/tsconfig.json ./
-COPY viewer/src ./src
-COPY viewer/index.html ./
+COPY workspace-tools/browser/viewer/tsconfig.json ./
+COPY workspace-tools/browser/viewer/src ./src
+COPY workspace-tools/browser/viewer/index.html ./
 RUN npx tsc --noEmit \
  && npm run build \
  && cp index.html static/
@@ -45,7 +45,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       gcc musl-dev \
   && rm -rf /var/lib/apt/lists/*
 
-COPY requirements.txt .
+COPY workspace-tools/browser/requirements.txt .
 
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install --no-cache-dir -r requirements.txt
@@ -80,8 +80,13 @@ ENV BROWSER_HEADLESS=false
 
 WORKDIR /app
 
-COPY src ./src
-COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+COPY workspace-tools/browser/src ./src
+# The one log format every tool image installs (apps/workspace-tools/toollog).
+# COPY'd next to src, imported as `toollog` under `python -m` from /app — the
+# same shape connector_base uses. Stdlib-only, so it adds no requirements.
+COPY workspace-tools/toollog ./toollog
+
+COPY workspace-tools/browser/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 COPY --from=viewer-builder /viewer/static ./viewer
 
 # Declared, not inferred: the server mounts a viewer only when told where one is.

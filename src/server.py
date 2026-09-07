@@ -27,6 +27,7 @@ import re
 import time
 from typing import Any
 
+import toollog
 from mcp.server.fastmcp import FastMCP, Image
 from mcp.server.fastmcp.exceptions import ToolError
 from mcp.server.lowlevel.server import request_ctx
@@ -1021,7 +1022,7 @@ def main() -> None:
     """Run both planes over uvicorn. Blocks; container entrypoint."""
     import uvicorn
 
-    logging.basicConfig(level=logging.INFO)
+    toollog.configure("browser")
     log.info("workspace-tool-browser on %s:%d — /mcp (agent) + /cobrowse (human)", HOST, PORT)
     uvicorn.run(build_app(), host=HOST, port=PORT, log_level="info")
 
