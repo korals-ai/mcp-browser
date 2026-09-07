@@ -27,6 +27,7 @@ import re
 import time
 from typing import Any
 
+import loopwatch
 import toollog
 from mcp.server.fastmcp import FastMCP, Image
 from mcp.server.fastmcp.exceptions import ToolError
@@ -228,7 +229,7 @@ async def _reap_idle_loop() -> None:
             log.exception("cobrowse reaper loop error")
 
 
-mcp = FastMCP("browser", host=HOST, port=PORT)
+mcp = FastMCP("browser", host=HOST, port=PORT, lifespan=loopwatch.lifespan)
 
 
 @mcp.tool()

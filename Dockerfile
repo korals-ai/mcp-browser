@@ -86,6 +86,11 @@ COPY workspace-tools/browser/src ./src
 # same shape connector_base uses. Stdlib-only, so it adds no requirements.
 COPY workspace-tools/toollog ./toollog
 
+# The shared stalled-loop watchdog (apps/workspace-tools/loopwatch). Same
+# placement and import rules as toollog above: COPY'd next to src, imported
+# as `loopwatch` under `python -m` from /app.
+COPY workspace-tools/loopwatch ./loopwatch
+
 COPY workspace-tools/browser/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 COPY --from=viewer-builder /viewer/static ./viewer
 
