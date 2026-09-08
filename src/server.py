@@ -231,6 +231,10 @@ async def _reap_idle_loop() -> None:
 
 mcp = FastMCP("browser", host=HOST, port=PORT, lifespan=loopwatch.lifespan)
 
+# The liveness target. Answered by the loop above, so silence means wedged —
+# see loopwatch.serve_health.
+loopwatch.serve_health(mcp)
+
 
 @mcp.tool()
 async def browser_open(url: str, new_tab: bool = False, reason: str = "") -> dict[str, Any]:
