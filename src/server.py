@@ -271,22 +271,29 @@ async def browser_open(url: str, new_tab: bool = False, reason: str = "") -> dic
         url: Absolute URL to navigate to.
         new_tab: Open in a NEW tab (and make it active) instead of navigating the
             current one. Use this to keep a page open while working another.
+            Close it with ``browser_close_tab`` once you have what you need —
+            every open tab is a live page holding memory, and the human inherits
+            whatever you leave behind when they open the co-browse view.
         reason: One short phrase on why this can't be a WebSearch/WebFetch
             instead (e.g. "tender portal, needs login"). Only checked on a
             chat's first browser_open; ignored after that.
 
     Returns:
-        Navigation state ``{url, title, can_go_back, can_go_forward}``.
+        Navigation state ``{url, title, loaded, can_go_back, can_go_forward}``.
     """
     return await agent_ops.open_url(manager, _session_id(), url, new_tab=new_tab)
 
 
 @mcp.tool()
 async def browser_list_tabs() -> list[dict[str, Any]]:
-    """List the open browser tabs as ``[{id, title, url, active}]``.
+    """List the open browser tabs as ``[{id, title, url, active, loaded}]``.
 
     Use the ``id`` with ``browser_switch_tab`` / ``browser_close_tab``. Snapshot,
     click, and type always act on the ACTIVE tab.
+
+    ``loaded`` is False for a tab restored from a previous session that has not
+    been opened yet: the URL is real, the page is not fetched until you switch
+    to it. Close the ones you don't need rather than switching through them.
     """
     return await agent_ops.list_tabs(manager, _session_id())
 

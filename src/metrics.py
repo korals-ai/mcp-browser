@@ -15,6 +15,13 @@ Signals worth alerting on:
     dropped the human's next input). Any sustained rate is a regression.
   * ``cobrowse_chromium_launch_failures_total`` — Chromium wouldn't start, so
     co-browse is dead for that tenant.
+  * ``cobrowse_restore_guard_trips_total`` / ``cobrowse_tab_restores_total``
+    ``{outcome="degraded"}`` — a session start found its own saved tab set
+    marked with an unfinished attempt, i.e. the last restore died mid-flight.
+    The pod-level ``KubePodOOMKilled`` says a container died; this says the
+    container's own persisted state is what keeps killing it, which is the
+    difference between "restart it" and "clear the state"
+    (docs/incidents/2026-09-09-browser-tab-restore-oom-loop.md).
 """
 
 from __future__ import annotations
@@ -148,6 +155,76 @@ _gc_skipped_live = Counter(
     "expected during an active co-browse, not an error.",
     registry=_registry,
 )
+_tab_restores = Counter(
+    "cobrowse_tab_restores_total",
+    "Session starts that consulted the saved tab set, by outcome: nothing_saved "
+    "(no file), clean (restored, active tab loaded), degraded (the restore guard "
+    "saw an unfinished previous attempt, so NOTHING was loaded), exhausted (the "
+    "guard kept firing with nothing loaded — the tabs are not the cause). Any "
+    "degraded/exhausted is the crash-loop signature: alert on it, because the "
+    "pod-level OOM alert only says a container died, not that its own saved "
+    "state is what keeps killing it.",
+    ["outcome"],
+    registry=_registry,
+)
+_tabs_restored = Counter(
+    "cobrowse_tabs_restored_total",
+    "Tabs recreated by a restore (loaded or parked). Divided by "
+    "cobrowse_tab_restores_total this is the average saved-tab-set size — the "
+    "number that has to stay compatible with the pod's memory limit.",
+    registry=_registry,
+)
+_tabs_loaded_on_restore = Counter(
+    "cobrowse_tabs_loaded_on_restore_total",
+    "Tabs a restore actually NAVIGATED. Restore is lazy, so this should be 1 per "
+    "clean restore and 0 per degraded one. A value tracking "
+    "cobrowse_tabs_restored_total means the lazy path regressed to eager and the "
+    "2026-09-09 OOM loop is back.",
+    registry=_registry,
+)
+_tabs_dropped_on_restore = Counter(
+    "cobrowse_tabs_dropped_on_restore_total",
+    "Saved tabs discarded for exceeding the per-restore cap — real data loss for "
+    "the human, so it is counted rather than only logged.",
+    registry=_registry,
+)
+_restore_guard_trips = Counter(
+    "cobrowse_restore_guard_trips_total",
+    "Restores that found an unfinished attempt marked on the saved set and so "
+    "loaded nothing. Each increment is one crash the guard absorbed; a sustained "
+    "rate means something is still killing session start.",
+    registry=_registry,
+)
+_tabs_hydrated = Counter(
+    "cobrowse_tabs_hydrated_total",
+    "Parked (restored, unloaded) tabs navigated on first activation. rate() = how "
+    "often a human or the agent actually revisits a restored tab, which is the "
+    "measured justification for restoring them lazily.",
+    registry=_registry,
+)
+_open_tabs = Gauge(
+    "cobrowse_open_tabs",
+    "Tabs currently open across this pod's co-browse sessions. The leading "
+    "indicator for the per-renderer memory the pod's limit is sized against — "
+    "on 2026-09-09 this reached 10 in one session against a limit sized for a "
+    "couple, and nothing was watching it.",
+    registry=_registry,
+)
+_memory_used = Gauge(
+    "cobrowse_memory_used_bytes",
+    "This container's cgroup memory usage, sampled at session start, restore and "
+    "tab hydration. cAdvisor already scrapes this, but at 30s resolution it "
+    "missed a container that lived 50 seconds; this one is sampled at the moments "
+    "that allocate.",
+    registry=_registry,
+)
+_memory_limit = Gauge(
+    "cobrowse_memory_limit_bytes",
+    "This container's cgroup memory limit (0 = unlimited). Paired with "
+    "cobrowse_memory_used_bytes so a dashboard can show headroom without needing "
+    "the pod spec — and so an alert can fire on the RATIO before the kernel acts.",
+    registry=_registry,
+)
 
 
 def record_gc_sweep(*, deleted: int, denied_perm: int, skipped_live: int) -> None:
@@ -160,6 +237,39 @@ def record_gc_sweep(*, deleted: int, denied_perm: int, skipped_live: int) -> Non
         _gc_denied_perm.inc(denied_perm)
     if skipped_live:
         _gc_skipped_live.inc(skipped_live)
+
+
+def record_tab_restore(*, outcome: str, tabs: int, loaded: int, dropped: int) -> None:
+    """Record one restore. Called on EVERY session start that consults the saved
+    set, including the empty case — an outcome series that only appears once
+    something restored could not tell "no restores happened" from "the metric
+    was never wired"."""
+    _tab_restores.labels(outcome=outcome).inc()
+    if tabs:
+        _tabs_restored.inc(tabs)
+    if loaded:
+        _tabs_loaded_on_restore.inc(loaded)
+    if dropped:
+        _tabs_dropped_on_restore.inc(dropped)
+
+
+def inc_restore_guard_trip() -> None:
+    _restore_guard_trips.inc()
+
+
+def inc_tab_hydrated() -> None:
+    _tabs_hydrated.inc()
+
+
+def add_open_tabs(delta: int) -> None:
+    """Move the pod-wide open-tab gauge. A delta, not a set: several per-chat
+    sessions share one pod, and each can only speak for its own tabs."""
+    _open_tabs.inc(delta)
+
+
+def set_memory(*, used: int, limit: int) -> None:
+    _memory_used.set(used)
+    _memory_limit.set(limit)
 
 
 def inc_dialog(dtype: str, action: str) -> None:

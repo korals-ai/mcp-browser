@@ -92,7 +92,7 @@ async def test_queued_snapshot_is_written_without_an_explicit_flush(tmp_path: Pa
         d._persist_open_tabs()  # exactly what the sync callback does
         await _settle()
 
-        assert d._read_saved_tabs() == (["https://a.example"], 0)
+        assert d._read_saved_tabs() == (["https://a.example"], 0, 0)
     finally:
         await d._stop_tab_persist_writer()
 
@@ -135,7 +135,7 @@ async def test_close_flushes_the_pending_write(tmp_path: Path) -> None:
 
     await d._stop_tab_persist_writer()
 
-    assert d._read_saved_tabs() == (["https://last.example"], 0)
+    assert d._read_saved_tabs() == (["https://last.example"], 0, 0)
 
 
 async def test_a_failed_write_stays_retryable(tmp_path: Path) -> None:
@@ -165,7 +165,7 @@ async def test_a_failed_write_stays_retryable(tmp_path: Path) -> None:
 
     # The retry now succeeds and lands.
     await d._do_persist_open_tabs()
-    assert d._read_saved_tabs() == (["https://a.example"], 0)
+    assert d._read_saved_tabs() == (["https://a.example"], 0, 0)
 
 
 async def test_the_write_itself_runs_off_the_event_loop(tmp_path: Path) -> None:

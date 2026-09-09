@@ -23,7 +23,7 @@ import os
 import shutil
 import subprocess
 from collections import deque
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Any, NamedTuple, Protocol
 
 from src import metrics
 from src.input_map import to_cdp_command
@@ -123,6 +123,25 @@ _OPEN_TABS_FILE = ".cobrowse_open_tabs.json"
 _MAX_RESTORE_TABS = 20
 _RESTORE_GOTO_TIMEOUT_MS = 15000
 
+# A restore RECREATES every saved tab but LOADS only the active one; the rest
+# hold their URL in _Tab.pending_url and navigate on first activation. The tab
+# list is a few hundred bytes; the loaded pages are ~150-250 MB of renderer
+# each, and the pod's limit is sized for a couple of them. Restoring ten at
+# once — which this did, concurrently — is what OOMKilled the prod browser pod
+# 43 times on 2026-09-09
+# (docs/incidents/2026-09-09-browser-tab-restore-oom-loop.md). Chrome and
+# Firefox both restore sessions this way for the same reason.
+#
+# The guard on top of that: an OOM is a SIGKILL, so the process cannot report
+# its own death. Instead the attempt is RECORDED IN THE FILE before any
+# navigation and cleared once the session is up, so a mark that is still set on
+# the next boot means "the last restore never finished" — the only evidence a
+# killed process can leave. One unfinished attempt drops even the active tab to
+# lazy, which is the floor: a restore that navigates nothing cannot be what is
+# killing us, and past that the tabs are exonerated, so the URLs are KEPT and
+# the operator gets a loud log rather than silent data loss.
+_RESTORE_GUARD_EXHAUSTED_ATTEMPTS = 3
+
 # Chrome's user-data-dir runs LIVE on the tenant volume, so every cookie/login/
 # IndexedDB write is durable the moment Chrome makes it. The two costs are
 # handled at their owners: Chrome's dangling Singleton* lock symlinks are
@@ -201,12 +220,16 @@ _REGENERABLE_CACHE_SUBDIRS = (
 )
 
 
-def _write_open_tabs(profile_dir: str, urls: list[str], active: int) -> None:
+def _write_open_tabs(profile_dir: str, urls: list[str], active: int, attempts: int = 0) -> None:
     """Write (or remove) the saved-tabs file. Pure filesystem — it is handed
     plain data, never a Playwright object, so it is safe to run on a thread.
 
     Atomic (tmp + ``os.replace``) so a crash can't leave a torn file; an
     all-blank tab set removes the file so a stale set doesn't linger.
+
+    ``attempts`` is the restore dirty bit: non-zero means "a restore of this
+    exact set started and has not reported success". Normal persistence writes
+    0, so the mark can only be set by :meth:`_mark_restore_attempt`.
     """
     path = os.path.join(profile_dir, _OPEN_TABS_FILE)
     if not any(u and u != "about:blank" for u in urls):
@@ -215,7 +238,7 @@ def _write_open_tabs(profile_dir: str, urls: list[str], active: int) -> None:
         return
     tmp = f"{path}.tmp"
     with open(tmp, "w") as f:
-        json.dump({"tabs": urls, "active": active}, f)
+        json.dump({"tabs": urls, "active": active, "restore_attempts": attempts}, f)
     os.replace(tmp, path)
 
 
@@ -458,6 +481,57 @@ class BrowserDriver(Protocol):
     async def close(self) -> None: ...
 
 
+def _read_cgroup_memory() -> tuple[int, int] | None:
+    """This container's ``(used, limit)`` memory in bytes, or None where the
+    cgroup files aren't readable (macOS dev, CI). Pure filesystem — run it on a
+    thread.
+
+    Chromium's cost is per RENDERER, so the number that matters at restore time
+    is how much room is left before the cgroup limit, not how many tabs there
+    are. Without it an OOM postmortem has only cAdvisor's 30s-resolution
+    scrape, which on 2026-09-09 sampled a 50-second container life roughly
+    once.
+    """
+    try:
+        with open("/sys/fs/cgroup/memory.current") as f:  # cgroup v2
+            used = int(f.read().strip())
+        with open("/sys/fs/cgroup/memory.max") as f:
+            raw = f.read().strip()
+        limit = 0 if raw == "max" else int(raw)  # "max" = unlimited, no ratio to report
+    except (OSError, ValueError):
+        return None
+    return used, limit
+
+
+async def _memory_snapshot() -> str:
+    """A short ``used/limit`` string for the restore logs, or ``unknown``. Never
+    raises — an instrument that can break the path it instruments is worse than
+    no instrument."""
+    got = await asyncio.to_thread(_read_cgroup_memory)
+    if got is None:
+        return "unknown"
+    used, limit = got
+    metrics.set_memory(used=used, limit=limit)
+    if not limit:
+        return f"{used // (1 << 20)}Mi/unlimited"
+    return f"{used // (1 << 20)}Mi/{limit // (1 << 20)}Mi ({100 * used // limit}%)"
+
+
+def _tab_url(tab: _Tab) -> str:
+    """A tab's URL for reporting and persistence: where it is, or — while it is
+    a not-yet-loaded restored tab — where it is going."""
+    return tab.pending_url or str(tab.page.url)
+
+
+class _SavedTabs(NamedTuple):
+    """The restore record on disk. ``attempts`` is the dirty bit — see
+    ``_RESTORE_GUARD_EXHAUSTED_ATTEMPTS``."""
+
+    urls: list[str]
+    active: int
+    attempts: int
+
+
 class _Tab:
     """One Chromium page + its CDP session, tracked by a stable id."""
 
@@ -473,6 +547,12 @@ class _Tab:
         # Which frame element ops act on (None = main). switch_frame pins a
         # child here; reset on a tab switch.
         self.active_frame_key: str | None = None
+        # Set on a RESTORED tab that has not loaded yet: the page is real and
+        # blank, this is where it will go on first activation. While it is set,
+        # this — not page.url — is the tab's URL everywhere the tab is reported
+        # or persisted, or a lazy tab would persist as about:blank and erase the
+        # very URL it is holding.
+        self.pending_url: str | None = None
         # Bounded per-tab console/network rings, fed by _install_observers.
         self.console_ring: deque[dict[str, Any]] = deque(maxlen=_CONSOLE_RING)
         self.network_ring: deque[dict[str, Any]] = deque(maxlen=_NETWORK_RING)
@@ -580,6 +660,7 @@ class PlaywrightDriver:
         tab = _Tab(self._next_tab_id(), page, cdp)
         self._install_observers(tab)
         self._tabs.append(tab)
+        metrics.add_open_tabs(1)
         return tab
 
     async def _apply_ua_override(self, cdp: Any) -> None:
@@ -804,7 +885,11 @@ class PlaywrightDriver:
         if not self._profile_dir or self._replaying:
             return
         try:
-            urls = [t.page.url for t in self._tabs]
+            # _tab_url, NOT page.url: a restored-but-unloaded tab's page really
+            # is about:blank, and persisting that would erase the URL it is
+            # holding — the tab list would empty itself one restart after a
+            # restore nobody clicked through.
+            urls = [_tab_url(t) for t in self._tabs]
             active = next((i for i, t in enumerate(self._tabs) if t.id == self._active_id), 0)
         except Exception:
             log.debug("cobrowse snapshot open tabs failed", exc_info=True)
@@ -854,9 +939,14 @@ class PlaywrightDriver:
                 await task
         self._tab_persist_wake = None
 
-    def _read_saved_tabs(self) -> tuple[list[str], int] | None:
-        """The saved ``(urls, active_index)``, or None — a missing/garbled file
-        is 'nothing to restore', never an error."""
+    def _read_saved_tabs(self) -> _SavedTabs | None:
+        """The saved tab record, or None — a missing/garbled file is 'nothing to
+        restore', never an error.
+
+        ``restore_attempts`` is absent in files written before the guard shipped;
+        that reads as 0 (clean), which is the right default for a set no crash
+        has been attributed to.
+        """
         if not self._profile_dir:
             return None
         try:
@@ -864,37 +954,125 @@ class PlaywrightDriver:
                 data = json.load(f)
             urls = [u for u in data.get("tabs", []) if isinstance(u, str)]
             active = int(data.get("active", 0))
+            attempts = max(0, int(data.get("restore_attempts", 0)))
         except (OSError, ValueError, TypeError):
             return None
-        return (urls, active) if urls else None
+        return _SavedTabs(urls, active, attempts) if urls else None
 
     async def _restore_saved_tabs(self, first: _Tab) -> None:
-        """Reopen the saved tab set: first URL on the already-adopted ``first``
-        tab, the rest as new tabs, loaded concurrently so many tabs don't
-        serialize session start. A failed/blank URL is skipped, not fatal."""
+        """Recreate the saved tab set, LOADING only the active tab.
+
+        Every saved URL becomes a real tab so the human gets their tab bar back,
+        but the non-active ones stay blank with their URL parked in
+        ``pending_url`` and navigate on first activation. See
+        ``_RESTORE_GUARD_EXHAUSTED_ATTEMPTS`` for why loading them all at once is
+        not an option, and for the dirty bit that drops even the active tab to
+        lazy after an unfinished attempt.
+
+        A failed/blank URL is skipped, not fatal.
+        """
         # The last blocking read on this path: an EFS open+parse before any tab
-        # is reopened. Small, and still on the loop that is about to drive the
-        # concurrent restore navigations below.
+        # is reopened. Small, and still on the loop that drives the restore.
         saved = await asyncio.to_thread(self._read_saved_tabs)
         if saved is None:
+            metrics.record_tab_restore(outcome="nothing_saved", tabs=0, loaded=0, dropped=0)
             return
-        urls, active = saved
-        log.info("cobrowse restoring %d saved tab(s)", min(len(urls), _MAX_RESTORE_TABS))
+        urls = saved.urls[:_MAX_RESTORE_TABS]
+        dropped = len(saved.urls) - len(urls)
+        # The dirty bit: a previous restore of this set started and never
+        # reported success, so it is the prime suspect for whatever killed us.
+        # Drop to loading nothing rather than replaying the same load.
+        load_active = saved.attempts == 0
+        outcome = "clean" if load_active else "degraded"
+        if not load_active:
+            log.warning(
+                "cobrowse restore guard: %d unfinished attempt(s) on this tab set — "
+                "restoring %d tab(s) WITHOUT loading any; they load on first click",
+                saved.attempts,
+                len(urls),
+            )
+            metrics.inc_restore_guard_trip()
+        if saved.attempts >= _RESTORE_GUARD_EXHAUSTED_ATTEMPTS:
+            # Loading nothing did not help, so the tabs are exonerated: keep
+            # every URL and say so, rather than quietly deleting a human's tabs
+            # to chase a cause that is somewhere else entirely.
+            outcome = "exhausted"
+            log.error(
+                "cobrowse restore guard EXHAUSTED after %d attempt(s) that loaded no page — "
+                "the saved tabs are NOT the cause; look at the session start path itself. "
+                "Keeping all %d saved URL(s).",
+                saved.attempts,
+                len(urls),
+            )
+        if dropped:
+            log.warning(
+                "cobrowse restore dropping %d saved tab(s) over the %d cap",
+                dropped,
+                _MAX_RESTORE_TABS,
+            )
+        log.info(
+            "cobrowse restoring %d saved tab(s) outcome=%s load_active=%s attempts=%d mem=%s",
+            len(urls),
+            outcome,
+            load_active,
+            saved.attempts,
+            await _memory_snapshot(),
+        )
+        # Recorded BEFORE the first navigation and cleared after: an OOM kill is
+        # a SIGKILL, so a mark still set on the next boot is the only evidence
+        # the dead process can leave that its restore never finished.
+        await self._mark_restore_attempt(urls, saved.active, saved.attempts + 1)
         self._replaying = True
         try:
-            targets: list[tuple[_Tab, str]] = []
-            for i, url in enumerate(urls[:_MAX_RESTORE_TABS]):
+            tabs: list[_Tab] = []
+            for i, url in enumerate(urls):
                 tab = first if i == 0 else await self._new_page_tab()
-                targets.append((tab, url))
-            await asyncio.gather(*(self._safe_restore_goto(t, u) for t, u in targets))
-            if 0 <= active < len(self._tabs):
-                self._active_id = self._tabs[active].id
+                tab.pending_url = url
+                tabs.append(tab)
+            active_tab = tabs[saved.active] if 0 <= saved.active < len(tabs) else tabs[0]
+            self._active_id = active_tab.id
+            if load_active:
+                await self._hydrate_tab(active_tab)
         finally:
             self._replaying = False
         self._persist_open_tabs()  # normalize the file to what actually restored
         # Flushed rather than left to the writer: this is the state a crash
-        # immediately after start() must find on disk.
+        # immediately after start() must find on disk — and it is what clears
+        # the attempt mark, so the flush IS the success report.
         await self._do_persist_open_tabs()
+        metrics.record_tab_restore(
+            outcome=outcome, tabs=len(tabs), loaded=1 if load_active else 0, dropped=dropped
+        )
+        log.info(
+            "cobrowse restored %d tab(s), %d loaded, mem=%s",
+            len(tabs),
+            1 if load_active else 0,
+            await _memory_snapshot(),
+        )
+
+    async def _mark_restore_attempt(self, urls: list[str], active: int, attempts: int) -> None:
+        """Stamp the saved set with an unfinished-attempt count, flushed to disk
+        before any navigation runs. ``_last_persisted`` is deliberately left
+        alone: the mark is not a tab-set change, and claiming it as one would
+        make the post-restore write (the one that CLEARS the mark) look
+        redundant and get skipped."""
+        if not self._profile_dir:
+            return
+        with contextlib.suppress(Exception):
+            await asyncio.to_thread(
+                _write_open_tabs, self._profile_dir, list(urls), active, attempts
+            )
+
+    async def _hydrate_tab(self, tab: _Tab) -> None:
+        """Load a restored tab's parked URL, once. No-op on an already-loaded
+        tab, so every activation can call it."""
+        url = tab.pending_url
+        if not url:
+            return
+        tab.pending_url = None  # cleared FIRST: a slow load must not re-enter
+        log.info("cobrowse hydrating restored tab id=%s mem=%s", tab.id, await _memory_snapshot())
+        metrics.inc_tab_hydrated()
+        await self._safe_restore_goto(tab, url)
 
     async def _safe_restore_goto(self, tab: _Tab, url: str) -> None:
         """Navigate one restored tab — a dead saved link must leave a usable
@@ -917,6 +1095,7 @@ class PlaywrightDriver:
         tab = _Tab(self._next_tab_id(), page, cdp)
         self._install_observers(tab)
         self._tabs.append(tab)
+        metrics.add_open_tabs(1)
         return tab
 
     # --- native dialogs (alert/confirm/prompt/beforeunload) -----------------
@@ -1119,8 +1298,20 @@ class PlaywrightDriver:
     async def open(self, url: str, *, new_tab: bool = False) -> None:
         if new_tab:
             tab = await self._new_page_tab()
+            # Logged with the running count and the memory it is being spent
+            # against: a session that accretes tabs is only visible as a trend,
+            # and the line that would have named the 2026-09-09 OOM ("tab 9 of
+            # 10 at 92% of limit") did not exist.
+            log.info(
+                "cobrowse new tab id=%s tabs=%d mem=%s",
+                tab.id,
+                len(self._tabs),
+                await _memory_snapshot(),
+            )
             await self._activate(tab.id)
-        await self._active().page.goto(url, wait_until="domcontentloaded")
+        active = self._active()
+        active.pending_url = None  # an explicit navigation supersedes a parked URL
+        await active.page.goto(url, wait_until="domcontentloaded")
 
     async def list_tabs(self) -> list[dict[str, Any]]:
         out: list[dict[str, Any]] = []
@@ -1128,8 +1319,17 @@ class PlaywrightDriver:
             title = ""
             with contextlib.suppress(Exception):
                 title = await t.page.title()
+            # A restored tab reports where it POINTS and says it isn't loaded —
+            # the human's tab bar shows their tabs, and the agent can tell a
+            # parked tab from one it has actually looked at.
             out.append(
-                {"id": t.id, "title": title, "url": t.page.url, "active": t.id == self._active_id}
+                {
+                    "id": t.id,
+                    "title": title,
+                    "url": _tab_url(t),
+                    "active": t.id == self._active_id,
+                    "loaded": t.pending_url is None,
+                }
             )
         return out
 
@@ -1151,6 +1351,7 @@ class PlaywrightDriver:
         if was_active and self._sinks:
             await self._stop_screencast_on(tab)
         self._tabs = [t for t in self._tabs if t.id != tab_id]
+        metrics.add_open_tabs(-1)
         if not self._tabs:
             # Never leave the session tab-less — open a fresh blank tab.
             fresh = await self._new_page_tab()
@@ -1170,6 +1371,10 @@ class PlaywrightDriver:
         self._active_id = tab_id
         self._active().active_frame_key = None  # a tab switch resets to main frame
         self._latest_frame = None  # drop the previous tab's stale frame
+        # A restored tab loads HERE, on the first activation — the whole point of
+        # lazy restore. Before bring_to_front so the tab is already navigating
+        # when the screencast picks it up.
+        await self._hydrate_tab(self._active())
         with contextlib.suppress(Exception):
             await self._active().page.bring_to_front()
         if self._sinks:
@@ -1319,10 +1524,14 @@ class PlaywrightDriver:
         return {"result": str(out.get("result", "")) if isinstance(out, dict) else str(out)}
 
     async def nav_state(self) -> dict[str, Any]:
-        page = self._active().page
+        tab = self._active()
         return {
-            "url": page.url,
-            "title": await page.title(),
+            # Under the restore guard even the active tab can be parked, and the
+            # address bar showing about:blank while the tab bar shows a URL
+            # would read as data loss. Report the destination, flagged unloaded.
+            "url": _tab_url(tab),
+            "title": await tab.page.title(),
+            "loaded": tab.pending_url is None,
             "can_go_back": False,  # POC: history introspection is a v1 nicety
             "can_go_forward": False,
         }
@@ -1492,6 +1701,11 @@ class PlaywrightDriver:
                 await tab.page.set_viewport_size({"width": w, "height": h})
 
     async def close(self) -> None:
+        # Drop this session's tabs from the pod-wide gauge FIRST: every later
+        # step can raise, and a leaked count would read as tabs that are still
+        # open — the gauge is the headroom signal, so it has to be honest about
+        # a session that went away badly.
+        metrics.add_open_tabs(-len(self._tabs))
         self._sinks.clear()
         if self._pump_task is not None:
             self._pump_task.cancel()
