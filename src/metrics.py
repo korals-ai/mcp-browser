@@ -18,10 +18,10 @@ Signals worth alerting on:
   * ``cobrowse_restore_guard_trips_total`` / ``cobrowse_tab_restores_total``
     ``{outcome="degraded"}`` — a session start found its own saved tab set
     marked with an unfinished attempt, i.e. the last restore died mid-flight.
-    The pod-level ``KubePodOOMKilled`` says a container died; this says the
-    container's own persisted state is what keeps killing it, which is the
-    difference between "restart it" and "clear the state"
-    (docs/incidents/2026-09-09-browser-tab-restore-oom-loop.md).
+    A container-level OOM alert says a container died; this says the container's
+    own persisted state is what keeps killing it, which is the difference
+    between "restart it" and "clear the state" — a restart cannot fix a crash
+    whose cause is reloaded from disk on every start.
 """
 
 from __future__ import annotations
@@ -197,9 +197,11 @@ _restore_guard_trips = Counter(
 )
 _tabs_hydrated = Counter(
     "cobrowse_tabs_hydrated_total",
-    "Parked (restored, unloaded) tabs navigated on first activation. rate() = how "
-    "often a human or the agent actually revisits a restored tab, which is the "
-    "measured justification for restoring them lazily.",
+    "Parked (restored, unloaded) tabs navigated on first activation. EXCLUDES the "
+    "restore's own load of the active tab, which is not a revisit — counting it "
+    "there would put a 1 in this on every clean start. rate() = how often a human "
+    "or the agent actually comes back to a restored tab, which is the measured "
+    "justification for restoring them lazily.",
     registry=_registry,
 )
 _open_tabs = Gauge(

@@ -127,10 +127,11 @@ _RESTORE_GOTO_TIMEOUT_MS = 15000
 # hold their URL in _Tab.pending_url and navigate on first activation. The tab
 # list is a few hundred bytes; the loaded pages are ~150-250 MB of renderer
 # each, and the pod's limit is sized for a couple of them. Restoring ten at
-# once — which this did, concurrently — is what OOMKilled the prod browser pod
-# 43 times on 2026-09-09
-# (docs/incidents/2026-09-09-browser-tab-restore-oom-loop.md). Chrome and
-# Firefox both restore sessions this way for the same reason.
+# once — which this did, concurrently — reached 99% of the memory limit and was
+# OOM-killed, and because the tab set is reloaded from disk at every start, each
+# restart replayed it: measured at ten real commercial pages, eager restore
+# peaks at 99% of the limit and lazy restore at 35%. Chrome and Firefox both
+# restore sessions this way for the same reason.
 #
 # The guard on top of that: an OOM is a SIGKILL, so the process cannot report
 # its own death. Instead the attempt is RECORDED IN THE FILE before any
@@ -1032,7 +1033,13 @@ class PlaywrightDriver:
             active_tab = tabs[saved.active] if 0 <= saved.active < len(tabs) else tabs[0]
             self._active_id = active_tab.id
             if load_active:
-                await self._hydrate_tab(active_tab)
+                # Deliberately NOT via _hydrate_tab: that counts a human (or the
+                # agent) coming back to a parked tab, which is the measurement
+                # justifying laziness. Counting the restore's own load there
+                # would put a 1 in it on every clean start and make the ratio
+                # meaningless — measured in the 2026-09-09 simulation.
+                active_tab.pending_url = None
+                await self._safe_restore_goto(active_tab, urls[tabs.index(active_tab)])
         finally:
             self._replaying = False
         self._persist_open_tabs()  # normalize the file to what actually restored
