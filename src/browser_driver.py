@@ -721,6 +721,12 @@ class PlaywrightDriver:
             self._release_profile_lock()  # a failed launch must not wedge the profile
             raise
         metrics.inc_chromium_launch()
+        # Sampled unconditionally, once per session, because the restore paths
+        # alone do not cover every start: a session with no saved tabs returns
+        # early and never sampled, leaving the memory gauge reading a flat 0 —
+        # which is indistinguishable from "this container is using no memory"
+        # and would let a headroom alert bind to a series that never moves.
+        log.info("cobrowse session ready tabs=%d mem=%s", len(self._tabs), await _memory_snapshot())
 
     async def _prime_ua_override(self, first: _Tab) -> None:
         """Compute the cleaned UA from the first tab and apply it there NOW
