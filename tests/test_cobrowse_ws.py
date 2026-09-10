@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
+from src import metrics
 from src.cobrowse_ws import CoBrowseConnection
 from src.protocol import BrowserInput, parse_client_message
 from tests.conftest import FakeDriver, make_manager
@@ -405,3 +406,73 @@ async def test_cursor_probe_is_single_in_flight() -> None:
         assert driver.cursor_calls == []  # no new probe while one is in flight
     finally:
         conn._cursor_task.cancel()
+
+
+def _val(name: str, **labels: str) -> float:
+    return metrics._registry.get_sample_value(name, labels or None) or 0.0
+
+
+async def test_a_viewer_that_never_painted_is_counted_at_teardown() -> None:
+    """The signal that would have caught the late-joiner bug from prod.
+
+    This connection does everything right — socket accepted, sink registered,
+    session healthy — and the human still saw nothing but the spinner. Every
+    transport-side metric reads green here, so the count of viewers that received
+    ZERO frames is the only one that disagrees.
+    """
+    driver = FakeDriver()
+    manager, _ = make_manager(driver)
+    before = _val("cobrowse_viewers_without_frame_total")
+    await CoBrowseConnection(manager, "c1", FakeWs(inbound=[])).run()
+    assert _val("cobrowse_viewers_without_frame_total") == before + 1
+
+
+async def test_a_viewer_that_painted_is_not_counted_as_starved() -> None:
+    """The negative half: a connection that received a frame must NOT increment
+    the tripwire, or it degrades into noise nobody can alert on."""
+    driver = FakeDriver()
+    manager, _ = make_manager(driver)
+
+    class GatedWs(FakeWs):
+        """Holds the connection open until one frame has been emitted."""
+
+        def __init__(self) -> None:
+            super().__init__(inbound=[])
+            self.gate = asyncio.Event()
+
+        async def receive_json(self) -> dict[str, Any] | None:
+            await self.gate.wait()
+            return None
+
+    ws = GatedWs()
+    before = _val("cobrowse_viewers_without_frame_total")
+    task = asyncio.create_task(CoBrowseConnection(manager, "c1", ws).run())
+    await asyncio.sleep(0)
+    await driver.emit_frame("JPEGDATA", {"width": 800, "height": 600})
+    ws.gate.set()
+    await task
+
+    assert any(m["type"] == "browser_frame" for m in ws.sent)
+    assert _val("cobrowse_viewers_without_frame_total") == before
+
+
+async def test_first_frame_latency_is_labelled_by_how_the_viewer_joined() -> None:
+    """A late joiner's paint time must be recorded under join="late" — mixed into
+    the cold-start distribution it is unreadable, and the late bucket is the one
+    that proves replay-on-attach still works."""
+    driver = FakeDriver()
+    manager, _ = make_manager(driver)
+    # A first viewer is already streaming and a frame has been captured, so the
+    # second attach is served from the driver's cache.
+    first_ws = FakeWs(inbound=[])
+    first = CoBrowseConnection(manager, "c1", first_ws)
+    session = await manager.get_or_create("c1")
+    await first._start_stream(session)
+    await driver.emit_frame("JPEGDATA", {"width": 800, "height": 600})
+
+    before = _val("cobrowse_viewer_first_frame_seconds_count", join="late")
+    late_ws = FakeWs(inbound=[])
+    await CoBrowseConnection(manager, "c1", late_ws).run()
+
+    assert any(m["type"] == "browser_frame" for m in late_ws.sent)
+    assert _val("cobrowse_viewer_first_frame_seconds_count", join="late") == before + 1

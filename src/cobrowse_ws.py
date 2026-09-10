@@ -76,6 +76,16 @@ class CoBrowseConnection:
         # forensic: how many frames/bytes did THIS viewer actually pull, at what fps).
         self._frames_sent = 0
         self._bytes_sent = 0
+        # How this viewer's attach landed ("first" / "replayed" / "no_cached_frame",
+        # from the driver) and when it attached — together they answer "how long did
+        # THIS human look at the spinner", which no transport-side signal can.
+        # None until the driver answers; a REPLAYED frame reaches the sink before
+        # that answer arrives, so the two halves are joined in
+        # _observe_first_frame_once rather than read at send time.
+        self._attach_outcome: str | None = None
+        self._stream_started_at = 0.0
+        self._first_frame_at: float | None = None
+        self._first_frame_observed = False
         # Cursor-mirroring side-channel state (all best-effort, see the module
         # constants). At most one probe task in flight; a monotonic gate throttles
         # scheduling; the last keyword sent is remembered so we only push changes.
@@ -129,6 +139,20 @@ class CoBrowseConnection:
         without paying for a per-session metric series."""
         avg_fps = self._frames_sent / dur_s if dur_s > 0 else 0.0
         avg_kb = (self._bytes_sent / self._frames_sent / 1024) if self._frames_sent else 0.0
+        if self._frames_sent == 0 and self._frame_sink is not None:
+            # This human watched the loading spinner for the whole connection and
+            # never saw the page. Every other signal (socket accepted, sink
+            # registered, screencast running for the OTHER viewer) reads green in
+            # exactly this case, which is how it went unseen until a user reported
+            # it — so it gets its own counter and its own log line, with the attach
+            # outcome that explains which silence it was.
+            metrics.inc_viewer_without_frame()
+            log.warning(
+                "cobrowse viewer never painted session=%s attach=%s dur_s=%.1f",
+                self._session_id,
+                self._attach_outcome or "never_attached",
+                dur_s,
+            )
         log.info(
             "cobrowse stream ended session=%s frames=%d bytes=%d dur_s=%.1f "
             "avg_fps=%.1f avg_frame_kb=%.1f",
@@ -169,13 +193,41 @@ class CoBrowseConnection:
             # Count egress only AFTER the send lands — a frame dropped to a
             # disconnecting viewer (send_json raises, swallowed by the pump) is not
             # wire cost and must not inflate the budget signal.
+            if self._frames_sent == 0:
+                # The moment this human stops seeing the loading spinner.
+                self._first_frame_at = time.monotonic()
+                self._observe_first_frame_once()
             self._frames_sent += 1
             self._bytes_sent += len(data)
             metrics.add_screencast_bytes(len(data))
             metrics.inc_screencast_frame()
 
         self._frame_sink = sink
-        await session.driver.add_frame_sink(sink)
+        self._stream_started_at = time.monotonic()
+        self._attach_outcome = await session.driver.add_frame_sink(sink)
+        # A replayed frame already went out above; now that the outcome is known,
+        # the deferred observation can be labelled and recorded.
+        self._observe_first_frame_once()
+
+    def _observe_first_frame_once(self) -> None:
+        """Record time-to-first-frame exactly once, when BOTH halves are known.
+
+        The frame's arrival comes from the sink and the join label from the
+        driver's attach outcome — and for a late viewer the cached frame is sent
+        from INSIDE add_frame_sink, i.e. before that call returns. Reading the
+        label at send time silently filed every replayed paint under join="first",
+        which is the cold-start distribution: the one place the late-join signal
+        must never hide.
+        """
+        if (
+            self._first_frame_observed
+            or self._first_frame_at is None
+            or self._attach_outcome is None
+        ):
+            return
+        self._first_frame_observed = True
+        join = "first" if self._attach_outcome == "first" else "late"
+        metrics.observe_first_frame(join, self._first_frame_at - self._stream_started_at)
 
     async def _recv_loop(self, session: Any) -> None:
         """Handle viewer->pod messages until the socket closes."""

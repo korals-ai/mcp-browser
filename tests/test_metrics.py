@@ -32,6 +32,10 @@ def test_render_exposes_all_cobrowse_series() -> None:
         "cobrowse_screencast_bytes_total",
         "cobrowse_screencast_frames_total",
         "cobrowse_frame_sinks",
+        "cobrowse_viewers_without_frame_total",
+        "cobrowse_frame_send_failures_total",
+        "cobrowse_slow_frame_sends_total",
+        "cobrowse_replay_frame_age_seconds",
     ):
         assert name in text, name
 
@@ -101,3 +105,76 @@ async def test_adapter_drop_increments_send_drops() -> None:
     before = _val("cobrowse_send_drops_total")
     await _StarletteWsAdapter(_DyingWs()).send_json({"type": "browser_nav"})
     assert _val("cobrowse_send_drops_total") == before + 1
+
+
+def test_viewer_attach_outcomes_are_labelled_not_summed() -> None:
+    """The three attach outcomes must stay separable: "a late viewer attached"
+    and "a late viewer attached and got nothing" are the same event to every
+    other signal, and only the label tells them apart."""
+    before = {
+        o: metrics._registry.get_sample_value("cobrowse_viewer_attaches_total", {"outcome": o})
+        or 0.0
+        for o in ("first", "replayed", "no_cached_frame")
+    }
+    metrics.inc_viewer_attach("first")
+    metrics.inc_viewer_attach("replayed")
+    metrics.inc_viewer_attach("replayed")
+    metrics.inc_viewer_attach("no_cached_frame")
+    after = {
+        o: metrics._registry.get_sample_value("cobrowse_viewer_attaches_total", {"outcome": o})
+        or 0.0
+        for o in ("first", "replayed", "no_cached_frame")
+    }
+    assert after["first"] == before["first"] + 1
+    assert after["replayed"] == before["replayed"] + 2
+    assert after["no_cached_frame"] == before["no_cached_frame"] + 1
+
+
+def test_never_painted_and_send_health_counters_move() -> None:
+    before = {
+        n: _val(n)
+        for n in (
+            "cobrowse_viewers_without_frame_total",
+            "cobrowse_frame_send_failures_total",
+            "cobrowse_slow_frame_sends_total",
+        )
+    }
+    metrics.inc_viewer_without_frame()
+    metrics.inc_frame_send_failure()
+    metrics.inc_slow_frame_send()
+    for n, b in before.items():
+        assert _val(n) == b + 1, n
+
+
+def test_first_frame_histogram_separates_first_from_late_joins() -> None:
+    """A cold first paint (seconds) and a cached late paint (milliseconds) must
+    not share a distribution — averaged together, neither is readable."""
+    late_before = (
+        metrics._registry.get_sample_value(
+            "cobrowse_viewer_first_frame_seconds_count", {"join": "late"}
+        )
+        or 0.0
+    )
+    metrics.observe_first_frame("late", 0.05)
+    metrics.observe_first_frame("first", 8.0)
+    assert (
+        metrics._registry.get_sample_value(
+            "cobrowse_viewer_first_frame_seconds_count", {"join": "late"}
+        )
+        == late_before + 1
+    )
+    # The late observation lands in the bottom bucket; that IS the regression test
+    # for replay-on-attach — a late join drifting upward means it stopped working.
+    assert (
+        metrics._registry.get_sample_value(
+            "cobrowse_viewer_first_frame_seconds_bucket", {"join": "late", "le": "0.25"}
+        )
+        == late_before + 1
+    )
+
+
+def test_replay_frame_age_is_observed() -> None:
+    before = _val("cobrowse_replay_frame_age_seconds_count")
+    metrics.observe_replay_frame_age(3.5)
+    assert _val("cobrowse_replay_frame_age_seconds_count") == before + 1
+    assert _val("cobrowse_replay_frame_age_seconds_sum") >= 3.5

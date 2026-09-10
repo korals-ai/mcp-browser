@@ -22,6 +22,7 @@ import logging
 import os
 import shutil
 import subprocess
+import time
 from collections import deque
 from typing import TYPE_CHECKING, Any, NamedTuple, NoReturn, Protocol
 
@@ -515,10 +516,16 @@ class BrowserDriver(Protocol):
         """Active tab's ``{url, title, can_go_back, can_go_forward}``."""
         ...
 
-    async def add_frame_sink(self, sink: Callable[[str, dict[str, Any]], Awaitable[None]]) -> None:
-        """Register a viewer's frame sink. The CDP screencast starts on the FIRST
-        sink and runs once for ALL viewers — each frame fans out to every sink —
-        so N concurrent viewers all see the live browser (not just the newest)."""
+    async def add_frame_sink(self, sink: Callable[[str, dict[str, Any]], Awaitable[None]]) -> str:
+        """Register a viewer's frame sink and report what this viewer got NOW.
+
+        The CDP screencast starts on the FIRST sink and runs once for ALL viewers
+        — each frame fans out to every sink — so N concurrent viewers all see the
+        live browser (not just the newest). Returns the attach outcome so the
+        caller can label its own signals: ``"first"`` (started the capture),
+        ``"replayed"`` (handed the cached frame immediately) or
+        ``"no_cached_frame"`` (late, nothing cached — waits for the next repaint).
+        """
         ...
 
     async def ack_frame(self, frame_id: int) -> None:
@@ -675,6 +682,9 @@ class PlaywrightDriver:
         # moves the capture's CDP session; the sinks are unchanged.
         self._sinks: set[Callable[[str, dict[str, Any]], Awaitable[None]]] = set()
         self._latest_frame: tuple[str, dict[str, Any]] | None = None
+        # When _latest_frame was captured (monotonic), so a replay to a late
+        # viewer can report how stale the picture it just painted was.
+        self._latest_frame_at: float = 0.0
         self._frame_ready: asyncio.Event | None = None
         self._pump_task: asyncio.Task[None] | None = None
         # Instance attribute so tests can shrink it without patching the constant.
@@ -1475,6 +1485,7 @@ class PlaywrightDriver:
         self._active_id = tab_id
         self._active().active_frame_key = None  # a tab switch resets to main frame
         self._latest_frame = None  # drop the previous tab's stale frame
+        self._latest_frame_at = 0.0
         # A restored tab loads HERE, on the first activation — the whole point of
         # lazy restore. Before bring_to_front so the tab is already navigating
         # when the screencast picks it up.
@@ -1659,7 +1670,7 @@ class PlaywrightDriver:
 
     # --- screencast (of the active tab) -------------------------------------
 
-    async def add_frame_sink(self, sink: Callable[[str, dict[str, Any]], Awaitable[None]]) -> None:
+    async def add_frame_sink(self, sink: Callable[[str, dict[str, Any]], Awaitable[None]]) -> str:
         # Start capture + pump on the FIRST viewer only — per-viewer starts would
         # stack duplicate CDP listeners and leak pump tasks. `first` and the add
         # are one atomic step (no await between), so two concurrent attaches
@@ -1667,10 +1678,41 @@ class PlaywrightDriver:
         first = not self._sinks
         self._sinks.add(sink)
         metrics.set_frame_sinks(len(self._sinks))
+        outcome = "first"
         if first:
             self._frame_ready = asyncio.Event()
             self._pump_task = asyncio.create_task(self._screencast_pump())
             await self._start_screencast_on(self._active())
+        elif self._latest_frame is not None:
+            # A LATE joiner (second tab, reconnect, a teammate opening the same
+            # chat) attaches to a screencast that is already running, so nothing
+            # restarts capture for it — and CDP only emits a frame when the page
+            # repaints. On a static page that is never, so the new viewer would
+            # sit on its "Loading the page…" spinner indefinitely while the first
+            # viewer shows the page. Hand it the cached frame immediately; the
+            # pump takes over from the next repaint. Errors are swallowed exactly
+            # as in the pump: a viewer that died mid-attach must not fail the add.
+            data, meta = self._latest_frame
+            outcome = "replayed"
+            metrics.observe_replay_frame_age(max(0.0, self._now() - self._latest_frame_at))
+            try:
+                await sink(data, meta)
+            except Exception:
+                # Swallowed like every other fan-out send (a viewer that died
+                # mid-attach must not fail the add) — but COUNTED, because a
+                # silently swallowed replay is indistinguishable from the bug
+                # this replay exists to fix.
+                metrics.inc_frame_send_failure()
+                log.debug("cobrowse replay-on-attach send failed; viewer likely gone")
+        else:
+            # Late, but there is genuinely no picture to give: a cold session
+            # before its first frame, or the instant after a tab switch cleared
+            # the cache. Named apart from "replayed" on purpose — this is the
+            # state the late-joiner bug lived in, and a sustained rate of it
+            # means someone is back to waiting on a repaint that may never come.
+            outcome = "no_cached_frame"
+        metrics.inc_viewer_attach(outcome)
+        return outcome
 
     async def _start_screencast_on(self, tab: _Tab) -> None:
         # A per-tab closure captures THIS tab's cdp so a frame is always acked
@@ -1722,6 +1764,7 @@ class PlaywrightDriver:
             with contextlib.suppress(Exception):
                 await origin_cdp.send("Page.screencastFrameAck", {"sessionId": sid})
         meta = params.get("metadata", {})
+        self._latest_frame_at = self._now()
         self._latest_frame = (
             params["data"],
             {
@@ -1733,6 +1776,12 @@ class PlaywrightDriver:
         )
         if self._frame_ready is not None:
             self._frame_ready.set()
+
+    @staticmethod
+    def _now() -> float:
+        """Monotonic seconds — the one clock the screencast path measures with
+        (never wall time: a viewer's paint latency must survive an NTP step)."""
+        return time.monotonic()
 
     async def _screencast_pump(self) -> None:
         """Fan the freshest frame out to every sink, rate-capped at
@@ -1760,8 +1809,18 @@ class PlaywrightDriver:
             last_sent_at = loop.time()
             data, meta = latest
             for sink in list(self._sinks):
-                with contextlib.suppress(Exception):
+                send_started = self._now()
+                try:
                     await sink(data, meta)
+                except Exception:
+                    metrics.inc_frame_send_failure()
+                    continue
+                finally:
+                    # The loop is SERIAL, so this viewer's send is latency every
+                    # other viewer pays. Counting the ones that overrun a whole
+                    # frame interval is what would name a head-of-line stall.
+                    if self._now() - send_started > self._min_frame_interval:
+                        metrics.inc_slow_frame_send()
 
     async def ack_frame(self, frame_id: int) -> None:
         # No-op: frames are acked immediately server-side (see _on_frame).
@@ -1784,6 +1843,7 @@ class PlaywrightDriver:
                 await self._pump_task
             self._pump_task = None
         self._latest_frame = None
+        self._latest_frame_at = 0.0
         if self._tabs:
             await self._stop_screencast_on(self._active())
 

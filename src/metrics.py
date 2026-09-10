@@ -22,6 +22,10 @@ Signals worth alerting on:
     own persisted state is what keeps killing it, which is the difference
     between "restart it" and "clear the state" — a restart cannot fix a crash
     whose cause is reloaded from disk on every start.
+  * ``cobrowse_viewers_without_frame_total`` — a human watched the spinner for a
+    whole connection and never saw the page. The only signal here that measures
+    what the VIEWER received rather than what the pod did; every transport-side
+    metric read green through the late-joiner bug.
 """
 
 from __future__ import annotations
@@ -31,6 +35,7 @@ from prometheus_client import (
     CollectorRegistry,
     Counter,
     Gauge,
+    Histogram,
     generate_latest,
 )
 
@@ -127,6 +132,72 @@ _screencast_frames = Counter(
     "Screencast frames fanned out to viewers. rate() = the delivered fps after "
     "the pump's _MIN_FRAME_INTERVAL_S fan-out cap — the direct read-back of a "
     "frame-rate change (does the wire actually carry the fps we set?).",
+    registry=_registry,
+)
+_viewer_attaches = Counter(
+    "cobrowse_viewer_attaches_total",
+    "Viewers registering a frame sink, by what the pod could give them at that "
+    "instant: first (this viewer started the capture), replayed (a cached frame "
+    "was handed over immediately), no_cached_frame (a LATE viewer with nothing "
+    "cached — it must wait for the next repaint, which on a static page may never "
+    "come). Splitting the outcome is the point: a late attach that paints and one "
+    "that hangs are otherwise the same event. Expect no_cached_frame only in the "
+    "moments right after a tab switch or before the first frame of a cold session; "
+    "a sustained rate means late joiners are staring at the spinner again.",
+    ["outcome"],
+    registry=_registry,
+)
+_viewers_without_frame = Counter(
+    "cobrowse_viewers_without_frame_total",
+    "Viewers that disconnected having received ZERO frames — the human saw the "
+    "loading spinner for the whole connection and nothing else. This counts the "
+    "USER's outcome, not the transport's health: every other co-browse signal "
+    "(viewer_connections, frame_sinks, session_errors) stayed perfectly green "
+    "through the 2026-09-10 late-joiner bug because the socket, the sink and the "
+    "screencast were all fine — only the picture was missing. Alert on any "
+    "sustained rate.",
+    registry=_registry,
+)
+_first_frame_seconds = Histogram(
+    "cobrowse_viewer_first_frame_seconds",
+    "Seconds from a viewer attaching to the first frame IT received, split by "
+    "whether it started the capture (join=first, pays Chromium launch + first "
+    "paint) or joined one already running (join=late, should be immediate from "
+    "the cache). A late-join distribution that drifts off the bottom bucket is "
+    "the regression. Note the blind spot this shares with every latency metric: "
+    "a viewer that NEVER paints is absent here, not slow — cobrowse_viewers_"
+    "without_frame_total is its counterpart and must be read together.",
+    ["join"],
+    buckets=(0.25, 2.0, 10.0, float("inf")),
+    registry=_registry,
+)
+_replay_frame_age_seconds = Histogram(
+    "cobrowse_replay_frame_age_seconds",
+    "Age of the cached frame replayed to a late viewer, in seconds. A large age "
+    "is not itself wrong — a page nobody touched for an hour is genuinely still "
+    "that picture — but it is the tell for a cache that outlived what it depicts "
+    "(the driver clears it on tab switch and on capture stop, so a replay much "
+    "older than the last navigation means one of those paths stopped clearing).",
+    buckets=(1.0, 10.0, 60.0, float("inf")),
+    registry=_registry,
+)
+_frame_send_failures = Counter(
+    "cobrowse_frame_send_failures_total",
+    "Fan-out sends that raised — one viewer's socket failed while the pump was "
+    "writing to it. The pump deliberately swallows these so one dying viewer "
+    "cannot stall the others, and swallowing without counting is how a silently "
+    "starved viewer stays invisible. Sits alongside cobrowse_send_drops_total "
+    "(a drop the WS layer saw coming); a rate here without disconnects means "
+    "sends are failing on sockets we still believe are open.",
+    registry=_registry,
+)
+_slow_frame_sends = Counter(
+    "cobrowse_slow_frame_sends_total",
+    "Single-sink sends that took longer than the pump's own frame interval "
+    "(_MIN_FRAME_INTERVAL_S). The pump awaits sinks SERIALLY, so one slow viewer "
+    "delays the picture for every other viewer on the session — this is the "
+    "head-of-line signal that says the fan-out needs per-viewer pacing rather "
+    "than a shared loop. Zero on a healthy pod.",
     registry=_registry,
 )
 _frame_sinks = Gauge(
@@ -345,6 +416,32 @@ def add_screencast_bytes(n: int) -> None:
 
 def inc_screencast_frame() -> None:
     _screencast_frames.inc()
+
+
+def inc_viewer_attach(outcome: str) -> None:
+    """outcome: first | replayed | no_cached_frame (see the metric docstring)."""
+    _viewer_attaches.labels(outcome=outcome).inc()
+
+
+def inc_viewer_without_frame() -> None:
+    _viewers_without_frame.inc()
+
+
+def observe_first_frame(join: str, seconds: float) -> None:
+    """join: first | late — a late join should land in the bottom bucket."""
+    _first_frame_seconds.labels(join=join).observe(seconds)
+
+
+def observe_replay_frame_age(seconds: float) -> None:
+    _replay_frame_age_seconds.observe(seconds)
+
+
+def inc_frame_send_failure() -> None:
+    _frame_send_failures.inc()
+
+
+def inc_slow_frame_send() -> None:
+    _slow_frame_sends.inc()
 
 
 def set_frame_sinks(n: int) -> None:

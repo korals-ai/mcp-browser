@@ -38,6 +38,10 @@ def _counter(name: str) -> float:
     return metrics._registry.get_sample_value(name) or 0.0
 
 
+def _labelled(name: str, **labels: str) -> float:
+    return metrics._registry.get_sample_value(name, labels) or 0.0
+
+
 class FakeCDP:
     """Records CDP calls for one tab's session. ``send`` is async (like the real
     ``CDPSession.send``); ``on`` / ``remove_listener`` are sync (pyee emitter)."""
@@ -105,6 +109,11 @@ class FakePage:
 
 
 async def _noop_sink(_data: str, _meta: dict[str, Any]) -> None:
+    return None
+
+
+async def _noop_sink_2(_data: str, _meta: dict[str, Any]) -> None:
+    """A second distinct sink — the set keys on identity, so it must not be _noop_sink."""
     return None
 
 
@@ -304,5 +313,131 @@ async def test_late_frame_is_counted_for_observability() -> None:
         before = _counter("cobrowse_late_frames_total")
         await late_handler({"sessionId": "sess-t1", "data": "AAAA", "metadata": {}})
         assert _counter("cobrowse_late_frames_total") == before + 1
+    finally:
+        await _cancel_pump(drv)
+
+
+async def test_late_sink_gets_the_cached_frame_without_a_repaint() -> None:
+    """A viewer attaching to an already-streaming session paints immediately.
+
+    The screencast starts on the FIRST sink only, and CDP emits a frame just on a
+    repaint — so on a static page a late joiner used to receive nothing at all and
+    sat on its loading spinner forever while the first viewer showed the page.
+    """
+    drv, t1_cdp, _t2_cdp = _two_tab_driver()
+    await drv.add_frame_sink(_noop_sink)
+    try:
+        # One frame arrives for the first viewer, then the page goes quiet.
+        handler = t1_cdp.frame_listeners[0]
+        await handler({"sessionId": "s1", "data": "JPEGDATA", "metadata": {"deviceWidth": 800}})
+
+        late: list[tuple[str, dict[str, Any]]] = []
+
+        async def late_sink(data: str, meta: dict[str, Any]) -> None:
+            late.append((data, meta))
+
+        await drv.add_frame_sink(late_sink)
+
+        # No further CDP frame — the cached one alone must reach the late viewer.
+        assert [d for d, _ in late] == ["JPEGDATA"]
+        assert late[0][1]["width"] == 800
+        # ...and capture is NOT restarted on the second attach (one start only).
+        assert [m for m, _ in t1_cdp.sent].count("Page.startScreencast") == 1
+    finally:
+        await _cancel_pump(drv)
+
+
+async def test_late_sink_with_no_frame_yet_is_a_no_op() -> None:
+    """Attaching before ANY frame has been captured must not raise — there is
+    simply nothing to replay, and the pump serves both viewers from then on."""
+    drv, _t1_cdp, _t2_cdp = _two_tab_driver()
+    await drv.add_frame_sink(_noop_sink)
+    try:
+        await drv.add_frame_sink(_noop_sink_2)
+        assert len(drv._sinks) == 2
+    finally:
+        await _cancel_pump(drv)
+
+
+async def test_attach_outcomes_are_reported_and_counted() -> None:
+    """add_frame_sink returns what the viewer actually got, and counts it.
+
+    Three attaches, three different answers from the same call — the first starts
+    the capture, the second finds nothing cached yet, the third is served from the
+    cache. Without the distinction, "a viewer attached" is one event covering both
+    a painted viewer and a stranded one.
+    """
+    drv, t1_cdp, _t2_cdp = _two_tab_driver()
+    before = {
+        o: _labelled("cobrowse_viewer_attaches_total", outcome=o)
+        for o in ("first", "replayed", "no_cached_frame")
+    }
+    try:
+        assert await drv.add_frame_sink(_noop_sink) == "first"
+        # Nothing captured yet: a late viewer here genuinely has no picture to get.
+        assert await drv.add_frame_sink(_noop_sink_2) == "no_cached_frame"
+
+        handler = t1_cdp.frame_listeners[0]
+        await handler({"sessionId": "s1", "data": "JPEGDATA", "metadata": {}})
+
+        async def third_sink(_data: str, _meta: dict[str, Any]) -> None:
+            return None
+
+        assert await drv.add_frame_sink(third_sink) == "replayed"
+
+        assert _labelled("cobrowse_viewer_attaches_total", outcome="first") == before["first"] + 1
+        assert (
+            _labelled("cobrowse_viewer_attaches_total", outcome="no_cached_frame")
+            == before["no_cached_frame"] + 1
+        )
+        assert (
+            _labelled("cobrowse_viewer_attaches_total", outcome="replayed")
+            == before["replayed"] + 1
+        )
+        # And the age of the replayed picture is measured, so a cache that
+        # outlives what it depicts is visible rather than merely suspected.
+        assert _counter("cobrowse_replay_frame_age_seconds_count") >= 1
+    finally:
+        await _cancel_pump(drv)
+
+
+async def test_a_switched_tab_leaves_no_cached_frame_to_replay() -> None:
+    """A tab switch clears the cache, so a viewer attaching in that window is told
+    "no_cached_frame" rather than being handed the PREVIOUS tab's picture."""
+    drv, t1_cdp, _t2_cdp = _two_tab_driver()
+    try:
+        await drv.add_frame_sink(_noop_sink)
+        handler = t1_cdp.frame_listeners[0]
+        await handler({"sessionId": "s1", "data": "TAB1FRAME", "metadata": {}})
+        await drv._activate("t2")
+
+        got: list[str] = []
+
+        async def late_sink(data: str, _meta: dict[str, Any]) -> None:
+            got.append(data)
+
+        assert await drv.add_frame_sink(late_sink) == "no_cached_frame"
+        assert got == []  # never the old tab's frame
+    finally:
+        await _cancel_pump(drv)
+
+
+async def test_a_failing_sink_is_counted_not_just_swallowed() -> None:
+    """The fan-out deliberately swallows a viewer's send error so one dying viewer
+    can't stall the others — but a swallowed error that isn't counted is exactly
+    how a starved viewer stays invisible."""
+    drv, t1_cdp, _t2_cdp = _two_tab_driver()
+    try:
+        await drv.add_frame_sink(_noop_sink)
+        handler = t1_cdp.frame_listeners[0]
+        await handler({"sessionId": "s1", "data": "JPEGDATA", "metadata": {}})
+
+        async def broken_sink(_data: str, _meta: dict[str, Any]) -> None:
+            raise RuntimeError("viewer socket gone")
+
+        before = _counter("cobrowse_frame_send_failures_total")
+        # The replay path: the attach must still succeed for the driver.
+        assert await drv.add_frame_sink(broken_sink) == "replayed"
+        assert _counter("cobrowse_frame_send_failures_total") == before + 1
     finally:
         await _cancel_pump(drv)

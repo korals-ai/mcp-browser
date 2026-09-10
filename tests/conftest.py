@@ -45,6 +45,9 @@ class FakeDriver(BrowserDriver):
         self.screencast_stopped = False
         # Fan-out sink set, mirroring PlaywrightDriver: frames go to EVERY viewer.
         self._sinks: set[Callable[[str, dict[str, Any]], Awaitable[None]]] = set()
+        # The driver's cached last frame, replayed to a LATE sink on attach. None
+        # = nothing captured yet, which is the "no_cached_frame" attach outcome.
+        self.cached_frame: tuple[str, dict[str, Any]] | None = None
         # Minimal in-memory tab model mirroring PlaywrightDriver's semantics.
         self._tab_seq = 1
         self._tabs: list[dict[str, Any]] = [{"id": "t1", "url": "about:blank", "title": "Fake"}]
@@ -323,12 +326,24 @@ class FakeDriver(BrowserDriver):
             "can_go_forward": False,
         }
 
-    async def add_frame_sink(self, sink: Callable[[str, dict[str, Any]], Awaitable[None]]) -> None:
+    async def add_frame_sink(self, sink: Callable[[str, dict[str, Any]], Awaitable[None]]) -> str:
+        # Mirrors the real driver's contract: the first sink starts the capture,
+        # a later one is served from the cached frame when there is one. Tests
+        # that need a specific outcome set `cached_frame` before attaching.
+        first = not self._sinks
         self.screencast_started = True
         self._sinks.add(sink)
+        if first:
+            return "first"
+        if self.cached_frame is None:
+            return "no_cached_frame"
+        data, meta = self.cached_frame
+        await sink(data, meta)
+        return "replayed"
 
     async def emit_frame(self, data: str, meta: dict[str, Any]) -> None:
         assert self._sinks, "screencast not started"
+        self.cached_frame = (data, meta)  # the real driver caches every frame
         for sink in list(self._sinks):
             await sink(data, meta)
 
