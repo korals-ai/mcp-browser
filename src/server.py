@@ -401,9 +401,15 @@ async def browser_type(ref: str, text: str, label: str = "") -> str:
         text: The text to enter.
         label: A short description of the field you're typing into, for the user's
             approval prompt. Optional but strongly preferred.
+
+    Returns:
+        ``"ok"``, or ``"ok — note: …"`` when the field's value after typing
+        differs from what you sent (the page reformatted or restricted your
+        input — react to it NOW, not at submit time) or the field is an
+        autocomplete (snapshot and click the right suggestion instead of
+        pressing Enter).
     """
-    await agent_ops.type_text(manager, _session_id(), ref, text)
-    return "ok"
+    return await agent_ops.type_text(manager, _session_id(), ref, text)
 
 
 @mcp.tool()

@@ -160,9 +160,9 @@ async def click(manager: SessionManager, session_id: str, ref: str) -> None:
     await session.driver.click(ref)
 
 
-async def type_text(manager: SessionManager, session_id: str, ref: str, text: str) -> None:
+async def type_text(manager: SessionManager, session_id: str, ref: str, text: str) -> str:
     session = await _active_session(manager, session_id)
-    await session.driver.type_text(ref, text)
+    return await session.driver.type_text(ref, text)
 
 
 async def fill_form(
@@ -187,14 +187,20 @@ async def fill_form(
         try:
             if kind == "select":
                 await session.driver.select_option(ref, value)
+                note = "ok"
             else:
-                await session.driver.type_text(ref, value)
+                note = await session.driver.type_text(ref, value)
         except Exception as exc:
             # The ref, not the value: a value can be a credential, and this
             # string goes into the model's context.
             results.append({"ref": ref, "status": "error", "error": f"{type(exc).__name__}: {exc}"})
             continue
-        results.append({"ref": ref, "status": "ok"})
+        entry = {"ref": ref, "status": "ok"}
+        if note != "ok":
+            # The read-back note (reformatted value / autocomplete hint) rides
+            # each field's result so a batched fill loses none of it.
+            entry["note"] = note
+        results.append(entry)
     filled = sum(1 for r in results if r["status"] == "ok")
     return {"filled": filled, "requested": len(fields), "fields": results}
 

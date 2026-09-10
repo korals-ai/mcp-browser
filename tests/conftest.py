@@ -73,6 +73,7 @@ class FakeDriver(BrowserDriver):
         self.evals: list[str] = []
         self.eval_result: dict[str, Any] = {"result": ""}
         self.page_state = "ok"
+        self.type_note = "ok"
 
     async def open(self, url: str, *, new_tab: bool = False) -> str:
         self.opened.append(url)
@@ -119,8 +120,11 @@ class FakeDriver(BrowserDriver):
     async def click(self, ref: str) -> None:
         self.clicks.append(ref)
 
-    async def type_text(self, ref: str, text: str) -> None:
+    async def type_text(self, ref: str, text: str) -> str:
         self.typed.append((ref, text))
+        # Configurable like page_state: tests set fake.type_note to simulate
+        # a read-back mismatch / autocomplete hint.
+        return self.type_note
 
     async def scroll(self, direction: str, amount: int) -> None:
         self.scrolls.append((direction, amount))

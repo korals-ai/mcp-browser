@@ -114,6 +114,44 @@ def _clean_ua(ua: str) -> str | None:
     return ua.replace("HeadlessChrome", "Chrome").replace("Headless", "")
 
 
+def _type_note(typed: str, observed: dict[str, Any] | None) -> str:
+    """Build ``type_text``'s result from the post-type read-back. Pure, so the
+    phrasing rules are unit-testable without a browser.
+
+    Two situations earn a note: the field's live value differs from what was
+    typed (the page reformatted/restricted/autocompleted the input), and the
+    field is an autocomplete widget (suggestions may have appeared — clicking
+    one beats pressing Enter). A secret field's value is NEVER echoed — the
+    mismatch is reported without the bytes, same stance as the snapshot
+    redaction in src/snapshot.py."""
+    if not observed:
+        return "ok"
+    notes: list[str] = []
+    actual = observed.get("value")
+    if actual is not None and actual != typed:
+        if str(observed.get("type", "")).lower() == "password":
+            notes.append(
+                "note: the field's value differs from the text you typed "
+                "(value hidden — secret field)"
+            )
+        else:
+            notes.append(
+                f"note: the field now contains {actual!r}, not the text you typed — "
+                "the page reformatted or restricted your input"
+            )
+    role = str(observed.get("role", "")).lower()
+    autocomplete = str(observed.get("autocomplete", "")).lower()
+    if role == "combobox" or (autocomplete and autocomplete != "none"):
+        notes.append(
+            "this is an autocomplete field — suggestions may have appeared; "
+            "call browser_snapshot and click the right suggestion instead of "
+            "pressing Enter"
+        )
+    if not notes:
+        return "ok"
+    return "ok — " + "; ".join(notes)
+
+
 def _raise_ref_action_error(action: str, ref: str, exc: Exception) -> NoReturn:
     """Rewrite a Playwright selector timeout on a ref action into an error that
     tells the agent its corrective call, instead of a selector-soup timeout the
@@ -355,7 +393,11 @@ class BrowserDriver(Protocol):
 
     async def click(self, ref: str) -> None: ...
 
-    async def type_text(self, ref: str, text: str) -> None: ...
+    async def type_text(self, ref: str, text: str) -> str:
+        """Type into the ref'd field. Returns ``"ok"``, or ``"ok — note: …"``
+        when the field's post-type value differs from what was typed or the
+        field is an autocomplete (see :func:`_type_note`)."""
+        ...
 
     async def scroll(self, direction: str, amount: int) -> None: ...
 
@@ -1457,11 +1499,22 @@ class PlaywrightDriver:
         except Exception as e:
             _raise_ref_action_error("click", ref, e)
 
-    async def type_text(self, ref: str, text: str) -> None:
+    async def type_text(self, ref: str, text: str) -> str:
+        selector = f"[data-cobrowse-ref='{ref}']"
         try:
-            await self._active_frame().fill(f"[data-cobrowse-ref='{ref}']", text)
+            await self._active_frame().fill(selector, text)
         except Exception as e:
             _raise_ref_action_error("type", ref, e)
+        # Read the field BACK (best-effort): pages reformat/restrict input and
+        # autocomplete widgets pop suggestions, and without a read-back the
+        # agent only learns at submit time — one wasted turn to discover, one
+        # to diagnose. The fill above already succeeded, so a failed read-back
+        # degrades to a bare "ok", never to an error.
+        observed: dict[str, Any] | None = None
+        with contextlib.suppress(Exception):
+            raw = await self._active_frame().evaluate(_TYPE_READBACK_JS, selector)
+            observed = dict(raw) if raw else None
+        return _type_note(text, observed)
 
     async def scroll(self, direction: str, amount: int) -> None:
         dy = -amount if direction == "up" else amount
@@ -1833,7 +1886,15 @@ _SNAPSHOT_JS = (
 """
     + _LABEL_JS
     + """
-  const sel = 'a,button,input,textarea,select,[role=button],[role=link]';
+  // Interactivity net: native controls, common widget ARIA roles, and the
+  // generic interactivity attributes ([onclick], focusable tabindex). Custom
+  // checkboxes/tabs/menus are invisible to the agent without the role list —
+  // it cannot click what the snapshot does not show.
+  const sel = 'a,button,input,textarea,select,summary,' +
+    '[onclick],[tabindex]:not([tabindex="-1"]),' +
+    '[role=button],[role=link],[role=checkbox],[role=radio],[role=switch],' +
+    '[role=tab],[role=menuitem],[role=option],[role=combobox],' +
+    '[role=searchbox],[role=slider]';
   const nodes = Array.from(document.querySelectorAll(sel));
   return nodes.slice(0, 200).map((el, i) => {
     const ref = 'e' + i;
@@ -1858,6 +1919,22 @@ _SNAPSHOT_JS = (
 }
 """
 )
+
+# Post-type read-back for _type_note: the field's live value plus the two
+# attributes that mark an autocomplete widget. Takes the same selector string
+# type_text just filled, so the two cannot disagree about the target.
+_TYPE_READBACK_JS = """
+(sel) => {
+  const el = document.querySelector(sel);
+  if (!el) return null;
+  const out = { tag: el.tagName.toLowerCase() };
+  if (el.type) out.type = el.type;
+  if ('value' in el && el.value != null) out.value = String(el.value).slice(0, 200);
+  const role = el.getAttribute('role'); if (role) out.role = role;
+  const ac = el.getAttribute('aria-autocomplete'); if (ac) out.autocomplete = ac;
+  return out;
+}
+"""
 
 # Readable text of the main content (article/main if present, else body), capped
 # so a huge page can't blow the agent's context.
