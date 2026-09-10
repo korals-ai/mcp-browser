@@ -97,6 +97,15 @@ _late_frames = Counter(
     "tab-switch race actually occurs, not an error.",
     registry=_registry,
 )
+_pages_blocked = Counter(
+    "cobrowse_pages_blocked_total",
+    "Agent navigations that landed on a wall instead of content, by page_state "
+    "(blocked_challenge/blocked_denied/rate_limited/server_error — see "
+    "src/page_state.py). The measure of how often anti-bot walls cost tenants "
+    "a browsing task; in-cluster diagnostic, not alert-wired.",
+    ["state"],
+    registry=_registry,
+)
 _dialogs_handled = Counter(
     "cobrowse_dialogs_handled_total",
     "Native JS dialogs (alert/confirm/prompt/beforeunload) auto-handled, by type "
@@ -272,6 +281,10 @@ def add_open_tabs(delta: int) -> None:
 def set_memory(*, used: int, limit: int) -> None:
     _memory_used.set(used)
     _memory_limit.set(limit)
+
+
+def inc_page_blocked(state: str) -> None:
+    _pages_blocked.labels(state=state).inc()
 
 
 def inc_dialog(dtype: str, action: str) -> None:

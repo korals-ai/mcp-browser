@@ -63,10 +63,15 @@ COPY --from=py-builder /usr/local/bin /usr/local/bin
 # open-source Chromium would be ~170 MB of dead weight, since executable_path
 # points at the CfT binary instead. Pin resolved + verified 200 against
 # https://googlechromelabs.github.io/chrome-for-testing (Stable, 2026-07-28).
+# The fonts-* packages give the headed browser a realistic desktop font
+# inventory: install-deps alone leaves a near-empty font set, which renders
+# pages worse AND is itself a bot fingerprint (no real desktop ships bare —
+# docs/upstreams/camoufox.md).
 ARG CHROME_FOR_TESTING_VERSION=151.0.7922.47
 RUN playwright install-deps chromium \
  && apt-get update \
  && apt-get install -y --no-install-recommends xvfb xauth unzip curl ca-certificates \
+      fonts-liberation fonts-dejavu-core fonts-noto-core \
  && curl -fsSL -o /tmp/chrome.zip \
       "https://storage.googleapis.com/chrome-for-testing-public/${CHROME_FOR_TESTING_VERSION}/linux64/chrome-linux64.zip" \
  && unzip -q /tmp/chrome.zip -d /opt \

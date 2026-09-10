@@ -72,8 +72,9 @@ class FakeDriver(BrowserDriver):
         self.links: list[dict[str, str]] = []
         self.evals: list[str] = []
         self.eval_result: dict[str, Any] = {"result": ""}
+        self.page_state = "ok"
 
-    async def open(self, url: str, *, new_tab: bool = False) -> None:
+    async def open(self, url: str, *, new_tab: bool = False) -> str:
         self.opened.append(url)
         if new_tab:
             self._tab_seq += 1
@@ -84,6 +85,9 @@ class FakeDriver(BrowserDriver):
             for t in self._tabs:
                 if t["id"] == self._active:
                     t["url"] = url
+        # A configurable page_state (default "ok") mirrors the real driver's
+        # classify-on-open contract; tests set fake.page_state to simulate walls.
+        return self.page_state
 
     async def list_tabs(self) -> list[dict[str, Any]]:
         return [{**t, "active": t["id"] == self._active} for t in self._tabs]

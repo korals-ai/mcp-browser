@@ -70,8 +70,12 @@ async def open_url(
     was_paused = session.agent_paused
     session.agent_paused = False
     session.touch(actor="agent")
-    await session.driver.open(url, new_tab=new_tab)
+    page_state = await session.driver.open(url, new_tab=new_tab)
     nav = await _broadcast_nav(session)
+    # Name a wall in the tool result itself, so the agent never has to infer
+    # "blocked" from re-reading a challenge page (which it reliably retried
+    # instead — see docs/reports/2026-09-09-stealth-scraping-upstreams-review.md).
+    nav["page_state"] = page_state
     await _broadcast_tabs(session)  # a new tab (or title change) updates the strip
     if was_paused:
         # Tell viewers the agent has control again so the Resume banner clears.

@@ -23,10 +23,11 @@ import os
 import shutil
 import subprocess
 from collections import deque
-from typing import TYPE_CHECKING, Any, NamedTuple, Protocol
+from typing import TYPE_CHECKING, Any, NamedTuple, NoReturn, Protocol
 
 from src import metrics
 from src.input_map import to_cdp_command
+from src.page_state import classify_page_state
 from src.snapshot import Element
 
 if TYPE_CHECKING:
@@ -71,6 +72,13 @@ _MAX_VIEWPORT_W, _MAX_VIEWPORT_H = 2560, 1600
 # signals remain — full stealth is an endless arms race, out of scope.
 _STEALTH_LAUNCH_ARGS = ["--disable-blink-features=AutomationControlled"]
 
+# Playwright INJECTS --enable-automation into Chromium's default switches — the
+# flag behind the "controlled by automated test software" infobar and
+# webdriver-adjacent behavior on some Chrome versions. A launch arg cannot
+# retract a default switch; only ignore_default_args removes it, so it must be
+# passed on BOTH launch paths (ephemeral and persistent).
+_IGNORED_DEFAULT_ARGS = ["--enable-automation"]
+
 # Chrome's setuid/namespace sandbox can't initialize in the unprivileged
 # per-tenant pod (uid 65532, no CAP_SYS_ADMIN); the pod itself (per-tenant,
 # non-root, egress-fenced) is the isolation boundary, so --no-sandbox is safe.
@@ -104,6 +112,22 @@ def _clean_ua(ua: str) -> str | None:
     if "Headless" not in ua:
         return None
     return ua.replace("HeadlessChrome", "Chrome").replace("Headless", "")
+
+
+def _raise_ref_action_error(action: str, ref: str, exc: Exception) -> NoReturn:
+    """Rewrite a Playwright selector timeout on a ref action into an error that
+    tells the agent its corrective call, instead of a selector-soup timeout the
+    agent can only guess at. Only TimeoutError is rewritten — any other failure
+    re-raises untouched. Both causes of a ref timeout are named (stale ref vs
+    blocked element) because they have opposite fixes and the timeout alone
+    cannot distinguish them."""
+    if type(exc).__name__ != "TimeoutError":
+        raise exc
+    raise ValueError(
+        f"could not {action} ref '{ref}': either the ref is stale (refs change "
+        "after any navigation or page update — call browser_snapshot for fresh "
+        "refs), or the element is covered/not interactable right now"
+    ) from exc
 
 
 def _truncate_url(url: str) -> str:
@@ -304,7 +328,11 @@ class BrowserDriver(Protocol):
     """Everything the pod needs from ONE browser session (with N tabs). Async
     throughout — every method touches the browser over CDP."""
 
-    async def open(self, url: str, *, new_tab: bool = False) -> None: ...
+    async def open(self, url: str, *, new_tab: bool = False) -> str:
+        """Navigate (optionally in a new tab) and return the landed page's
+        ``page_state`` (see :mod:`src.page_state`; ``"unknown"`` when the
+        navigation succeeded but classification itself failed)."""
+        ...
 
     async def list_tabs(self) -> list[dict[str, Any]]:
         """The open tabs as ``[{id, title, url, active}]`` in tab order."""
@@ -704,6 +732,7 @@ class PlaywrightDriver:
                     headless=self._headless,
                     executable_path=self._executable_path,
                     args=[*_launch_args(), *self._cache_launch_args()],
+                    ignore_default_args=_IGNORED_DEFAULT_ARGS,
                 )
                 self._context = await self._browser.new_context(
                     viewport={"width": w, "height": h}, device_scale_factor=_DEVICE_SCALE
@@ -773,6 +802,7 @@ class PlaywrightDriver:
             viewport={"width": w, "height": h},
             device_scale_factor=_DEVICE_SCALE,
             args=[*_launch_args(), *self._cache_launch_args()],
+            ignore_default_args=_IGNORED_DEFAULT_ARGS,
         )
 
     # --- live-on-PVC profile: flock + one-time reverse migration ------------------
@@ -1308,7 +1338,7 @@ class PlaywrightDriver:
 
     # --- tabs ---------------------------------------------------------------
 
-    async def open(self, url: str, *, new_tab: bool = False) -> None:
+    async def open(self, url: str, *, new_tab: bool = False) -> str:
         if new_tab:
             tab = await self._new_page_tab()
             # Logged with the running count and the memory it is being spent
@@ -1324,7 +1354,26 @@ class PlaywrightDriver:
             await self._activate(tab.id)
         active = self._active()
         active.pending_url = None  # an explicit navigation supersedes a parked URL
-        await active.page.goto(url, wait_until="domcontentloaded")
+        resp = await active.page.goto(url, wait_until="domcontentloaded")
+        return await self._classify_landed_page(active, resp)
+
+    async def _classify_landed_page(self, tab: _Tab, resp: Any) -> str:
+        """``page_state`` for a navigation that already succeeded. Best-effort
+        by design: a classifier failure must never fail the open — but it
+        reports ``"unknown"``, never ``"ok"``, so a broken classifier can't
+        pass a wall off as content."""
+        try:
+            title = await tab.page.title()
+            status = resp.status if resp else None
+            headers = dict(resp.headers) if resp else {}
+            state = classify_page_state(status, headers, tab.page.url, title)
+        except Exception:
+            log.warning("page-state classification failed for %s", _truncate_url(tab.page.url))
+            return "unknown"
+        if state != "ok":
+            metrics.inc_page_blocked(state)
+            log.info("cobrowse open landed on %s: %s", state, _truncate_url(tab.page.url))
+        return state
 
     async def list_tabs(self) -> list[dict[str, Any]]:
         out: list[dict[str, Any]] = []
@@ -1403,10 +1452,16 @@ class PlaywrightDriver:
         return list(raw)
 
     async def click(self, ref: str) -> None:
-        await self._active_frame().click(f"[data-cobrowse-ref='{ref}']")
+        try:
+            await self._active_frame().click(f"[data-cobrowse-ref='{ref}']")
+        except Exception as e:
+            _raise_ref_action_error("click", ref, e)
 
     async def type_text(self, ref: str, text: str) -> None:
-        await self._active_frame().fill(f"[data-cobrowse-ref='{ref}']", text)
+        try:
+            await self._active_frame().fill(f"[data-cobrowse-ref='{ref}']", text)
+        except Exception as e:
+            _raise_ref_action_error("type", ref, e)
 
     async def scroll(self, direction: str, amount: int) -> None:
         dy = -amount if direction == "up" else amount

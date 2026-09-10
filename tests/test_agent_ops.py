@@ -15,6 +15,17 @@ async def test_open_navigates_and_returns_nav_state() -> None:
     nav = await agent_ops.open_url(manager, "c1", "https://example.com/form")
     assert driver.opened == ["https://example.com/form"]
     assert nav["url"] == "https://example.com/form"
+    assert nav["page_state"] == "ok"  # content and a wall must be distinguishable
+
+
+async def test_open_surfaces_blocked_page_state() -> None:
+    # The agent's fix for a wall is opposite to its fix for content ("stop
+    # retrying" vs "read on") — the state must ride the tool result itself.
+    driver = FakeDriver()
+    driver.page_state = "blocked_challenge"
+    manager, _ = make_manager(driver)
+    nav = await agent_ops.open_url(manager, "c1", "https://shop.example/item")
+    assert nav["page_state"] == "blocked_challenge"
 
 
 async def test_open_broadcasts_nav_to_viewers() -> None:

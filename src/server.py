@@ -279,7 +279,13 @@ async def browser_open(url: str, new_tab: bool = False, reason: str = "") -> dic
             chat's first browser_open; ignored after that.
 
     Returns:
-        Navigation state ``{url, title, loaded, can_go_back, can_go_forward}``.
+        Navigation state ``{url, title, loaded, page_state, can_go_back,
+        can_go_forward}``. A ``page_state`` other than ``"ok"`` means the site
+        served a WALL, not content: ``blocked_challenge`` (anti-bot/CAPTCHA),
+        ``blocked_denied`` (401/403), ``rate_limited`` (429), ``server_error``,
+        or ``unknown`` (couldn't classify). Retrying a blocked page will not
+        change it — tell the user the site blocks automated access and suggest
+        they take over via the co-browse view, or use another source.
     """
     return await agent_ops.open_url(manager, _session_id(), url, new_tab=new_tab)
 

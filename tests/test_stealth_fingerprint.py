@@ -12,6 +12,7 @@ from typing import Any
 
 from src.browser_driver import (
     _CONTAINER_LAUNCH_ARGS,
+    _IGNORED_DEFAULT_ARGS,
     _STEALTH_LAUNCH_ARGS,
     PlaywrightDriver,
     _clean_ua,
@@ -159,3 +160,20 @@ async def test_persistent_launch_passes_stealth_args(tmp_path: Any) -> None:
     await d._launch_persistent(str(tmp_path), 1280, 800)
 
     assert chromium.persistent_kw["args"] == _launch_args()
+
+
+def test_enable_automation_is_in_ignored_defaults() -> None:
+    # Playwright INJECTS --enable-automation as a default switch; only
+    # ignore_default_args can retract it. Guard the constant so a refactor
+    # can't silently re-admit the automation infobar flag.
+    assert "--enable-automation" in _IGNORED_DEFAULT_ARGS
+
+
+async def test_persistent_launch_ignores_enable_automation(tmp_path: Any) -> None:
+    chromium = _RecordingChromium()
+    d = PlaywrightDriver(profile_dir=str(tmp_path))
+    d._playwright = _RecordingPlaywright(chromium)
+
+    await d._launch_persistent(str(tmp_path), 1280, 800)
+
+    assert chromium.persistent_kw["ignore_default_args"] == _IGNORED_DEFAULT_ARGS
