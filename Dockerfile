@@ -65,8 +65,8 @@ COPY --from=py-builder /usr/local/bin /usr/local/bin
 # https://googlechromelabs.github.io/chrome-for-testing (Stable, 2026-07-28).
 # The fonts-* packages give the headed browser a realistic desktop font
 # inventory: install-deps alone leaves a near-empty font set, which renders
-# pages worse AND is itself a bot fingerprint (no real desktop ships bare —
-# docs/upstreams/camoufox.md).
+# pages worse AND is itself a bot fingerprint: no real desktop ships with an
+# empty font list, so an empty one is a signal in itself.
 ARG CHROME_FOR_TESTING_VERSION=151.0.7922.47
 RUN playwright install-deps chromium \
  && apt-get update \

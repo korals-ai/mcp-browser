@@ -13,7 +13,8 @@ codes; the title/URL markers are the vendors' documented interstitials
 (Cloudflare "Just a moment…" / "Attention Required!", Amazon "Robot Check" /
 ``/errors/validateCaptcha``). Extend the marker tables only from block pages
 actually captured in real runs — a guessed marker matches nothing and reads
-as coverage (match-list rule, ``.claude/CLAUDE.md`` Tier 2).
+as coverage — a match-list that matches nothing fails silently and looks
+exactly like one that has nothing to match.
 """
 
 from __future__ import annotations

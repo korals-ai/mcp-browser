@@ -73,8 +73,8 @@ async def open_url(
     page_state = await session.driver.open(url, new_tab=new_tab)
     nav = await _broadcast_nav(session)
     # Name a wall in the tool result itself, so the agent never has to infer
-    # "blocked" from re-reading a challenge page (which it reliably retried
-    # instead — see docs/reports/2026-09-09-stealth-scraping-upstreams-review.md).
+    # "blocked" from re-reading a challenge page. Left to infer it, the model
+    # reliably retried the same navigation instead of reporting the wall.
     nav["page_state"] = page_state
     await _broadcast_tabs(session)  # a new tab (or title change) updates the strip
     if was_paused:
