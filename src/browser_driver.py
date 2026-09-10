@@ -186,6 +186,20 @@ _OPEN_TABS_FILE = ".cobrowse_open_tabs.json"
 _MAX_RESTORE_TABS = 20
 _RESTORE_GOTO_TIMEOUT_MS = 15000
 
+# Login-form field selectors, shared by the single- and two-step paths.
+# S105 is silenced below: this is a CSS selector naming the password INPUT,
+# not a credential.
+_PASSWORD_SELECTOR = "input[type=password]"  # noqa: S105
+_USERNAME_SELECTOR = (
+    "input[type=email], input[type=text], "
+    "input[name*=user i], input[name*=email i], input[id*=user i]"
+)
+# How long to wait for a two-step portal's password screen after submitting the
+# username. Generous because the hop is a real navigation against an IDP, but
+# bounded so a portal that never advances reports no_login_form instead of
+# hanging the agent's turn.
+_TWO_STEP_PASSWORD_TIMEOUT_MS = 15000
+
 # A restore RECREATES every saved tab but LOADS only the active one; the rest
 # hold their URL in _Tab.pending_url and navigate on first activation. The tab
 # list is a few hundred bytes; the loaded pages are ~150-250 MB of renderer
@@ -509,7 +523,12 @@ class BrowserDriver(Protocol):
 
     async def fill_login(self, username: str, password: str) -> bool:
         """Best-effort: find the active tab's username + password fields, fill
-        them (server-side — the secret never touches the agent), and submit."""
+        them (server-side — the secret never touches the agent), and submit.
+
+        Handles both form shapes: single-step (both fields on one screen) and
+        two-step (username, submit, then a password screen — SAP Ariba, Okta,
+        Microsoft, Google). False means no usable login form was found, which
+        the caller reports to the agent as ``no_login_form``."""
         ...
 
     async def nav_state(self) -> dict[str, Any]:
@@ -1600,20 +1619,64 @@ class PlaywrightDriver:
         await download.save_as(dest_path)
         return {"filename": download.suggested_filename, "saved": True}
 
+    async def _visible_selector(self, frame: Any, selector: str) -> Any:
+        """First element matching ``selector`` that is actually VISIBLE, else None.
+
+        Visibility — not mere presence — is the test that matters here. Two-step
+        portals ship the password input in the DOM on the username screen and
+        hide it; a presence check finds that hidden field, fills it, and submits
+        nothing.
+        """
+        el = await frame.query_selector(selector)
+        if el is None:
+            return None
+        try:
+            if not await el.is_visible():
+                return None
+        except Exception:
+            return None
+        return el
+
     async def fill_login(self, username: str, password: str) -> bool:
         # Login forms are often inside an iframe on portals — operate on the active
         # frame, not page.*.
         frame = self._active_frame()
-        pw = await frame.query_selector("input[type=password]")
+        pw = await self._visible_selector(frame, _PASSWORD_SELECTOR)
+        if pw is None:
+            return await self._fill_login_two_step(frame, username, password)
+
+        await pw.fill(password)
+        user = await self._visible_selector(frame, _USERNAME_SELECTOR)
+        if user is not None:
+            await user.fill(username)
+        await pw.press("Enter")
+        return True
+
+    async def _fill_login_two_step(self, frame: Any, username: str, password: str) -> bool:
+        """Username screen first, password on a second screen.
+
+        The shape every modern SSO uses (SAP Ariba, Okta, Microsoft, Google):
+        the password field does not exist until the username is submitted, so
+        "no password field" is not yet a failure — it's the first screen. Only
+        a missing username field, or a password screen that never arrives, is.
+        """
+        user = await self._visible_selector(frame, _USERNAME_SELECTOR)
+        if user is None:
+            return False
+        await user.fill(username)
+        await user.press("Enter")
+        # The second screen commonly re-renders or swaps the frame, so re-resolve
+        # rather than reusing the handle the username lived in.
+        frame = self._active_frame()
+        try:
+            pw = await frame.wait_for_selector(
+                _PASSWORD_SELECTOR, state="visible", timeout=_TWO_STEP_PASSWORD_TIMEOUT_MS
+            )
+        except Exception:
+            return False
         if pw is None:
             return False
         await pw.fill(password)
-        user = await frame.query_selector(
-            "input[type=email], input[type=text], "
-            "input[name*=user i], input[name*=email i], input[id*=user i]"
-        )
-        if user is not None:
-            await user.fill(username)
         await pw.press("Enter")
         return True
 
