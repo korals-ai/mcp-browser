@@ -26,6 +26,20 @@ Signals worth alerting on:
     whole connection and never saw the page. The only signal here that measures
     what the VIEWER received rather than what the pod did; every transport-side
     metric read green through the late-joiner bug.
+  * ``cobrowse_repaints_total{outcome="no_frame"}`` — the page changed and the
+    viewers were not shown it. The sibling of the above for a viewer that IS
+    painting: it has a picture, so nothing reads as broken, but the picture is
+    of the previous page and the human has no way to tell.
+  * ``cobrowse_input_dispatch_failures_total`` — the human's click raised on the
+    way to the page. The action did not happen and the viewer was told nothing.
+
+A note on shape, because three of the signals here exist because of it: the bugs
+this pod keeps producing are ones where the pod is healthy and the HUMAN is
+stuck, so a signal that measures the pod cannot see them. Prefer the metric that
+counts what the viewer received, and when a case can't be measured, count it
+under its own outcome (``viewer_left``, ``aborted_connect``) rather than letting
+it fall out of the numerator — an unmeasured case that silently reads as a clean
+one is how the last three of these went unnoticed until a customer said so.
 """
 
 from __future__ import annotations
@@ -149,13 +163,83 @@ _viewer_attaches = Counter(
 )
 _viewers_without_frame = Counter(
     "cobrowse_viewers_without_frame_total",
-    "Viewers that disconnected having received ZERO frames — the human saw the "
-    "loading spinner for the whole connection and nothing else. This counts the "
-    "USER's outcome, not the transport's health: every other co-browse signal "
-    "(viewer_connections, frame_sinks, session_errors) stayed perfectly green "
-    "through the 2026-09-10 late-joiner bug because the socket, the sink and the "
-    "screencast were all fine — only the picture was missing. Alert on any "
-    "sustained rate.",
+    "Viewers that disconnected having received ZERO frames AFTER staying attached "
+    "long enough to have been painted (see cobrowse_viewer_aborted_connects_total "
+    "for the ones that didn't) — the human saw the loading spinner and nothing "
+    "else. This counts the USER's outcome, not the transport's health: every other "
+    "co-browse signal (viewer_connections, frame_sinks, session_errors) stayed "
+    "perfectly green through the 2026-09-10 late-joiner bug because the socket, "
+    "the sink and the screencast were all fine — only the picture was missing. "
+    "Alert on any sustained rate.",
+    registry=_registry,
+)
+_viewer_aborted_connects = Counter(
+    "cobrowse_viewer_aborted_connects_total",
+    "Viewer connections that ended with zero frames in under "
+    "_MIN_PAINTABLE_CONNECTION_S — too fast for any picture to have been possible, "
+    "so NOT a stranded human. Split out of cobrowse_viewers_without_frame_total "
+    "because lumping them together made an ordinary reconnect race read as a "
+    "person watching a spinner, which is what misfired CoBrowseViewerNeverPainted "
+    "on 2026-09-11. It is counted rather than dropped for the usual reason: a "
+    "silent skip and a genuine zero look identical. A sustained rate is its own "
+    "finding — the SPA is dialling and hanging up, so every reconnect flashes the "
+    "spinner even though each individual attempt looks harmless.",
+    registry=_registry,
+)
+_viewer_connection_seconds = Histogram(
+    "cobrowse_viewer_connection_seconds",
+    "How long a viewer's WebSocket lived. The distribution IS the churn signal: "
+    "a healthy session is one long connection, and a pile in the sub-second bucket "
+    "means viewers are flapping (each flap is a spinner flash for the human) while "
+    "a hard cluster at one long duration means something upstream — a proxy idle "
+    "timeout, a lease — is cutting sessions at a fixed age rather than the human "
+    "leaving. Neither is visible in a connection COUNT, which is all "
+    "cobrowse_viewer_connections_total can say.",
+    buckets=(0.5, 5.0, 60.0, 600.0, 3600.0, float("inf")),
+    registry=_registry,
+)
+_repaints = Counter(
+    "cobrowse_repaints_total",
+    "Page changes the pod KNOWS happened (navigate / tab switch / back / forward / "
+    "reload) while at least one viewer was attached, by what the viewers then got: "
+    "painted (a frame reached a viewer), no_frame (none did, within the deadline — "
+    "every attached human is looking at the PREVIOUS page and has no way to know), "
+    "viewer_left (the last viewer detached before the deadline, so the question "
+    "became moot). This is the join no single-sided signal can make: the screencast "
+    "can be running, the sinks registered and the navigation successful while the "
+    "picture is silently stale. viewer_left is carried rather than dropped so an "
+    "unmeasured case can never be mistaken for a clean one.",
+    ["outcome"],
+    registry=_registry,
+)
+_repaint_to_frame_seconds = Histogram(
+    "cobrowse_repaint_to_frame_seconds",
+    "Seconds from a known page change to the first frame that reached a viewer. "
+    "The human-facing latency of 'I clicked a link / the agent navigated' — the "
+    "one number that says how long the co-browse picture lags reality.",
+    buckets=(0.5, 2.0, 5.0, float("inf")),
+    registry=_registry,
+)
+_input_dispatch_failures = Counter(
+    "cobrowse_input_dispatch_failures_total",
+    "Drive frames from a viewer that RAISED on dispatch, by kind (input/navigate/"
+    "tab/control/resize). The human clicked and the click went nowhere. Before "
+    "this existed the exception tore the whole connection down, so one bad click "
+    "took the picture with it and surfaced only as a generic "
+    "cobrowse_session_errors_total tick; the connection now survives and the "
+    "failure is named. Any sustained rate is a broken input path, not a flaky "
+    "viewer.",
+    ["kind"],
+    registry=_registry,
+)
+_multi_driver_attaches = Counter(
+    "cobrowse_multi_driver_attaches_total",
+    "Times a viewer with DRIVE rights attached to a session that already had one. "
+    "Two people sharing one mouse and keyboard with no arbitration and no UI "
+    "telling either of them: clicks interleave, typing lands in whichever field "
+    "the other person just moved focus to. Not an error — co-browse is deliberately "
+    "multi-viewer — but it is the precondition for a confusing session, and today "
+    "nothing anywhere records that it happened.",
     registry=_registry,
 )
 _first_frame_seconds = Histogram(
@@ -425,6 +509,31 @@ def inc_viewer_attach(outcome: str) -> None:
 
 def inc_viewer_without_frame() -> None:
     _viewers_without_frame.inc()
+
+
+def inc_viewer_aborted_connect() -> None:
+    _viewer_aborted_connects.inc()
+
+
+def observe_viewer_connection(seconds: float) -> None:
+    _viewer_connection_seconds.observe(seconds)
+
+
+def inc_repaint(outcome: str) -> None:
+    """outcome: painted | no_frame | viewer_left (see the metric docstring)."""
+    _repaints.labels(outcome=outcome).inc()
+
+
+def observe_repaint_to_frame(seconds: float) -> None:
+    _repaint_to_frame_seconds.observe(seconds)
+
+
+def inc_input_dispatch_failure(kind: str) -> None:
+    _input_dispatch_failures.labels(kind=kind).inc()
+
+
+def inc_multi_driver_attach() -> None:
+    _multi_driver_attaches.inc()
 
 
 def observe_first_frame(join: str, seconds: float) -> None:

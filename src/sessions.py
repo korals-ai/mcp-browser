@@ -41,6 +41,9 @@ class BrowserSession:
         self.driver = driver
         # Number of live co-browse WS viewers. Screencast runs iff > 0.
         self.viewers = 0
+        # How many of those viewers may DRIVE (the rest are watch-only). Two at
+        # once is legal but unarbitrated — see cobrowse_multi_driver_attaches_total.
+        self.drivers = 0
         # "agent" | "human" | None — drives the BrowserAgentState hint.
         self.last_actor: str | None = None
         # When True, the human has paused the agent (or the agent asked for a

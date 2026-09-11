@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
-from src import metrics
+from src import cobrowse_ws, metrics
 from src.cobrowse_ws import CoBrowseConnection
 from src.protocol import BrowserInput, parse_client_message
 from tests.conftest import FakeDriver, make_manager
@@ -412,7 +412,23 @@ def _val(name: str, **labels: str) -> float:
     return metrics._registry.get_sample_value(name, labels or None) or 0.0
 
 
-async def test_a_viewer_that_never_painted_is_counted_at_teardown() -> None:
+class SlowCloseWs(FakeWs):
+    """A viewer that stays attached for ``hold_s`` before the socket closes, so a
+    teardown can be measured against the paintable-connection floor with the real
+    clock rather than a faked one."""
+
+    def __init__(self, hold_s: float) -> None:
+        super().__init__(inbound=[])
+        self._hold_s = hold_s
+
+    async def receive_json(self) -> dict[str, Any] | None:
+        await asyncio.sleep(self._hold_s)
+        return None
+
+
+async def test_a_viewer_that_never_painted_is_counted_at_teardown(
+    monkeypatch: Any,
+) -> None:
     """The signal that would have caught the late-joiner bug from prod.
 
     This connection does everything right — socket accepted, sink registered,
@@ -420,11 +436,46 @@ async def test_a_viewer_that_never_painted_is_counted_at_teardown() -> None:
     transport-side metric reads green here, so the count of viewers that received
     ZERO frames is the only one that disagrees.
     """
+    monkeypatch.setattr(cobrowse_ws, "_MIN_PAINTABLE_CONNECTION_S", 0.001)
     driver = FakeDriver()
     manager, _ = make_manager(driver)
     before = _val("cobrowse_viewers_without_frame_total")
-    await CoBrowseConnection(manager, "c1", FakeWs(inbound=[])).run()
+    await CoBrowseConnection(manager, "c1", SlowCloseWs(hold_s=0.02)).run()
     assert _val("cobrowse_viewers_without_frame_total") == before + 1
+
+
+async def test_a_connect_that_died_before_any_paint_was_possible_is_not_a_stranded_human(
+    monkeypatch: Any,
+) -> None:
+    """The 2026-09-11 misfire, at its source.
+
+    Prod's viewer sockets are recycled roughly hourly, and each recycle produced a
+    connection that lived ~8ms with zero frames — no picture was POSSIBLE in that
+    time, and the retry two seconds later painted normally. Counting those as
+    humans who watched a spinner is what made CoBrowseViewerNeverPainted fire on
+    an ordinary reconnect. They are still counted, under their own name: a burst
+    of them is a real finding, just a different one.
+    """
+    monkeypatch.setattr(cobrowse_ws, "_MIN_PAINTABLE_CONNECTION_S", 5.0)
+    driver = FakeDriver()
+    manager, _ = make_manager(driver)
+    stranded = _val("cobrowse_viewers_without_frame_total")
+    aborted = _val("cobrowse_viewer_aborted_connects_total")
+
+    await CoBrowseConnection(manager, "c1", FakeWs(inbound=[])).run()
+
+    assert _val("cobrowse_viewers_without_frame_total") == stranded
+    assert _val("cobrowse_viewer_aborted_connects_total") == aborted + 1
+
+
+async def test_every_connection_records_how_long_it_lived() -> None:
+    """Connection COUNT cannot tell one long session from fifty flaps; the
+    lifetime distribution is what makes reconnect churn visible at all."""
+    driver = FakeDriver()
+    manager, _ = make_manager(driver)
+    before = _val("cobrowse_viewer_connection_seconds_count")
+    await CoBrowseConnection(manager, "c1", FakeWs(inbound=[])).run()
+    assert _val("cobrowse_viewer_connection_seconds_count") == before + 1
 
 
 async def test_a_viewer_that_painted_is_not_counted_as_starved() -> None:
@@ -476,3 +527,72 @@ async def test_first_frame_latency_is_labelled_by_how_the_viewer_joined() -> Non
 
     assert any(m["type"] == "browser_frame" for m in late_ws.sent)
     assert _val("cobrowse_viewer_first_frame_seconds_count", join="late") == before + 1
+
+
+async def test_a_failing_click_is_counted_and_does_not_take_the_picture_with_it() -> None:
+    """A raising drive frame used to propagate out of run(), so one bad click
+    closed the socket: the human's natural response — click again — met a dead
+    view, and the only trace was a generic session error. The connection must
+    survive, the next action must still be dispatched, and the failure must be
+    named by kind."""
+
+    class BreakingDriver(FakeDriver):
+        def __init__(self) -> None:
+            super().__init__()
+            self.raise_next = True
+
+        async def send_input(self, event: str, fields: dict[str, Any]) -> None:
+            if self.raise_next:
+                self.raise_next = False
+                raise RuntimeError("CDP send failed")
+            await super().send_input(event, fields)
+
+    driver = BreakingDriver()
+    manager, _ = make_manager(driver)
+    before = _val("cobrowse_input_dispatch_failures_total", kind="input")
+    ws = FakeWs(
+        inbound=[
+            {"type": "browser_input", "event": "mouse", "fields": {"kind": "click", "x": 1}},
+            {"type": "browser_input", "event": "mouse", "fields": {"kind": "click", "x": 3}},
+        ]
+    )
+
+    await CoBrowseConnection(manager, "c1", ws).run()
+
+    assert _val("cobrowse_input_dispatch_failures_total", kind="input") == before + 1
+    # The connection outlived the failure: the SECOND click still reached the page.
+    assert driver.inputs == [("mouse", {"kind": "click", "x": 3})]
+
+
+async def test_a_second_driving_viewer_is_recorded() -> None:
+    """Two people sharing one mouse with no arbitration is legal and invisible;
+    "their clicks kept fighting mine" is unreconstructable without this count."""
+    driver = FakeDriver()
+    manager, _ = make_manager(driver)
+    session = await manager.get_or_create("c1")
+    first = CoBrowseConnection(manager, "c1", SlowCloseWs(hold_s=0.02), can_drive=True)
+    task = asyncio.create_task(first.run())
+    await asyncio.sleep(0)
+
+    before = _val("cobrowse_multi_driver_attaches_total")
+    await CoBrowseConnection(manager, "c1", FakeWs(inbound=[]), can_drive=True).run()
+    assert _val("cobrowse_multi_driver_attaches_total") == before + 1
+    await task
+    # Both viewers have gone: the driving refcount must come back to zero, or the
+    # very next lone viewer is misreported as a second one forever after.
+    assert session.drivers == 0
+
+
+async def test_a_watch_only_viewer_is_not_a_second_driver() -> None:
+    """The negative control for the count above: a teammate opening the same chat
+    read-only shares no input plane — no arbitration problem, no increment."""
+    driver = FakeDriver()
+    manager, _ = make_manager(driver)
+    first = CoBrowseConnection(manager, "c1", SlowCloseWs(hold_s=0.02), can_drive=True)
+    task = asyncio.create_task(first.run())
+    await asyncio.sleep(0)
+
+    before = _val("cobrowse_multi_driver_attaches_total")
+    await CoBrowseConnection(manager, "c1", FakeWs(inbound=[]), can_drive=False).run()
+    assert _val("cobrowse_multi_driver_attaches_total") == before
+    await task

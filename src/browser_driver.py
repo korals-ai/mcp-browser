@@ -60,6 +60,12 @@ _DEVICE_SCALE = 2
 _SCREENCAST_QUALITY = 85
 _MIN_FRAME_INTERVAL_S = 0.066
 
+# How long after a KNOWN page change (navigate / tab switch / back / forward /
+# reload) a frame must reach a viewer before we call it a miss. Generous on
+# purpose: it is not a latency SLO but a stuck-picture tripwire, and a heavy page
+# on a cold tab can legitimately take seconds to first paint. See _expect_repaint.
+_REPAINT_DEADLINE_S = 10.0
+
 # Human-driven resize bounds (set_viewport). The floor keeps a sliver panel
 # from rendering an unusable page; the ceiling caps the screencast JPEG
 # (_DEVICE_SCALE x these pixels) so a 4K panel can't balloon per-frame egress.
@@ -706,6 +712,12 @@ class PlaywrightDriver:
         self._latest_frame_at: float = 0.0
         self._frame_ready: asyncio.Event | None = None
         self._pump_task: asyncio.Task[None] | None = None
+        # An armed "the page definitely changed" expectation: when it was armed
+        # and by what. Resolved by the next frame that reaches a viewer, or by
+        # the watchdog below when none does. See _expect_repaint.
+        self._repaint_expected_at: float | None = None
+        self._repaint_reason: str = ""
+        self._repaint_watch: asyncio.Task[None] | None = None
         # Instance attribute so tests can shrink it without patching the constant.
         self._min_frame_interval = _MIN_FRAME_INTERVAL_S
         # The CDP session actually running the capture — lets teardown prove it
@@ -1425,6 +1437,7 @@ class PlaywrightDriver:
             await self._activate(tab.id)
         active = self._active()
         active.pending_url = None  # an explicit navigation supersedes a parked URL
+        self._expect_repaint("navigate")
         resp = await active.page.goto(url, wait_until="domcontentloaded")
         return await self._classify_landed_page(active, resp)
 
@@ -1512,6 +1525,10 @@ class PlaywrightDriver:
         with contextlib.suppress(Exception):
             await self._active().page.bring_to_front()
         if self._sinks:
+            # Armed AFTER the cache was cleared above: until the new tab paints,
+            # every attached viewer is holding the old tab's picture with no way
+            # to tell, and a late joiner gets `no_cached_frame`.
+            self._expect_repaint("tab_switch")
             await self._start_screencast_on(self._active())
 
     # --- page actions (on the active tab) -----------------------------------
@@ -1579,12 +1596,15 @@ class PlaywrightDriver:
     # --- history / reliability ----------------------------------------------
 
     async def go_back(self) -> None:
+        self._expect_repaint("go_back")
         await self._active().page.go_back(wait_until="domcontentloaded")
 
     async def go_forward(self) -> None:
+        self._expect_repaint("go_forward")
         await self._active().page.go_forward(wait_until="domcontentloaded")
 
     async def reload(self) -> None:
+        self._expect_repaint("reload")
         await self._active().page.reload(wait_until="domcontentloaded")
 
     async def wait_for(self, *, text: str | None, selector: str | None, timeout_ms: int) -> bool:
@@ -1846,6 +1866,72 @@ class PlaywrightDriver:
         (never wall time: a viewer's paint latency must survive an NTP step)."""
         return time.monotonic()
 
+    # --- "did the humans actually SEE the change?" ---------------------------
+    #
+    # A navigation can succeed, the screencast can be running and every sink can
+    # be registered while the attached viewers keep showing the PREVIOUS page —
+    # the same shape as the late-joiner bug, one step further along: there the
+    # viewer had no picture, here it has the wrong one, which is worse because
+    # nothing looks broken. The only way to see it is to join the two sides:
+    # arm an expectation when the page is known to have changed, and let the
+    # fan-out disarm it.
+
+    def _expect_repaint(self, reason: str) -> None:
+        """Arm the deadline for an action that MUST produce a new picture.
+
+        Only called for changes the pod is certain about (navigate, tab switch,
+        back/forward/reload) — a click that hits dead space legitimately paints
+        nothing, and arming on those would drown the signal in noise. Nothing is
+        armed when no viewer is attached: a frame nobody waits for strands nobody.
+        """
+        if not self._sinks:
+            return
+        self._cancel_repaint_watch()
+        self._repaint_expected_at = self._now()
+        self._repaint_reason = reason
+        self._repaint_watch = asyncio.create_task(self._watch_repaint(reason))
+
+    def _resolve_repaint(self) -> None:
+        """A frame reached a viewer — the armed expectation (if any) is met."""
+        armed_at = self._repaint_expected_at
+        if armed_at is None:
+            return
+        self._repaint_expected_at = None
+        self._cancel_repaint_watch()
+        metrics.inc_repaint("painted")
+        metrics.observe_repaint_to_frame(max(0.0, self._now() - armed_at))
+
+    def _cancel_repaint_watch(self) -> None:
+        if self._repaint_watch is not None and not self._repaint_watch.done():
+            self._repaint_watch.cancel()
+        self._repaint_watch = None
+
+    async def _watch_repaint(self, reason: str) -> None:
+        """Count a page change the viewers were never shown.
+
+        Deliberately a plain sleep rather than a check folded into the pump: the
+        pump blocks on the frame event, so on exactly the failure this measures —
+        no frame — it never wakes up to notice.
+        """
+        with contextlib.suppress(asyncio.CancelledError):
+            await asyncio.sleep(_REPAINT_DEADLINE_S)
+            if self._repaint_expected_at is None:
+                return  # a frame landed between the timer firing and this line
+            self._repaint_expected_at = None
+            if not self._sinks:
+                # Everyone detached while we waited. The question is moot, but it
+                # is recorded rather than dropped so this case can never be
+                # mistaken for a clean paint.
+                metrics.inc_repaint("viewer_left")
+                return
+            metrics.inc_repaint("no_frame")
+            log.warning(
+                "cobrowse repaint reached no viewer reason=%s viewers=%d after_s=%.1f",
+                reason,
+                len(self._sinks),
+                _REPAINT_DEADLINE_S,
+            )
+
     async def _screencast_pump(self) -> None:
         """Fan the freshest frame out to every sink, rate-capped at
         ``_min_frame_interval`` (see _MIN_FRAME_INTERVAL_S). One slow viewer
@@ -1878,6 +1964,11 @@ class PlaywrightDriver:
                 except Exception:
                     metrics.inc_frame_send_failure()
                     continue
+                else:
+                    # A frame LANDED on a viewer — only now is a pending page
+                    # change resolved. Resolving on the attempt would report a
+                    # paint for a fan-out where every send raised.
+                    self._resolve_repaint()
                 finally:
                     # The loop is SERIAL, so this viewer's send is latency every
                     # other viewer pays. Counting the ones that overrun a whole
@@ -1900,6 +1991,12 @@ class PlaywrightDriver:
             await self._stop_capture()
 
     async def _stop_capture(self) -> None:
+        # The last viewer is gone: an armed expectation has nobody left to
+        # disappoint, and its watchdog must not outlive the capture.
+        if self._repaint_expected_at is not None:
+            self._repaint_expected_at = None
+            metrics.inc_repaint("viewer_left")
+        self._cancel_repaint_watch()
         if self._pump_task is not None:
             self._pump_task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
@@ -1951,6 +2048,8 @@ class PlaywrightDriver:
         # a session that went away badly.
         metrics.add_open_tabs(-len(self._tabs))
         self._sinks.clear()
+        self._repaint_expected_at = None
+        self._cancel_repaint_watch()
         if self._pump_task is not None:
             self._pump_task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):

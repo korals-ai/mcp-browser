@@ -50,6 +50,32 @@ log = logging.getLogger("workspace-tool-browser")
 _CURSOR_PROBE_MIN_INTERVAL_S = 0.08  # ≤ ~12 probes/sec per viewer
 _CURSOR_PROBE_TIMEOUT_S = 0.3  # a slow page eval is abandoned, not awaited
 
+# How long a zero-frame connection must have lasted before we call it a human
+# who watched a spinner rather than a socket that hung up before anything could
+# be painted. Prod reconnects produced 8ms zero-frame connections, which read as
+# stranded viewers and misfired CoBrowseViewerNeverPainted on 2026-09-11; a
+# second is far below the time any real first paint takes (the cold path is
+# seconds) and far above a transport abort.
+_MIN_PAINTABLE_CONNECTION_S = 1.0
+
+
+def _drive_kind(msg: Any) -> str:
+    """Label for a viewer->pod message in the failure counter. Kept coarse on
+    purpose — one series per USER-visible action, not per protocol class."""
+    if isinstance(msg, BrowserInput):
+        return "input"
+    if isinstance(msg, (BrowserNavigate, BrowserNewTab)):
+        return "navigate"
+    if isinstance(msg, (BrowserSwitchTab, BrowserCloseTab)):
+        return "tab"
+    if isinstance(msg, BrowserControl):
+        return "control"
+    if isinstance(msg, BrowserResize):
+        return "resize"
+    if isinstance(msg, BrowserEndSession):
+        return "end_session"
+    return "other"
+
 
 class CoBrowseConnection:
     """Drives one viewer WebSocket against one session. Framework-agnostic: the
@@ -97,6 +123,19 @@ class CoBrowseConnection:
         """Full connection lifecycle: attach, stream, drain input, detach."""
         session = await self._manager.get_or_create(self._session_id)
         session.viewers += 1
+        if self._can_drive:
+            if session.drivers:
+                # Two people now share one mouse and keyboard, with no arbitration
+                # and nothing in either UI saying so. Not blocked — co-browse is
+                # deliberately multi-viewer — but recorded, because "their clicks
+                # kept fighting mine" is otherwise unreconstructable after the fact.
+                metrics.inc_multi_driver_attach()
+                log.info(
+                    "cobrowse second driving viewer attached session=%s drivers=%d",
+                    self._session_id,
+                    session.drivers + 1,
+                )
+            session.drivers += 1
         session.touch()
         metrics.viewer_attached()
         # Register this socket so an MCP tool (e.g. a take-over request) can push
@@ -120,6 +159,8 @@ class CoBrowseConnection:
                 self._cursor_task.cancel()
             session.remove_viewer_sink(self._ws.send_json)
             session.viewers -= 1
+            if self._can_drive:
+                session.drivers -= 1
             metrics.viewer_detached()
             # Deregister THIS viewer's frame sink. The driver stops the CDP
             # screencast only when the last sink goes (start-once / stop-when-empty),
@@ -139,20 +180,35 @@ class CoBrowseConnection:
         without paying for a per-session metric series."""
         avg_fps = self._frames_sent / dur_s if dur_s > 0 else 0.0
         avg_kb = (self._bytes_sent / self._frames_sent / 1024) if self._frames_sent else 0.0
+        metrics.observe_viewer_connection(dur_s)
         if self._frames_sent == 0 and self._frame_sink is not None:
-            # This human watched the loading spinner for the whole connection and
-            # never saw the page. Every other signal (socket accepted, sink
-            # registered, screencast running for the OTHER viewer) reads green in
-            # exactly this case, which is how it went unseen until a user reported
-            # it — so it gets its own counter and its own log line, with the attach
-            # outcome that explains which silence it was.
-            metrics.inc_viewer_without_frame()
-            log.warning(
-                "cobrowse viewer never painted session=%s attach=%s dur_s=%.1f",
-                self._session_id,
-                self._attach_outcome or "never_attached",
-                dur_s,
-            )
+            if dur_s < _MIN_PAINTABLE_CONNECTION_S:
+                # Gone before any picture was possible — a reconnect race, not a
+                # person. Counted under its own name so the distinction stays
+                # visible: a burst of these is its own finding (the SPA dialling
+                # and hanging up), just not the "stranded human" one.
+                metrics.inc_viewer_aborted_connect()
+                log.info(
+                    "cobrowse viewer connect aborted before first paint session=%s "
+                    "attach=%s dur_s=%.3f",
+                    self._session_id,
+                    self._attach_outcome or "never_attached",
+                    dur_s,
+                )
+            else:
+                # This human watched the loading spinner for the whole connection
+                # and never saw the page. Every other signal (socket accepted, sink
+                # registered, screencast running for the OTHER viewer) reads green
+                # in exactly this case, which is how it went unseen until a user
+                # reported it — so it gets its own counter and its own log line,
+                # with the attach outcome that explains which silence it was.
+                metrics.inc_viewer_without_frame()
+                log.warning(
+                    "cobrowse viewer never painted session=%s attach=%s dur_s=%.1f",
+                    self._session_id,
+                    self._attach_outcome or "never_attached",
+                    dur_s,
+                )
         log.info(
             "cobrowse stream ended session=%s frames=%d bytes=%d dur_s=%.1f "
             "avg_fps=%.1f avg_frame_kb=%.1f",
@@ -247,7 +303,20 @@ class CoBrowseConnection:
             except ValueError as exc:
                 log.warning("cobrowse session=%s bad frame: %s", self._session_id, exc)
                 continue
-            await self._dispatch(session, msg)
+            try:
+                await self._dispatch(session, msg)
+            except Exception:
+                # One failed action must not take the picture with it. Before
+                # this, a raising click propagated out of run(), was counted as a
+                # generic session error and closed the socket — so the human's
+                # response to "nothing happened" (click again) hit a dead view.
+                # The connection survives; the failure is named and countable.
+                kind = _drive_kind(msg)
+                metrics.inc_input_dispatch_failure(kind)
+                log.exception(
+                    "cobrowse drive frame failed session=%s kind=%s", self._session_id, kind
+                )
+                continue
             if self._ended:  # human ended the session — the driver is closed
                 return
 

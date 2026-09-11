@@ -36,6 +36,12 @@ def test_render_exposes_all_cobrowse_series() -> None:
         "cobrowse_frame_send_failures_total",
         "cobrowse_slow_frame_sends_total",
         "cobrowse_replay_frame_age_seconds",
+        "cobrowse_viewer_aborted_connects_total",
+        "cobrowse_viewer_connection_seconds",
+        "cobrowse_repaints_total",
+        "cobrowse_repaint_to_frame_seconds",
+        "cobrowse_input_dispatch_failures_total",
+        "cobrowse_multi_driver_attaches_total",
     ):
         assert name in text, name
 

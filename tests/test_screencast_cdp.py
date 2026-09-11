@@ -22,7 +22,7 @@ import asyncio
 import contextlib
 from typing import Any
 
-from src import metrics
+from src import browser_driver, metrics
 from src.browser_driver import (
     _MAX_VIEWPORT_H,
     _MAX_VIEWPORT_W,
@@ -439,5 +439,104 @@ async def test_a_failing_sink_is_counted_not_just_swallowed() -> None:
         # The replay path: the attach must still succeed for the driver.
         assert await drv.add_frame_sink(broken_sink) == "replayed"
         assert _counter("cobrowse_frame_send_failures_total") == before + 1
+    finally:
+        await _cancel_pump(drv)
+
+
+# --- "did the humans actually SEE the change?" -------------------------------
+#
+# The late-joiner bug one step further along: the viewer HAS a picture, so every
+# signal reads green, and the picture is of the page before the navigation. These
+# cover the join that makes it visible — page change armed, fan-out disarms.
+
+
+class PaintSignalSink:
+    """A frame sink that reports, so a test can await the fan-out instead of
+    guessing how many event-loop turns the pump needs."""
+
+    def __init__(self) -> None:
+        self.painted = asyncio.Event()
+
+    async def __call__(self, _data: str, _meta: dict[str, Any]) -> None:
+        self.painted.set()
+
+
+async def _deliver_frame(cdp: FakeCDP) -> None:
+    """Invoke the tab's real screencast listener, as CDP would."""
+    await cdp.frame_listeners[0]({"sessionId": "s", "data": "JPEG", "metadata": {}})
+
+
+async def test_a_tab_switch_the_viewers_see_is_recorded_as_painted() -> None:
+    """The healthy path, which has to be asserted for the miss count to mean
+    anything: a page change followed by a frame reaching a viewer is `painted`,
+    with its latency recorded."""
+    drv, _t1, t2_cdp = _two_tab_driver()
+    sink = PaintSignalSink()
+    await drv.add_frame_sink(sink)
+    drv._min_frame_interval = 0.0  # no fan-out throttle to wait through
+    try:
+        painted = _labelled("cobrowse_repaints_total", outcome="painted")
+        latencies = _counter("cobrowse_repaint_to_frame_seconds_count")
+
+        await drv.switch_tab("t2")
+        await _deliver_frame(t2_cdp)
+        await asyncio.wait_for(sink.painted.wait(), timeout=2.0)
+
+        assert _labelled("cobrowse_repaints_total", outcome="painted") == painted + 1
+        assert _counter("cobrowse_repaint_to_frame_seconds_count") == latencies + 1
+    finally:
+        await _cancel_pump(drv)
+
+
+async def test_a_page_change_that_reaches_no_viewer_is_counted(monkeypatch: Any) -> None:
+    """The signal itself. The switch happened, the screencast is running and the
+    sink is registered — and no frame ever arrives, so every attached human keeps
+    staring at the previous tab with nothing to tell them. Nothing else in this
+    pod disagrees with that state, which is the whole reason for the counter."""
+    monkeypatch.setattr(browser_driver, "_REPAINT_DEADLINE_S", 0.01)
+    drv, _t1, _t2 = _two_tab_driver()
+    await drv.add_frame_sink(_noop_sink)
+    try:
+        before = _labelled("cobrowse_repaints_total", outcome="no_frame")
+
+        await drv.switch_tab("t2")  # no frame is ever delivered
+        await asyncio.sleep(0.05)
+
+        assert _labelled("cobrowse_repaints_total", outcome="no_frame") == before + 1
+    finally:
+        await _cancel_pump(drv)
+
+
+async def test_nothing_is_armed_when_nobody_is_watching(monkeypatch: Any) -> None:
+    """The agent browses alone most of the time. A page change with no viewer
+    attached strands nobody, and counting it would bury the real signal under
+    every headless navigation the agent makes."""
+    monkeypatch.setattr(browser_driver, "_REPAINT_DEADLINE_S", 0.01)
+    drv, _t1, _t2 = _two_tab_driver()
+    before = {
+        outcome: _labelled("cobrowse_repaints_total", outcome=outcome)
+        for outcome in ("painted", "no_frame", "viewer_left")
+    }
+
+    await drv.switch_tab("t2")
+    await asyncio.sleep(0.05)
+
+    for outcome, was in before.items():
+        assert _labelled("cobrowse_repaints_total", outcome=outcome) == was
+
+
+async def test_the_last_viewer_leaving_mid_change_is_recorded_not_dropped() -> None:
+    """A page change whose audience walked out before the deadline is neither a
+    paint nor a miss — and it must not silently vanish from the denominator, or
+    "we never miss a repaint" would be true partly because we stopped looking."""
+    drv, _t1, _t2 = _two_tab_driver()
+    await drv.add_frame_sink(_noop_sink)
+    try:
+        before = _labelled("cobrowse_repaints_total", outcome="viewer_left")
+
+        await drv.switch_tab("t2")
+        await drv.remove_frame_sink(_noop_sink)  # last viewer gone -> capture stops
+
+        assert _labelled("cobrowse_repaints_total", outcome="viewer_left") == before + 1
     finally:
         await _cancel_pump(drv)
