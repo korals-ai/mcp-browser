@@ -350,7 +350,9 @@ async def browser_login(portal_id: str) -> dict[str, Any]:
 
     Returns:
         ``{status, portal_id, ...}`` where status is ``submitted`` (credentials
-        entered), ``unknown_portal`` (no such portal configured), or
+        entered), ``unknown_portal`` (no such portal configured),
+        ``no_stored_password`` (the portal exists but has no password saved —
+        ask the user to add one in their settings; nothing was typed), or
         ``no_login_form`` (no login form found on the page).
     """
     portals = await asyncio.to_thread(read_portals)

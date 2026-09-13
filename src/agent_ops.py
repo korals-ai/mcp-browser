@@ -131,6 +131,17 @@ async def login(
     cred = portals.get(portal_id)
     if cred is None:
         return {"status": "unknown_portal", "portal_id": portal_id}
+    if not cred.password:
+        # A portal CAN be configured with metadata and no stored password: the
+        # SPA never gets the password back, so a blank one means "keep what is
+        # stored" — and when nothing is stored, ``build_env`` renders the key as
+        # "". Attempting the login anyway submits an EMPTY password, which the
+        # site rejects while this function reports ``submitted`` — the agent then
+        # believes it is signed in, and a real account has eaten a failed-login
+        # attempt it did not need to. Report the actual fault instead, before
+        # touching the site. (Found live: a tenant's portal had been configured
+        # with a username and no password since it was first set up.)
+        return {"status": "no_stored_password", "portal_id": portal_id}
     session = await _active_session(manager, session_id)
     await session.driver.open(cred.login_url)
     filled = await session.driver.fill_login(cred.username, cred.password)

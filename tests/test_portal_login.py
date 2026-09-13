@@ -66,6 +66,21 @@ async def test_login_unknown_portal() -> None:
     assert driver.opened == []  # never navigated
 
 
+async def test_login_refuses_a_portal_with_no_stored_password() -> None:
+    # The live shape this came from: a portal configured with a username and
+    # login_url whose password was never stored, so build_env delivers "". The
+    # old code typed the empty password and reported `submitted`, so the agent
+    # read a failed login as a successful one — and the real account took a
+    # failed-login attempt for nothing.
+    driver = FakeDriver()
+    manager, _ = make_manager(driver)
+    portals = {"acme": PortalCred("acme", "https://acme/login", "user1", "")}
+    result = await agent_ops.login(manager, "c1", "acme", portals)
+    assert result["status"] == "no_stored_password"
+    assert driver.opened == [], "must not navigate — the attempt is the harm"
+    assert driver.logins == []
+
+
 async def test_login_reports_no_form_found() -> None:
     driver = FakeDriver()
     driver.login_result = False  # no password field on the page
