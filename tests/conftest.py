@@ -32,6 +32,8 @@ class FakeDriver(BrowserDriver):
         self.tables: list[list[list[str]]] = [[["a", "b"], ["1", "2"]]]
         self.logins: list[tuple[str, str]] = []
         self.login_result = True  # fill_login return value; tests can flip
+        self.logins_at: list[tuple[str, str, str]] = []  # (ref, username, password)
+        self.login_at_result = True  # fill_login_at return value; tests can flip
         self.wait_for_result = True  # wait_for return value; a False is a real timeout
         self._reads = 0  # read-only calls, which record no arguments of their own
         self.inputs: list[tuple[str, dict[str, Any]]] = []
@@ -317,6 +319,10 @@ class FakeDriver(BrowserDriver):
     async def fill_login(self, username: str, password: str) -> bool:
         self.logins.append((username, password))
         return self.login_result
+
+    async def fill_login_at(self, ref: str, username: str, password: str) -> bool:
+        self.logins_at.append((ref, username, password))
+        return self.login_at_result
 
     async def nav_state(self) -> dict[str, Any]:
         return {

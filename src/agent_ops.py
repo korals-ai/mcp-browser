@@ -9,13 +9,17 @@ domain error the handler maps.
 
 from __future__ import annotations
 
+import logging
 from typing import Any
+from urllib.parse import urlsplit
 
 from src import recipes
 from src.portal_creds import PortalCred
 from src.protocol import BrowserAgentState, BrowserNav, BrowserTabs, BrowserTakeoverRequest
 from src.sessions import SessionManager
 from src.snapshot import redact_snapshot, snapshot_to_json
+
+log = logging.getLogger("workspace-tool-browser")
 
 
 class AgentPaused(Exception):
@@ -124,10 +128,26 @@ async def login(
     session_id: str,
     portal_id: str,
     portals: dict[str, PortalCred],
+    ref: str | None = None,
 ) -> dict[str, Any]:
-    """Authenticate to a stored portal. The agent passes only ``portal_id``; the
-    credential is resolved HERE and injected via the driver — it never enters the
-    agent's context (and the returned dict never carries it)."""
+    """Authenticate to a stored portal. The agent passes only ``portal_id`` (and
+    optionally where to type); the credential is resolved HERE and injected via
+    the driver — it never enters the agent's context, and the returned dict never
+    carries it.
+
+    Two modes, and the caller picks:
+
+    * ``ref=None`` — open the portal's stored login URL and fill the form there.
+    * ``ref=<username field>`` — fill the form containing that ref on the page
+      already open, with no navigation. This is how a caller reaches a login form
+      that is not AT the stored URL: many sites keep the form behind a menu, or
+      redirect to a separate identity provider, so "always navigate to the stored
+      URL first" cannot reach them at all.
+
+    The credential can therefore be typed somewhere other than the stored URL.
+    That is a deliberate trade — reachability over a fixed-destination guarantee —
+    which is why every injection logs the origin it was typed into, so where a
+    stored credential has been used is answerable after the fact."""
     cred = portals.get(portal_id)
     if cred is None:
         return {"status": "unknown_portal", "portal_id": portal_id}
@@ -143,12 +163,37 @@ async def login(
         # with a username and no password since it was first set up.)
         return {"status": "no_stored_password", "portal_id": portal_id}
     session = await _active_session(manager, session_id)
-    await session.driver.open(cred.login_url)
-    filled = await session.driver.fill_login(cred.username, cred.password)
-    if not filled:
-        return {"status": "no_login_form", "portal_id": portal_id}
+    if ref is None:
+        await session.driver.open(cred.login_url)
+        filled = await session.driver.fill_login(cred.username, cred.password)
+    else:
+        filled = await session.driver.fill_login_at(ref, cred.username, cred.password)
     nav = await session.driver.nav_state()
+    if not filled:
+        # Say which URL was actually tried. "No login form" on its own sends the
+        # caller looking at the wrong page — most often the stored URL is a site's
+        # home page and the form lives behind a menu, which is indistinguishable
+        # from "this site has no login" unless the answer names where it looked.
+        return {
+            "status": "no_login_form",
+            "portal_id": portal_id,
+            "url": nav.get("url", ""),
+            "tried": "stored_login_url" if ref is None else f"ref:{ref}",
+        }
+    _log_injection(portal_id, nav.get("url", ""))
     return {"status": "submitted", "portal_id": portal_id, "url": nav.get("url", "")}
+
+
+def _log_injection(portal_id: str, url: str) -> None:
+    """Record WHERE a stored credential was typed — origin only, never the path
+    or query (those carry per-session tokens), and never the credential.
+
+    This is the audit half of allowing a caller-chosen destination: the tool no
+    longer guarantees a credential only reaches its stored URL, so it has to be
+    able to answer where each one did go."""
+    parts = urlsplit(url)
+    origin = f"{parts.scheme}://{parts.netloc}" if parts.scheme and parts.netloc else "unknown"
+    log.info("portal credential injected: portal_id=%s origin=%s", portal_id, origin)
 
 
 async def request_takeover(manager: SessionManager, session_id: str, reason: str) -> dict[str, Any]:
@@ -388,7 +433,7 @@ async def _run_recipe_step(
         # Reuse the audited login op rather than re-implementing it here: it is
         # what keeps the password out of the agent's context, and a second copy
         # of that path is a second place for it to leak.
-        return await login(manager, session_id, args["portal_id"], portals)
+        return await login(manager, session_id, args["portal_id"], portals, ref=args.get("ref"))
     if tool == "browser_back":
         await driver.go_back()
         return None

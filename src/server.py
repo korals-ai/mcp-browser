@@ -336,27 +336,42 @@ async def browser_snapshot() -> list[dict[str, Any]]:
 
 
 @mcp.tool()
-async def browser_login(portal_id: str) -> dict[str, Any]:
+async def browser_login(portal_id: str, ref: str = "") -> dict[str, Any]:
     """Log in to a portal the user has configured for this workspace.
 
     You pass ONLY the portal id (e.g. "acme-portal"); the username and password
-    are stored securely and injected server-side — they are never shown to you.
-    Use this when a page needs a login you don't have visible credentials for.
-    Call ``browser_snapshot`` afterwards to see whether login succeeded or a
-    challenge (MFA/CAPTCHA) needs the user.
+    are stored securely and injected server-side — they are never shown to you,
+    and you can never read them. Call ``browser_snapshot`` afterwards to see
+    whether login succeeded or a challenge (MFA/CAPTCHA) needs the user.
+
+    Two ways to use it:
+
+    * **No ``ref``** — goes to the portal's saved login URL and fills the form
+      there. Try this first.
+    * **With ``ref``** — fills the form on the page you are ALREADY on, without
+      navigating. Use this when the saved URL turns out not to hold the login
+      form: many sites keep it behind an account menu, or hand off to a separate
+      sign-in provider. Navigate there yourself, ``browser_snapshot``, then pass
+      the ref of the username/email field.
+
+    So a `no_login_form` answer is not a dead end — find the real form and call
+    again with its ref. Never ask the user to tell you the password.
 
     Args:
         portal_id: The configured portal to authenticate to.
+        ref: Optional element ref of the username/email field on the current
+            page, from a prior ``browser_snapshot``. Omit to use the saved URL.
 
     Returns:
-        ``{status, portal_id, ...}`` where status is ``submitted`` (credentials
-        entered), ``unknown_portal`` (no such portal configured),
+        ``{status, portal_id, url, ...}`` where status is ``submitted``
+        (credentials entered), ``unknown_portal`` (no such portal configured),
         ``no_stored_password`` (the portal exists but has no password saved —
         ask the user to add one in their settings; nothing was typed), or
-        ``no_login_form`` (no login form found on the page).
+        ``no_login_form`` (no usable form where it looked — ``url`` and ``tried``
+        say where that was).
     """
     portals = await asyncio.to_thread(read_portals)
-    return await agent_ops.login(manager, _session_id(), portal_id, portals)
+    return await agent_ops.login(manager, _session_id(), portal_id, portals, ref=ref or None)
 
 
 @mcp.tool()

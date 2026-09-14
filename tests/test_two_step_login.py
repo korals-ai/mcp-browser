@@ -40,6 +40,24 @@ class FakeElement:
             self.on_press()
 
 
+class FakeLocator:
+    """Playwright's locator surface, as much of it as ``fill_login_at`` uses."""
+
+    def __init__(self, element: FakeElement | None) -> None:
+        self.element = element
+
+    async def count(self) -> int:
+        return 1 if self.element is not None else 0
+
+    async def fill(self, value: str) -> None:
+        assert self.element is not None
+        await self.element.fill(value)
+
+    async def press(self, key: str) -> None:
+        assert self.element is not None
+        await self.element.press(key)
+
+
 class FakeFrame:
     """Models a login screen: which fields exist, and whether they're visible."""
 
@@ -47,10 +65,18 @@ class FakeFrame:
         self,
         username: FakeElement | None = None,
         password: FakeElement | None = None,
+        by_ref: dict[str, FakeElement] | None = None,
     ) -> None:
         self.username = username
         self.password = password
         self.waited: list[str] = []
+        # Elements addressable by the cobrowse ref attribute, for fill_login_at.
+        self.by_ref = by_ref or {}
+
+    def locator(self, selector: str) -> FakeLocator:
+        prefix, suffix = "[data-cobrowse-ref='", "']"
+        assert selector.startswith(prefix) and selector.endswith(suffix), selector
+        return FakeLocator(self.by_ref.get(selector[len(prefix) : -len(suffix)]))
 
     def _match(self, selector: str) -> FakeElement | None:
         if selector == _PASSWORD_SELECTOR:
@@ -127,9 +153,9 @@ async def test_two_step_submits_username_then_password() -> None:
     # Submitting the username is what reveals the password screen.
     user.on_press = lambda: setattr(pw, "visible", True)
 
-    assert await _driver(frame).fill_login("ali@metrobit.ca", "s3cret") is True
+    assert await _driver(frame).fill_login("ali@example.com", "s3cret") is True
 
-    assert user.filled == ["ali@metrobit.ca"]
+    assert user.filled == ["ali@example.com"]
     assert user.pressed == ["Enter"]
     assert pw.filled == ["s3cret"]
     assert pw.pressed == ["Enter"]
@@ -206,3 +232,63 @@ async def test_visibility_probe_failure_is_not_fatal(boom: Exception) -> None:
 
     # No username to fall back to, so this is a clean False rather than a raise.
     assert await _driver(frame).fill_login("alice", "s3cret") is False
+
+
+# --- fill at a caller-chosen ref --------------------------------------------
+
+
+async def test_fill_at_ref_single_step_fills_both_and_submits() -> None:
+    user, pw = FakeElement(), FakeElement()
+    frame = FakeFrame(password=pw, by_ref={"e7": user})
+
+    assert await _driver(frame).fill_login_at("e7", "alice", "s3cret") is True
+
+    assert user.filled == ["alice"]
+    assert pw.filled == ["s3cret"]
+    assert pw.pressed == ["Enter"]
+    assert frame.waited == []
+
+
+async def test_fill_at_ref_takes_the_two_step_path_when_no_password_yet() -> None:
+    """The case that motivated the ref form: a progressive-disclosure form the
+    caller reached itself, where the password screen only follows the username."""
+    user = FakeElement()
+    pw = FakeElement(visible=False)
+    frame = FakeFrame(password=pw, by_ref={"e7": user})
+    user.on_press = lambda: setattr(pw, "visible", True)
+
+    assert await _driver(frame).fill_login_at("e7", "alice", "s3cret") is True
+
+    assert user.filled == ["alice"]
+    assert user.pressed == ["Enter"]
+    assert pw.filled == ["s3cret"]
+    assert frame.waited == [_PASSWORD_SELECTOR]
+
+
+async def test_fill_at_ref_never_consults_the_username_selector() -> None:
+    """The whole point of the ref form.
+
+    ``_USERNAME_SELECTOR`` matches a bare ``input[type=text]``, so guessing on a
+    page the caller navigated to can land on a search box and submit it. Here the
+    frame has NO selector-findable username field and the fill still works — proof
+    the ref is what is used.
+    """
+    user, pw = FakeElement(), FakeElement()
+    frame = FakeFrame(username=None, password=pw, by_ref={"e7": user})
+
+    assert await _driver(frame).fill_login_at("e7", "alice", "s3cret") is True
+    assert user.filled == ["alice"]
+
+
+async def test_fill_at_a_ref_that_matches_nothing_is_a_clean_false() -> None:
+    frame = FakeFrame(password=FakeElement(), by_ref={})
+
+    assert await _driver(frame).fill_login_at("e99", "alice", "s3cret") is False
+
+
+async def test_fill_at_ref_returns_false_when_the_password_screen_never_arrives() -> None:
+    user = FakeElement()
+    frame = FakeFrame(password=None, by_ref={"e7": user})  # nothing ever reveals one
+
+    assert await _driver(frame).fill_login_at("e7", "alice", "s3cret") is False
+    assert user.pressed == ["Enter"], "it must have tried to advance the form"

@@ -537,6 +537,13 @@ class BrowserDriver(Protocol):
         the caller reports to the agent as ``no_login_form``."""
         ...
 
+    async def fill_login_at(self, ref: str, username: str, password: str) -> bool:
+        """Like :meth:`fill_login`, but for the form containing ``ref`` on the
+        page already open — no navigation, and the username field is the one the
+        caller named rather than one guessed by selector. False means the ref
+        resolved to nothing, or the password screen never arrived."""
+        ...
+
     async def nav_state(self) -> dict[str, Any]:
         """Active tab's ``{url, title, can_go_back, can_go_forward}``."""
         ...
@@ -1672,6 +1679,40 @@ class PlaywrightDriver:
         await pw.press("Enter")
         return True
 
+    async def fill_login_at(self, ref: str, username: str, password: str) -> bool:
+        """Fill the login form containing ``ref`` on the CURRENT page.
+
+        ``fill_login`` finds its own username field by selector, which is safe
+        only right after opening a known login URL. Once the caller has navigated
+        somewhere itself, selector-guessing is the wrong tool: ``_USERNAME_SELECTOR``
+        matches a bare ``input[type=text]``, so on an arbitrary page it can land on
+        a search box and submit it. Anchoring on a ref the caller picked out of a
+        snapshot removes the guess — the caller says which field, this types into
+        it.
+
+        Same two shapes as ``fill_login``: password already visible → fill both and
+        submit; password not present yet → submit the username and wait for the
+        second screen.
+        """
+        frame = self._active_frame()
+        user = frame.locator(f"[data-cobrowse-ref='{ref}']")
+        try:
+            if await user.count() == 0:
+                return False
+        except Exception:
+            return False
+
+        pw = await self._visible_selector(frame, _PASSWORD_SELECTOR)
+        if pw is not None:
+            await user.fill(username)
+            await pw.fill(password)
+            await pw.press("Enter")
+            return True
+
+        await user.fill(username)
+        await user.press("Enter")
+        return await self._submit_password_screen(password)
+
     async def _fill_login_two_step(self, frame: Any, username: str, password: str) -> bool:
         """Username screen first, password on a second screen.
 
@@ -1685,8 +1726,14 @@ class PlaywrightDriver:
             return False
         await user.fill(username)
         await user.press("Enter")
-        # The second screen commonly re-renders or swaps the frame, so re-resolve
-        # rather than reusing the handle the username lived in.
+        return await self._submit_password_screen(password)
+
+    async def _submit_password_screen(self, password: str) -> bool:
+        """Wait for the second screen's password field, fill it and submit.
+
+        Re-resolves the frame rather than reusing the one the username lived in —
+        the second screen commonly re-renders or swaps it.
+        """
         frame = self._active_frame()
         try:
             pw = await frame.wait_for_selector(
