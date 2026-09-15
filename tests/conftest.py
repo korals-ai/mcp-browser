@@ -7,35 +7,65 @@ from typing import Any
 
 from src.browser_driver import BrowserDriver
 from src.sessions import SessionManager
-from src.snapshot import Element
+
+# A small page the agent-plane tests read: two refs, a password field whose
+# typed value the driver blanks, and a link with a /url property.
+DEFAULT_TREE = """- banner:
+  - link "Home" [ref=e1] [cursor=pointer]:
+    - /url: /
+  - searchbox "Search products" [ref=e2]
+- main:
+  - heading "Welcome" [level=1]
+  - textbox "Password" [ref=e3]
+  - button "Sign in" [ref=e4] [cursor=pointer]
+  - text: Some prose on the page
+"""
 
 
 class FakeDriver(BrowserDriver):
     """In-memory driver recording calls and returning canned data.
 
-    Screencast frames are delivered by calling :meth:`emit_frame` from the test,
-    so streaming is deterministic (no timers, no real browser)."""
+    Screencast frames are delivered by calling :meth:`emit_frame` from the
+    test, so streaming is deterministic (no timers, no real browser)."""
 
-    def __init__(self, snapshot: list[Element] | None = None) -> None:
-        self._snapshot = snapshot or []
+    def __init__(self, tree: str = DEFAULT_TREE) -> None:
+        self.tree = tree
+        self.page_text_value = "fake page text"
+        self.page_title = "Fake"
         self.opened: list[str] = []
-        self.clicks: list[str] = []
-        self.typed: list[tuple[str, str]] = []
-        self.scrolls: list[tuple[str, int]] = []
-        self.keys: list[str] = []
-        self.selects: list[tuple[str, str]] = []
-        self.uploads: list[tuple[str, str]] = []
+        self.clicks: list[dict[str, Any]] = []
+        self.typed: list[tuple[str, str | None]] = []  # (text, ref)
+        self.keys: list[tuple[str, int]] = []
+        self.scrolls: list[dict[str, Any]] = []
+        self.scrolled_to: list[str] = []
+        self.scroll_to_result = True
+        self.hovers: list[dict[str, Any]] = []
+        self.drags: list[tuple[tuple[int, int], tuple[int, int]]] = []
+        self.waits: list[float] = []
+        self.form_inputs: list[tuple[str, Any]] = []
+        self.uploads: list[tuple[str, list[str]]] = []
         self.downloads: list[tuple[str, str]] = []
-        self.nav_ops: list[str] = []  # back/forward/reload
+        self.nav_ops: list[str] = []  # back/forward
         self.waited: list[dict[str, Any]] = []
-        self.page_text = "fake page text"
-        self.tables: list[list[list[str]]] = [[["a", "b"], ["1", "2"]]]
+        self.wait_for_result = True  # a False is a real timeout
         self.logins: list[tuple[str, str]] = []
         self.login_result = True  # fill_login return value; tests can flip
         self.logins_at: list[tuple[str, str, str]] = []  # (ref, username, password)
         self.login_at_result = True  # fill_login_at return value; tests can flip
-        self.wait_for_result = True  # wait_for return value; a False is a real timeout
-        self._reads = 0  # read-only calls, which record no arguments of their own
+        self.evals: list[str] = []
+        self.eval_result: dict[str, Any] = {"result": ""}
+        self.page_state = "ok"
+        self.type_note = "ok"
+        self.form_note = "ok"
+        # What settle() reports for the next mutating action ("Page navigated
+        # to …", "Opened tab 2 (…)", 'Dialog confirm "…" was dismissed').
+        self.changes: list[str] = []
+        self.markers: list[dict[str, Any]] = []
+        self.settled = 0
+        self.secrets: list[str] = []  # password values typed on the page
+        self.screenshot_png = b"\x89PNG\r\n\x1a\n-fake"
+        self.screenshots: list[dict[str, Any]] = []
+        self.read_pages: list[dict[str, Any]] = []
         self.inputs: list[tuple[str, dict[str, Any]]] = []
         self.viewports: list[tuple[int, int]] = []  # set_viewport calls
         # Cursor probe: recorded (x, y) calls + the value returned (per-test).
@@ -50,10 +80,14 @@ class FakeDriver(BrowserDriver):
         # The driver's cached last frame, replayed to a LATE sink on attach. None
         # = nothing captured yet, which is the "no_cached_frame" attach outcome.
         self.cached_frame: tuple[str, dict[str, Any]] | None = None
-        # Minimal in-memory tab model mirroring PlaywrightDriver's semantics.
+        # Minimal in-memory tab model mirroring PlaywrightDriver's semantics:
+        # string ids for the human plane, numbers for the agent plane.
         self._tab_seq = 1
-        self._tabs: list[dict[str, Any]] = [{"id": "t1", "url": "about:blank", "title": "Fake"}]
+        self._tabs: list[dict[str, Any]] = [
+            {"id": "t1", "tabId": 1, "url": "about:blank", "title": "Fake", "loaded": True}
+        ]
         self._active = "t1"
+        self.activations: list[int] = []
         # --- frames (per-tab active-frame pin) ---
         self.frame_switches: list[str] = []
         self._frames: dict[str, list[dict[str, Any]]] = {
@@ -65,32 +99,19 @@ class FakeDriver(BrowserDriver):
         self.last_dialog_info: dict[str, Any] | None = None
         # --- console/network observability ---
         self.console_ring: list[dict[str, Any]] = []
-        self.network_ring: list[dict[str, Any]] = []
-        self.next_wait_response: dict[str, Any] | None = None
-        self.waited_response: list[tuple[str, int]] = []
-        # --- interaction extras ---
-        self.hovers: list[str] = []
-        self.drags: list[tuple[str, str]] = []
-        self.scrolled_to: list[str] = []
-        self.scroll_to_result = True
-        self.options: list[dict[str, Any]] = []
-        self.links: list[dict[str, str]] = []
-        self.evals: list[str] = []
-        self.eval_result: dict[str, Any] = {"result": ""}
-        self.page_state = "ok"
-        self.type_note = "ok"
+        self.network_entries: list[dict[str, Any]] = []
+        self._net_seq = 0
+
+    # --- tabs ---
+
+    def _tab(self, tab_id: str) -> dict[str, Any]:
+        return next(t for t in self._tabs if t["id"] == tab_id)
 
     async def open(self, url: str, *, new_tab: bool = False) -> str:
         self.opened.append(url)
         if new_tab:
-            self._tab_seq += 1
-            tid = f"t{self._tab_seq}"
-            self._tabs.append({"id": tid, "url": url, "title": "Fake"})
-            self._active = tid
-        else:
-            for t in self._tabs:
-                if t["id"] == self._active:
-                    t["url"] = url
+            await self.new_tab()
+        self._tab(self._active)["url"] = url
         # A configurable page_state (default "ok") mirrors the real driver's
         # classify-on-open contract; tests set fake.page_state to simulate walls.
         return self.page_state
@@ -111,47 +132,169 @@ class FakeDriver(BrowserDriver):
         was_active = tab_id == self._active
         self._tabs = [t for t in self._tabs if t["id"] != tab_id]
         if not self._tabs:
-            self._tab_seq += 1
-            self._tabs = [{"id": f"t{self._tab_seq}", "url": "about:blank", "title": "Fake"}]
-            self._active = self._tabs[0]["id"]
+            await self.new_tab()
         elif was_active:
             self._active = self._tabs[0]["id"]
         return True
 
-    async def snapshot(self) -> list[Element]:
-        self._reads += 1
-        return list(self._snapshot)
+    async def activate_num(self, tab_num: int) -> bool:
+        tab = next((t for t in self._tabs if t["tabId"] == tab_num), None)
+        if tab is None:
+            return False
+        self.activations.append(tab_num)
+        if tab["id"] != self._active:
+            self._active = tab["id"]
+            self._active_frame_idx[tab["id"]] = 0
+        return True
 
-    async def click(self, ref: str) -> None:
-        self.clicks.append(ref)
+    async def new_tab(self) -> int:
+        self._tab_seq += 1
+        tid = f"t{self._tab_seq}"
+        self._tabs.append(
+            {
+                "id": tid,
+                "tabId": self._tab_seq,
+                "url": "about:blank",
+                "title": "Fake",
+                "loaded": True,
+            }
+        )
+        self._frames[tid] = [{"index": 0, "name": "", "url": "about:blank"}]
+        self._active_frame_idx[tid] = 0
+        self._active = tid
+        return self._tab_seq
 
-    async def type_text(self, ref: str, text: str) -> str:
-        self.typed.append((ref, text))
-        # Configurable like page_state: tests set fake.type_note to simulate
-        # a read-back mismatch / autocomplete hint.
+    async def close_tab_num(self, tab_num: int) -> bool:
+        tab = next((t for t in self._tabs if t["tabId"] == tab_num), None)
+        return False if tab is None else await self.close_tab(tab["id"])
+
+    def active_num(self) -> int:
+        return int(self._tab(self._active)["tabId"])
+
+    # --- the tree + refs ---
+
+    async def read_page(
+        self, *, depth: int | None = None, boxes: bool = False, ref_id: str | None = None
+    ) -> str:
+        self.read_pages.append({"depth": depth, "boxes": boxes, "ref_id": ref_id})
+        return self.tree
+
+    async def secret_values(self) -> list[str]:
+        return list(self.secrets)
+
+    async def page_text(self) -> dict[str, Any]:
+        return {
+            "title": self.page_title,
+            "url": self._tab(self._active)["url"],
+            "source": "main",
+            "text": self.page_text_value,
+        }
+
+    async def screenshot(
+        self, *, scale: float = 1.0, region: tuple[int, int, int, int] | None = None
+    ) -> tuple[bytes, dict[str, Any]]:
+        self.screenshots.append({"scale": scale, "region": region})
+        if region:
+            x0, y0, x1, y1 = region
+            w, h, x, y = x1 - x0, y1 - y0, x0, y0
+        else:
+            w, h, x, y = 1280, 800, 0, 0
+        meta = {
+            "width": w,
+            "height": h,
+            "x": x,
+            "y": y,
+            "image_width": int(w * scale),
+            "image_height": int(h * scale),
+            "scale": scale,
+            "region": list(region) if region else None,
+        }
+        return self.screenshot_png, meta
+
+    # --- `computer` actions ---
+
+    async def click(
+        self,
+        *,
+        ref: str | None = None,
+        coordinate: tuple[int, int] | None = None,
+        button: str = "left",
+        count: int = 1,
+        modifiers: list[str] | None = None,
+    ) -> str:
+        self.clicks.append(
+            {
+                "ref": ref,
+                "coordinate": coordinate,
+                "button": button,
+                "count": count,
+                "modifiers": modifiers or [],
+            }
+        )
+        return f"Clicked {ref}" if ref else f"Clicked at {coordinate}"
+
+    async def type_text(self, text: str, *, ref: str | None = None) -> str:
+        self.typed.append((text, ref))
         return self.type_note
 
-    async def scroll(self, direction: str, amount: int) -> None:
-        self.scrolls.append((direction, amount))
+    async def press_keys(self, combo: str, *, repeat: int = 1) -> None:
+        self.keys.append((combo, repeat))
 
-    async def read(self) -> str:
-        self._reads += 1
-        return self.page_text
+    async def scroll(
+        self,
+        direction: str,
+        amount: int,
+        *,
+        coordinate: tuple[int, int] | None = None,
+        ref: str | None = None,
+    ) -> None:
+        self.scrolls.append(
+            {"direction": direction, "amount": amount, "coordinate": coordinate, "ref": ref}
+        )
 
-    async def find_text(self, query: str) -> dict[str, Any]:
-        self._reads += 1
-        count = self.page_text.lower().count(query.lower())
-        return {"count": count, "snippet": query if count else ""}
+    async def scroll_to(self, ref: str) -> bool:
+        self.scrolled_to.append(ref)
+        return self.scroll_to_result
 
-    async def screenshot(self) -> bytes:
-        return b"\x89PNG\r\n\x1a\n-fake"
+    async def hover(
+        self, *, ref: str | None = None, coordinate: tuple[int, int] | None = None
+    ) -> None:
+        self.hovers.append({"ref": ref, "coordinate": coordinate})
 
-    async def inspect(self, ref: str) -> dict[str, Any]:
-        return {"found": True, "ref": ref, "tag": "button", "text": "Fake"}
+    async def drag(self, start: tuple[int, int], end: tuple[int, int]) -> None:
+        self.drags.append((start, end))
 
-    async def get_table(self, ref: str | None = None) -> list[list[list[str]]]:
-        self._reads += 1
-        return self.tables
+    async def wait(self, seconds: float) -> None:
+        self.waits.append(seconds)
+
+    async def form_input(self, ref: str, value: str | bool | float) -> str:
+        self.form_inputs.append((ref, value))
+        return self.form_note
+
+    async def upload_files(self, ref: str, paths: list[str]) -> None:
+        self.uploads.append((ref, list(paths)))
+
+    async def download(self, ref: str, dest_path: str) -> dict[str, Any]:
+        self.downloads.append((ref, dest_path))
+        return {"filename": "report.pdf", "saved": True}
+
+    async def eval_js(self, js: str) -> dict[str, Any]:
+        self.evals.append(js)
+        return dict(self.eval_result)
+
+    # --- settling ---
+
+    def state_marker(self) -> dict[str, Any]:
+        marker = {"url": self._tab(self._active)["url"], "tabs": {t["tabId"] for t in self._tabs}}
+        self.markers.append(marker)
+        return marker
+
+    async def settle(self, marker: dict[str, Any]) -> list[str]:
+        self.settled += 1
+        changes, self.changes = list(self.changes), []
+        return changes
+
+    # --- history / waiting ---
 
     async def go_back(self) -> None:
         self.nav_ops.append("back")
@@ -159,61 +302,28 @@ class FakeDriver(BrowserDriver):
     async def go_forward(self) -> None:
         self.nav_ops.append("forward")
 
-    async def reload(self) -> None:
-        self.nav_ops.append("reload")
-
-    def calls_made(self) -> int:
-        """How many driver calls this fake has recorded, in total.
-
-        Lets a test assert that a code path reached the driver AT ALL without
-        naming which method — used to prove every allowlisted recipe tool has a
-        live executor branch rather than just its name in the source."""
-        return (
-            sum(
-                len(x)
-                for x in (
-                    self.opened,
-                    self.clicks,
-                    self.typed,
-                    self.scrolls,
-                    self.keys,
-                    self.selects,
-                    self.uploads,
-                    self.downloads,
-                    self.nav_ops,
-                    self.waited,
-                    self.logins,
-                    self.inputs,
-                    self.hovers,
-                    self.drags,
-                    self.scrolled_to,
-                    self.evals,
-                    self.frame_switches,
-                    self.waited_response,
-                    self.cursor_calls,
-                )
-            )
-            + self._reads
+    async def wait_for(
+        self,
+        *,
+        text: str | None,
+        selector: str | None,
+        url: str | None = None,
+        response: str | None = None,
+        timeout_ms: int,
+    ) -> bool:
+        self.waited.append(
+            {
+                "text": text,
+                "selector": selector,
+                "url": url,
+                "response": response,
+                "timeout_ms": timeout_ms,
+            }
         )
-
-    async def wait_for(self, *, text: str | None, selector: str | None, timeout_ms: int) -> bool:
-        self.waited.append({"text": text, "selector": selector, "timeout_ms": timeout_ms})
         return self.wait_for_result
 
-    async def press_key(self, key: str) -> None:
-        self.keys.append(key)
-
-    async def select_option(self, ref: str, value: str) -> None:
-        self.selects.append((ref, value))
-
-    async def upload_file(self, ref: str, path: str) -> None:
-        self.uploads.append((ref, path))
-
-    async def download(self, ref: str, dest_path: str) -> dict[str, Any]:
-        self.downloads.append((ref, dest_path))
-        return {"filename": "report.pdf", "saved": True}
-
     # --- frames ---
+
     async def list_frames(self) -> list[dict[str, Any]]:
         return list(
             self._frames.get(self._active, [{"index": 0, "name": "", "url": "about:blank"}])
@@ -243,6 +353,7 @@ class FakeDriver(BrowserDriver):
         return self._active_frame_idx.get(self._active, 0)
 
     # --- native dialogs ---
+
     async def set_dialog_mode(self, mode: str) -> None:
         self.dialog_mode = "accept" if mode == "accept" else "dismiss"
 
@@ -259,62 +370,87 @@ class FakeDriver(BrowserDriver):
             "default_value": default_value,
             "action": self.dialog_mode,
             "url": self.opened[-1] if self.opened else "about:blank",
+            "seq": 1,
         }
 
     # --- console/network observability ---
+
     def record_console(self, msg_type: str, text: str) -> None:
         self.console_ring.append({"type": msg_type, "text": text})
         self.console_ring = self.console_ring[-50:]
 
     def record_network(
-        self, method: str, url: str, status: int, resource_type: str = "xhr"
-    ) -> None:
-        self.network_ring.append(
-            {"method": method, "url": url, "status": status, "resource_type": resource_type}
+        self,
+        method: str,
+        url: str,
+        status: int,
+        resource_type: str = "xhr",
+        *,
+        response_body: str | None = None,
+        request_body: str | None = None,
+        request_headers: dict[str, str] | None = None,
+        response_headers: dict[str, str] | None = None,
+    ) -> int:
+        self._net_seq += 1
+        self.network_entries.append(
+            {
+                "index": self._net_seq,
+                "method": method,
+                "url": url,
+                "status": status,
+                "resource_type": resource_type,
+                "size": len(response_body or ""),
+                "request_headers": dict(request_headers or {}),
+                "response_headers": dict(response_headers or {}),
+                "request_body": request_body,
+                "response_body": response_body,
+                "body_truncated": False,
+                "content_type": "application/json",
+            }
         )
-        self.network_ring = self.network_ring[-100:]
+        self.network_entries = self.network_entries[-100:]
+        return self._net_seq
 
-    async def console_log(self) -> list[dict[str, Any]]:
-        return list(self.console_ring)
-
-    async def network_log(
-        self, *, url_substring: str | None = None, limit: int = 100
+    async def console_messages(
+        self, *, pattern: str | None, only_errors: bool, limit: int, clear: bool
     ) -> list[dict[str, Any]]:
-        entries = list(self.network_ring)
-        if url_substring:
-            needle = url_substring.lower()
-            entries = [e for e in entries if needle in e["url"].lower()]
+        import re
+
+        entries = list(self.console_ring)
+        if only_errors:
+            entries = [e for e in entries if e["type"] in ("error", "warning")]
+        if pattern:
+            rx = re.compile(pattern, re.IGNORECASE)
+            entries = [e for e in entries if rx.search(e["text"])]
         if limit > 0:
             entries = entries[-limit:]
+        if clear:
+            self.console_ring = []
         return entries
 
-    async def wait_for_response(self, url_substring: str, timeout_ms: int) -> dict[str, Any]:
-        self.waited_response.append((url_substring, timeout_ms))
-        if self.next_wait_response is not None:
-            return self.next_wait_response
-        return {"matched": False, "status": 0, "url": ""}
+    async def network_requests(
+        self, *, url_pattern: str | None, limit: int, clear: bool
+    ) -> list[dict[str, Any]]:
+        import re
 
-    # --- interaction extras ---
-    async def hover(self, ref: str) -> None:
-        self.hovers.append(ref)
+        entries = list(self.network_entries)
+        if url_pattern:
+            rx = re.compile(url_pattern, re.IGNORECASE)
+            entries = [e for e in entries if rx.search(e["url"])]
+        if limit > 0:
+            entries = entries[-limit:]
+        if clear:
+            self.network_entries = []
+        keys = ("index", "method", "url", "status", "resource_type", "size")
+        return [{k: e[k] for k in keys} for e in entries]
 
-    async def drag(self, from_ref: str, to_ref: str) -> None:
-        self.drags.append((from_ref, to_ref))
+    async def network_request(self, index: int) -> dict[str, Any] | None:
+        for e in self.network_entries:
+            if e["index"] == index:
+                return dict(e)
+        return None
 
-    async def scroll_to(self, ref: str) -> bool:
-        self.scrolled_to.append(ref)
-        return self.scroll_to_result
-
-    async def get_options(self, ref: str) -> list[dict[str, Any]]:
-        return list(self.options)
-
-    async def get_links(self, cap: int = 200) -> list[dict[str, str]]:
-        self._reads += 1
-        return list(self.links[:cap])
-
-    async def eval_js(self, js: str) -> dict[str, Any]:
-        self.evals.append(js)
-        return dict(self.eval_result)
+    # --- login ---
 
     async def fill_login(self, username: str, password: str) -> bool:
         self.logins.append((username, password))
@@ -327,10 +463,13 @@ class FakeDriver(BrowserDriver):
     async def nav_state(self) -> dict[str, Any]:
         return {
             "url": self.opened[-1] if self.opened else "about:blank",
-            "title": "Fake",
+            "title": self.page_title,
+            "loaded": True,
             "can_go_back": False,
             "can_go_forward": False,
         }
+
+    # --- the human plane ---
 
     async def add_frame_sink(self, sink: Callable[[str, dict[str, Any]], Awaitable[None]]) -> str:
         # Mirrors the real driver's contract: the first sink starts the capture,

@@ -1,12 +1,12 @@
-"""Read the tenant's portal login credentials from the mounted creds Secret.
+"""Read the configured portal login credentials from the mounted creds Secret.
 
-The dispatcher materialises the co-browse connector's creds into the per-tenant
+The dispatcher materialises the co-browse connector's creds into the
 ``connectors-creds`` Secret, which the operator mounts into this pod at
 ``$CONNECTORS_CREDS_DIR`` (file-per-key). We read the single
 ``PORTAL_CREDENTIALS_JSON`` key — a JSON array of ``{portal_id, login_url,
 username, password}`` — and index it by ``portal_id``.
 
-Read fresh on each ``browser_login`` so a live creds refresh (the operator
+Read fresh on each ``login`` so a live creds refresh (the operator
 rewrites the Secret; the kubelet updates the mounted file) is picked up without a
 pod restart — same live-refresh contract the odoo sidecar relies on. The password
 lives ONLY here and in the driver; it never enters the agent's context.
@@ -39,7 +39,7 @@ class PortalCred:
 def _creds_path() -> Path:
     """The mounted-Secret path. REQUIRED (Tier 0.5): the dir is declared in the
     image and the operator injects it with the creds mount, so a missing value is
-    a config bug — NOT the same thing as "this tenant has no portals", which is
+    a config bug — NOT the same thing as "no portals are configured", which is
     the absent FILE at this path (read_portals returns {} for that)."""
     return Path(os.environ[_CREDS_DIR_ENV]) / _PORTAL_FILE
 

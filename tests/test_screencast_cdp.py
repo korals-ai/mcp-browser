@@ -19,11 +19,13 @@ the two latent tab-switch bugs are driven from:
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 from typing import Any
 
 from src import browser_driver, metrics
 from src.browser_driver import (
+    _DEVICE_SCALE,
     _MAX_VIEWPORT_H,
     _MAX_VIEWPORT_W,
     _MIN_FRAME_INTERVAL_S,
@@ -32,6 +34,11 @@ from src.browser_driver import (
     PlaywrightDriver,
     _Tab,
 )
+
+# A minimal PNG header (8x4) — the driver reads only the IHDR for the image size.
+_PNG_8X4_B64 = base64.b64encode(
+    b"\x89PNG\r\n\x1a\n" + b"\x00\x00\x00\rIHDR" + (8).to_bytes(4, "big") + (4).to_bytes(4, "big")
+).decode()
 
 
 def _counter(name: str) -> float:
@@ -67,6 +74,8 @@ class FakeCDP:
         self.sent.append((method, params))
         if method == "Page.screencastFrameAck":
             self.acks.append(params.get("sessionId"))
+        if method == "Page.captureScreenshot":
+            return {"data": _PNG_8X4_B64}
         return {}
 
     @property
@@ -88,7 +97,6 @@ class FakePage:
     def __init__(self) -> None:
         self.url = "about:blank"
         self.closed = False
-        self.screenshot_kwargs: dict[str, Any] | None = None
         self.viewport_sizes: list[dict[str, int]] = []
 
     async def set_viewport_size(self, size: dict[str, int]) -> None:
@@ -102,10 +110,6 @@ class FakePage:
 
     async def title(self) -> str:
         return "Fake"
-
-    async def screenshot(self, **kwargs: Any) -> bytes:
-        self.screenshot_kwargs = kwargs
-        return b"png-bytes"
 
 
 async def _noop_sink(_data: str, _meta: dict[str, Any]) -> None:
@@ -291,15 +295,23 @@ async def test_set_viewport_clamps_out_of_range_and_skips_no_op() -> None:
 
 
 async def test_agent_screenshot_stays_css_scaled() -> None:
-    """The agent's screenshot must request scale="css": the context renders at
-    2x device scale for the human screencast, and without this cap every agent
-    screenshot would carry 4x the pixels into model context — a silent
-    token-cost multiplier on every browsing step (human watching or not)."""
-    drv, _t1_cdp, _t2_cdp = _two_tab_driver()
-    await drv.screenshot()
-    page = drv._tabs[0].page
-    assert isinstance(page, FakePage)
-    assert page.screenshot_kwargs == {"type": "png", "scale": "css"}
+    """The agent's default screenshot is 1 image px per CSS px: the context
+    renders at 2x device scale for the human screencast, and without the clip
+    scale every agent screenshot would carry 4x the pixels into model context —
+    a silent token-cost multiplier on every browsing step. ``zoom``'s 2.0 is the
+    one place device pixels are wanted, and a region clips before scaling."""
+    drv, t1_cdp, _t2_cdp = _two_tab_driver()
+    w, h = drv._viewport
+    _png, meta = await drv.screenshot()
+    method, params = t1_cdp.sent[-1]
+    assert method == "Page.captureScreenshot"
+    assert params["clip"] == {"x": 0, "y": 0, "width": w, "height": h, "scale": 1 / _DEVICE_SCALE}
+    assert (meta["image_width"], meta["image_height"]) == (8, 4)  # what the fake PNG says
+    assert (meta["width"], meta["height"]) == (w, h)
+
+    await drv.screenshot(scale=2.0, region=(10, 20, 110, 70))
+    _method, params = t1_cdp.sent[-1]
+    assert params["clip"] == {"x": 10, "y": 20, "width": 100, "height": 50, "scale": 1.0}
 
 
 async def test_late_frame_is_counted_for_observability() -> None:

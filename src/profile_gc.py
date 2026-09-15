@@ -1,10 +1,10 @@
-"""Garbage-collect orphaned per-chat Chromium profiles off the tenant volume.
+"""Garbage-collect orphaned per-chat Chromium profiles off the data volume.
 
 Every co-browse chat gets its own persistent Chromium user-data-dir under
 ``BROWSER_PROFILE_DIR`` (``$HOME/.cobrowse/profile/<chat_id>``). Nothing ever
-deleted them, so a tenant that co-browsed many chats accumulates thousands of
-profile files on the EFS PVC (they sync to S3), tripping the WorkspaceTenantBloat
-/ WorkspaceSyncSlow alerts. This module reclaims a profile once its chat is gone.
+deleted them, so a workspace that co-browsed many chats accumulates thousands of
+profile files on the volume (they sync to S3), tripping the volume-bloat and
+sync-slow alerts. This module reclaims a profile once its chat is gone.
 
 Design + adversarial hazard audit:
 ``docs/plan/20260810T182738Z-cobrowse-profile-footprint.md`` (Pillar B). Deleting a
@@ -15,7 +15,7 @@ plan.
 Runs IN the browser pod (the uid that authored the profile), off two triggers:
 container boot and opportunistically at session start — no periodic timer, no
 cross-pod RPC. The keep-set ("which chats still exist") is read straight off the
-shared tenant PVC that both the workspace and browser pods mount; the workspace
+shared data volume that both the workspace and browser pods mount; the workspace
 pod is never called (its egress netpol blocks it anyway).
 """
 
@@ -120,7 +120,7 @@ def live_chat_ids(projects_root: str) -> set[str]:
                             # "<id>.meta" and delete every meta-only chat).
                             ids.add(name[: -len(".meta.json")])
     except OSError:
-        # Missing (fresh tenant) or unreadable (transient EFS) → unusable keep-set.
+        # Missing (fresh volume) or unreadable (transient EFS) → unusable keep-set.
         return set()
     return ids
 

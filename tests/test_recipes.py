@@ -1,272 +1,251 @@
-"""Recipe parsing, targeting, and the boundaries around what a recipe may do.
-
-A recipe is data that arrives on the tenant volume, so anything it can reach is
-reachable by anyone who can drop a file there. These tests pin the two rules
-that make that safe — the tool allowlist and no-secrets — plus the targeting
-rule that keeps a stale recipe from silently clicking the wrong thing.
-"""
+"""Recipes as stored batches: parsing, descriptor targets, and the runner."""
 
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 
-from src import recipes
+from src import agent_ops, recipes
+from tests.conftest import DEFAULT_TREE
+
+# --- parse ---------------------------------------------------------------------
 
 
-def _snapshot() -> list[dict[str, str]]:
-    return [
-        {"ref": "e0", "tag": "input", "type": "text", "name": "Username"},
-        {"ref": "e1", "tag": "input", "type": "password", "name": "Password"},
-        {"ref": "e2", "tag": "button", "type": "submit", "name": "Sign in"},
-        {"ref": "e3", "tag": "input", "type": "text", "name": "Search"},
-        {"ref": "e4", "tag": "a", "type": "", "name": "Next"},
-        {"ref": "e5", "tag": "a", "type": "", "name": "Next"},
-    ]
-
-
-# --- what a recipe may execute ----------------------------------------------
-
-
-def test_parse_rejects_a_tool_outside_the_allowlist() -> None:
-    # browser_eval runs arbitrary JS. A recipe file that could call it turns
-    # "drop a file in the workspace" into "run code in the tenant's browser".
-    with pytest.raises(recipes.RecipeError, match="not allowed"):
-        recipes.parse({"steps": [{"tool": "browser_eval", "args": {"js": "alert(1)"}}]})
-
-
-def test_parse_rejects_file_reaching_tools() -> None:
-    for tool in ("browser_upload_file", "browser_download"):
-        with pytest.raises(recipes.RecipeError, match="not allowed"):
-            recipes.parse({"steps": [{"tool": tool, "args": {}}]})
-
-
-async def test_every_allowlisted_tool_actually_executes() -> None:
-    # Was a grep of the executor's SOURCE for each tool name, which passes while
-    # a branch does nothing at all — 12 of 17 branches were never run. Drive each
-    # one for real and assert it reaches the driver.
-    from src import agent_ops
-    from src.snapshot import Element
-    from tests.conftest import FakeDriver, make_manager
-
-    snapshot = [
-        Element(ref="e0", tag="input", type="text", name="Search"),
-        Element(ref="e1", tag="button", type="submit", name="Go"),
-    ]
-    args_for: dict[str, dict[str, object]] = {
-        "browser_open": {"url": "https://example.test/"},
-        "browser_snapshot": {},
-        "browser_click": {"ref": "e1"},
-        "browser_type": {"ref": "e0", "text": "hello"},
-        "browser_fill_form": {"fields": [{"ref": "e0", "value": "x", "kind": "text"}]},
-        "browser_select_option": {"ref": "e0", "value": "x"},
-        "browser_press_key": {"key": "Enter"},
-        "browser_scroll": {"direction": "down", "amount": 100},
-        "browser_wait_for": {"text": "done", "timeout_ms": 10},
-        "browser_read": {},
-        "browser_get_table": {},
-        "browser_get_links": {},
-        "browser_find": {"query": "Go"},
-        "browser_login": {"portal_id": "p1"},
-        "browser_back": {},
-        "browser_forward": {},
-        "browser_reload": {},
+def test_parse_accepts_a_batch_shaped_recipe() -> None:
+    raw = {
+        "name": "search",
+        "params": ["keyword"],
+        "steps": [
+            {"name": "navigate", "input": {"url": "https://x"}},
+            {"name": "read_page", "input": {}},
+            {
+                "name": "computer",
+                "input": {"action": "type", "text": "param:keyword"},
+                "target": {"role": "searchbox"},
+            },
+            {"name": "computer", "input": {"action": "key", "text": "Return"}},
+            {"name": "get_page_text", "input": {}},
+        ],
     }
-    assert set(args_for) == set(recipes.ALLOWED_TOOLS), "update this table when the allowlist moves"
-
-    unreached = []
-    for tool, args in args_for.items():
-        driver = FakeDriver(snapshot=list(snapshot))
-        manager, _ = make_manager(driver)
-        session = await manager.get_or_create("c1")
-        before = driver.calls_made()
-        await agent_ops._run_recipe_step(
-            manager, "c1", session, tool, dict(args), {"p1": _portal()}
-        )
-        if driver.calls_made() == before:
-            unreached.append(tool)
-    assert not unreached, f"allowlisted but the branch touches no driver: {unreached}"
-
-
-def _portal():
-    from src.portal_creds import PortalCred
-
-    return PortalCred(
-        portal_id="p1", login_url="https://example.test/login", username="u", password="p"
-    )
-
-
-# --- structure a recipe must have --------------------------------------------
-
-
-def test_parse_rejects_a_stored_ref() -> None:
-    # A ref is a handle into ONE page render. Pasting a working tool call into a
-    # recipe produces exactly this, and it skips resolve_target entirely.
-    with pytest.raises(recipes.RecipeError, match="cannot store 'ref'"):
-        recipes.parse({"steps": [{"tool": "browser_click", "args": {"ref": "e12"}}]})
-
-
-def test_parse_rejects_an_unknown_target_key() -> None:
-    # 'role' and 'placeholder' are in the snapshot an author reads, so reaching
-    # for one is natural — and it used to be DROPPED, leaving a target that
-    # matched every element on the page.
-    with pytest.raises(recipes.RecipeError, match="unknown target key"):
-        recipes.parse({"steps": [{"tool": "browser_click", "target": {"role": "button"}}]})
-
-
-def test_parse_rejects_a_target_that_matches_on_nothing() -> None:
-    with pytest.raises(recipes.RecipeError, match="at least one of"):
-        recipes.parse({"steps": [{"tool": "browser_click", "target": {"nth": 0}}]})
-
-
-def test_parse_rejects_a_boolean_nth() -> None:
-    # isinstance(True, int) is True in Python, so this read as index 1 and
-    # silently picked the SECOND match.
-    with pytest.raises(recipes.RecipeError, match="non-negative integer"):
-        recipes.parse({"steps": [{"tool": "browser_click", "target": {"tag": "a", "nth": True}}]})
-
-
-def test_parse_rejects_a_negative_nth() -> None:
-    with pytest.raises(recipes.RecipeError, match="non-negative integer"):
-        recipes.parse({"steps": [{"tool": "browser_click", "target": {"tag": "a", "nth": -1}}]})
-
-
-def test_parse_rejects_a_fill_form_with_no_fields() -> None:
-    # Used to fill nothing, then click Submit, and report ok — a blank form
-    # posted to a live site.
-    with pytest.raises(recipes.RecipeError, match="non-empty 'fields'"):
-        recipes.parse({"steps": [{"tool": "browser_fill_form", "args": {}}]})
-
-
-def test_parse_rejects_fields_hidden_inside_args() -> None:
-    # The shape you get by transcribing the MCP tool's own signature. The
-    # executor overwrites args["fields"], so this silently filled nothing.
-    with pytest.raises(recipes.RecipeError, match="not inside 'args'"):
-        recipes.parse(
-            {
-                "steps": [
-                    {
-                        "tool": "browser_fill_form",
-                        "args": {"fields": [{"ref": "e0", "value": "x"}]},
-                    }
-                ]
-            }
-        )
-
-
-def test_parse_rejects_fields_on_a_tool_that_cannot_use_them() -> None:
-    with pytest.raises(recipes.RecipeError, match="only browser_fill_form"):
-        recipes.parse(
-            {"steps": [{"tool": "browser_click", "fields": [{"target": {"tag": "input"}}]}]}
-        )
-
-
-def test_parse_validates_targets_inside_fill_form_fields() -> None:
-    with pytest.raises(recipes.RecipeError, match="unknown target key"):
-        recipes.parse(
-            {
-                "steps": [
-                    {
-                        "tool": "browser_fill_form",
-                        "fields": [{"target": {"placeholder": "Name"}, "value": "x"}],
-                    }
-                ]
-            }
-        )
-
-
-def test_resolve_target_refuses_a_boolean_nth_directly() -> None:
-    # resolve_target is public and pure; parse is not its only caller.
-    with pytest.raises(recipes.RecipeError, match="non-negative integer"):
-        recipes.resolve_target(_snapshot(), {"tag": "a", "nth": True})
-
-
-def test_extraction_tools_are_a_subset_of_allowed() -> None:
-    assert recipes.EXTRACTION_TOOLS <= recipes.ALLOWED_TOOLS
-
-
-# --- structure ---------------------------------------------------------------
-
-
-def test_parse_rejects_an_empty_or_missing_step_list() -> None:
-    for bad in ({}, {"steps": []}, {"steps": "open the page"}):
-        with pytest.raises(recipes.RecipeError):
-            recipes.parse(bad)
-
-
-def test_parse_keeps_declared_params() -> None:
-    recipe = recipes.parse(
-        {"name": "search", "params": ["keyword"], "steps": [{"tool": "browser_snapshot"}]}
-    )
+    recipe = recipes.parse(raw)
     assert recipe["params"] == ["keyword"]
-    assert recipe["name"] == "search"
+    assert len(recipe["steps"]) == 5
 
 
-def test_missing_params_is_reported_before_anything_runs() -> None:
-    recipe = recipes.parse({"params": ["keyword"], "steps": [{"tool": "browser_snapshot"}]})
-    assert recipes.missing_params(recipe, {}) == ["keyword"]
-    assert recipes.missing_params(recipe, {"keyword": "CCTV"}) == []
+@pytest.mark.parametrize(
+    ("raw", "message"),
+    [
+        ([], "must be an object"),
+        ({"steps": []}, "non-empty 'steps'"),
+        ({"steps": [{"name": "javascript_tool", "input": {"text": "1"}}]}, "not allowed"),
+        ({"steps": [{"name": "file_upload", "input": {}}]}, "not allowed"),
+        (
+            {"steps": [{"name": "computer", "input": {"action": "screenshot"}}]},
+            "not allowed in a recipe",
+        ),
+        (
+            {"steps": [{"name": "computer", "input": {"action": "left_click", "ref": "e5"}}]},
+            "cannot store 'ref'",
+        ),
+        (
+            {"steps": [{"name": "read_page", "input": {}, "target": {"role": "button"}}]},
+            "takes no ref",
+        ),
+        (
+            {
+                "steps": [
+                    {"name": "form_input", "input": {"value": "x"}, "target": {"kind": "button"}}
+                ]
+            },
+            "unknown target key",
+        ),
+        (
+            {"steps": [{"name": "form_input", "input": {"value": "x"}, "target": {"nth": 0}}]},
+            "needs 'role' and/or 'name'",
+        ),
+        (
+            {
+                "steps": [
+                    {
+                        "name": "form_input",
+                        "input": {"value": "x"},
+                        "target": {"role": "textbox", "nth": True},
+                    }
+                ]
+            },
+            "non-negative integer",
+        ),
+        ({"steps": [{"tool": "navigate"}]}, "has no 'name'"),
+        ({"steps": [{"name": "navigate", "input": "x"}]}, "'input' must be an object"),
+        ({"steps": [1], "params": "k"}, "must be a list of names"),
+    ],
+)
+def test_parse_rejects(raw: Any, message: str) -> None:
+    with pytest.raises(recipes.RecipeError, match=message):
+        recipes.parse(raw)
 
 
-# --- values ------------------------------------------------------------------
+# --- params ---------------------------------------------------------------------
 
 
-def test_substitute_resolves_a_param_and_passes_literals_through() -> None:
-    assert recipes.substitute("param:keyword", {"keyword": "CCTV"}) == "CCTV"
-    assert recipes.substitute("CCTV", {}) == "CCTV"
-    assert recipes.substitute(20, {}) == 20
+def test_substitute_walks_the_input_object() -> None:
+    inp = {"text": "param:q", "nested": {"value": "param:q"}, "list": ["param:q", "lit"], "n": 1}
+    assert recipes.substitute(inp, {"q": "pumps"}) == {
+        "text": "pumps",
+        "nested": {"value": "pumps"},
+        "list": ["pumps", "lit"],
+        "n": 1,
+    }
+    with pytest.raises(recipes.RecipeError, match="parameter 'q'"):
+        recipes.substitute("param:q", {})
+    assert recipes.missing_params({"params": ["a", "b"]}, {"a": "1"}) == ["b"]
 
 
-def test_an_unsupplied_param_raises_rather_than_becoming_empty() -> None:
-    # Typing "" into a portal's search box returns EVERY row, which reads like a
-    # successful run. Failing loudly is the only safe behaviour.
-    with pytest.raises(recipes.RecipeError, match="keyword"):
-        recipes.substitute("param:keyword", {})
+# --- targets --------------------------------------------------------------------
 
 
-def test_there_is_no_credential_value_source() -> None:
-    # Recipes must never be able to hold or fetch a secret; logging in goes
-    # through browser_login, which injects the password server-side. A
-    # `credential:` string is therefore an inert literal, not a lookup.
-    assert recipes.substitute("credential:portal.password", {}) == "credential:portal.password"
-    assert recipes._PARAM_PREFIX == "param:"
-    # `param:` is the ONLY dynamic source there is.
-    assert not [n for n in dir(recipes) if n.endswith("_PREFIX") and n != "_PARAM_PREFIX"]
+def test_resolve_target_by_role_and_name() -> None:
+    assert recipes.resolve_target(DEFAULT_TREE, {"role": "button", "name": "Sign in"}) == "e4"
+    assert recipes.resolve_target(DEFAULT_TREE, {"name": "Search products"}) == "e2"
+    assert recipes.resolve_target(DEFAULT_TREE, {"role": "searchbox"}) == "e2"
 
 
-# --- targeting ---------------------------------------------------------------
-
-
-def test_resolve_target_finds_the_current_ref() -> None:
-    assert (
-        recipes.resolve_target(_snapshot(), {"tag": "input", "type": "text", "name": "Username"})
-        == "e0"
-    )
-    assert (
-        recipes.resolve_target(_snapshot(), {"tag": "button", "type": "submit", "name": "Sign in"})
-        == "e2"
-    )
-
-
-def test_resolve_target_raises_when_nothing_matches() -> None:
-    # The page changed. That must surface, not fall back to something else.
-    with pytest.raises(recipes.RecipeError, match="no element matches"):
-        recipes.resolve_target(_snapshot(), {"tag": "button", "name": "Log in"})
-
-
-def test_ambiguity_raises_unless_the_recipe_disambiguates() -> None:
-    two = {"tag": "a", "name": "Next"}
-    with pytest.raises(recipes.RecipeError, match="add 'nth'"):
-        recipes.resolve_target(_snapshot(), two)
-    assert recipes.resolve_target(_snapshot(), {**two, "nth": 0}) == "e4"
-    assert recipes.resolve_target(_snapshot(), {**two, "nth": 1}) == "e5"
-
-
-def test_out_of_range_nth_raises() -> None:
+def test_resolve_target_refuses_ambiguity_unless_nth_says_which() -> None:
+    tree = '- button "Add" [ref=e1]\n- button "Add" [ref=e2]\n'
+    with pytest.raises(recipes.RecipeError, match="2 elements match"):
+        recipes.resolve_target(tree, {"role": "button", "name": "Add"})
+    assert recipes.resolve_target(tree, {"role": "button", "name": "Add", "nth": 1}) == "e2"
     with pytest.raises(recipes.RecipeError, match="out of range"):
-        recipes.resolve_target(_snapshot(), {"tag": "a", "name": "Next", "nth": 9})
+        recipes.resolve_target(tree, {"role": "button", "name": "Add", "nth": 5})
 
 
-def test_a_partial_descriptor_still_matches() -> None:
-    # Recipes should not have to spell out every attribute; name alone is a
-    # legitimate descriptor when it is unique.
-    assert recipes.resolve_target(_snapshot(), {"name": "Search"}) == "e3"
+def test_resolve_target_names_what_it_looked_for_on_a_miss() -> None:
+    with pytest.raises(recipes.RecipeError, match="no element matches"):
+        recipes.resolve_target(DEFAULT_TREE, {"role": "button", "name": "Buy"})
+
+
+# --- the runner -------------------------------------------------------------------
+
+
+def _dispatch(calls: list[tuple[str, dict[str, Any]]], **overrides: Any) -> dict[str, Any]:
+    """A fake tool table: records every call, answers like the real tools do."""
+
+    def handler_for(name: str) -> Any:
+        async def h(**kw: Any) -> Any:
+            calls.append((name, kw))
+            if name in overrides:
+                return overrides[name]
+            if name == "read_page":
+                return DEFAULT_TREE
+            if name == "navigate":
+                return {"page_state": "ok", "url": kw.get("url")}
+            if name == "wait_for":
+                return {"ready": True}
+            if name == "login":
+                return {"status": "submitted"}
+            return "ok"
+
+        return h
+
+    return {n: handler_for(n) for n in recipes.ALLOWED_TOOLS}
+
+
+async def test_runner_resolves_targets_against_its_own_read_page() -> None:
+    calls: list[tuple[str, dict[str, Any]]] = []
+    recipe = recipes.parse(
+        {
+            "params": ["q"],
+            "steps": [
+                {"name": "navigate", "input": {"url": "https://x"}},
+                {"name": "read_page", "input": {}},
+                {
+                    "name": "computer",
+                    "input": {"action": "type", "text": "param:q"},
+                    "target": {"role": "searchbox"},
+                },
+                {"name": "get_page_text", "input": {}},
+            ],
+        }
+    )
+    out = await agent_ops.run_recipe(recipe, {"q": "pumps"}, tab_id=3, dispatch=_dispatch(calls))
+    assert out["status"] == "ok" and out["steps_run"] == 4
+    typed = next(kw for name, kw in calls if name == "computer")
+    assert typed == {"action": "type", "text": "pumps", "tabId": 3, "ref": "e2"}
+    assert all(kw["tabId"] == 3 for _, kw in calls)
+    assert [e["tool"] for e in out["extracted"]] == ["read_page", "get_page_text"]
+
+
+async def test_runner_refuses_a_target_before_any_read_page() -> None:
+    calls: list[tuple[str, dict[str, Any]]] = []
+    recipe = recipes.parse(
+        {
+            "steps": [
+                {"name": "form_input", "input": {"value": "x"}, "target": {"role": "searchbox"}}
+            ]
+        }
+    )
+    out = await agent_ops.run_recipe(recipe, {}, tab_id=1, dispatch=_dispatch(calls))
+    assert out["status"] == "step_failed" and out["failed_at"] == 0
+    assert "no read_page step" in out["reason"]
+    assert calls == []
+
+
+async def test_runner_stops_at_a_stale_descriptor_with_the_step_index() -> None:
+    calls: list[tuple[str, dict[str, Any]]] = []
+    recipe = recipes.parse(
+        {
+            "steps": [
+                {"name": "read_page", "input": {}},
+                {
+                    "name": "computer",
+                    "input": {"action": "left_click"},
+                    "target": {"role": "button", "name": "Buy"},
+                },
+                {"name": "get_page_text", "input": {}},
+            ]
+        }
+    )
+    out = await agent_ops.run_recipe(recipe, {}, tab_id=1, dispatch=_dispatch(calls))
+    assert out["status"] == "step_failed"
+    assert out["failed_at"] == 1 and out["tool"] == "computer"
+    assert "no element matches" in out["reason"]
+    assert out["steps_run"] == 1
+    assert [n for n, _ in calls] == ["read_page"]  # never reached the third step
+
+
+@pytest.mark.parametrize(
+    ("name", "output", "reason"),
+    [
+        ("wait_for", {"ready": False}, "did not"),
+        ("login", {"status": "no_login_form"}, "login did not complete: no_login_form"),
+        ("navigate", {"page_state": "blocked_challenge"}, "landed on a wall"),
+    ],
+)
+async def test_runner_treats_a_reported_failure_as_a_failed_step(
+    name: str, output: Any, reason: str
+) -> None:
+    calls: list[tuple[str, dict[str, Any]]] = []
+    recipe = recipes.parse(
+        {
+            "steps": [
+                {"name": name, "input": {"url": "https://x", "portal_id": "p"}},
+                {"name": "get_page_text", "input": {}},
+            ]
+        }
+    )
+    out = await agent_ops.run_recipe(
+        recipe, {}, tab_id=1, dispatch=_dispatch(calls, **{name: output})
+    )
+    assert out["status"] == "step_failed" and out["failed_at"] == 0
+    assert reason in out["reason"]
+
+
+async def test_runner_reports_missing_params_before_touching_the_site() -> None:
+    calls: list[tuple[str, dict[str, Any]]] = []
+    recipe = recipes.parse(
+        {"params": ["q"], "steps": [{"name": "navigate", "input": {"url": "https://x"}}]}
+    )
+    out = await agent_ops.run_recipe(recipe, {}, tab_id=1, dispatch=_dispatch(calls))
+    assert out == {"status": "missing_params", "missing": ["q"], "steps_run": 0}
+    assert calls == []

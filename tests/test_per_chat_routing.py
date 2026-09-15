@@ -116,28 +116,26 @@ def test_cache_dir_refuses_path_traversal(monkeypatch: Any) -> None:
     assert server._cache_dir_for(".") == "/chromium-cache/shared"
 
 
-# --- tenant volume root: derive from the PVC anchor, NOT $HOME --------------------
+# --- data root: derive from the volume anchor, NOT $HOME --------------------
 
 
-def test_tenant_volume_root_derives_from_the_pvc_anchor_not_home(monkeypatch: Any) -> None:
+def test_data_root_derives_from_the_volume_anchor_not_home(monkeypatch: Any) -> None:
     # The browser container runs as user "tool" with HOME=/home/tool, but the
-    # operator mounts the tenant PVC at /home/agent and anchors BROWSER_PROFILE_DIR
+    # operator mounts the data volume at /home/agent and anchors BROWSER_PROFILE_DIR
     # there. Deriving the volume root from $HOME made PROJECTS_ROOT
     # /home/tool/.claude/projects (nonexistent) → the GC read an empty keep-set and
     # fail-closed forever on prod. It MUST come from the profile-dir anchor.
     monkeypatch.setenv("HOME", "/home/tool")
     monkeypatch.setattr(server, "PROFILE_DIR", "/home/agent/.cobrowse/profile")
-    assert server._tenant_volume_root() == "/home/agent"
+    assert server._data_root() == "/home/agent"
     # trailing slash tolerated
     monkeypatch.setattr(server, "PROFILE_DIR", "/home/agent/.cobrowse/profile/")
-    assert server._tenant_volume_root() == "/home/agent"
+    assert server._data_root() == "/home/agent"
 
 
-def test_tenant_volume_root_falls_back_to_home_without_a_volume(
-    monkeypatch: Any, tmp_path: Any
-) -> None:
+def test_data_root_falls_back_to_home_without_a_volume(monkeypatch: Any, tmp_path: Any) -> None:
     # No volume mounted (CI/local): $HOME and the mount coincide (realpath'd, so a
     # real dir avoids macOS /var→/private/var surprises).
     monkeypatch.setattr(server, "PROFILE_DIR", None)
     monkeypatch.setenv("HOME", str(tmp_path))
-    assert server._tenant_volume_root() == os.path.realpath(str(tmp_path))
+    assert server._data_root() == os.path.realpath(str(tmp_path))

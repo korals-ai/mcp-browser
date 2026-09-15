@@ -61,6 +61,9 @@ export BROWSER_VIEWER_DIR=""
 export BROWSER_HEADLESS=true
 export BROWSER_EXECUTABLE_PATH=""
 export CONNECTORS_CREDS_DIR=/var/run/connectors-creds
+export BROWSER_FIND_INFERENCE_URL=""
+export BROWSER_FIND_INFERENCE_KEY=""
+export BROWSER_FIND_MODEL=claude-haiku-4-5-20251001
 
 log "1/6 Format check (ruff format)..."
 "$RUFF" format --check src tests || fail "ruff format (run: ruff format src tests)"

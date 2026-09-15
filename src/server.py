@@ -14,6 +14,13 @@ is rejected, never merged into one ``shared`` profile — that would leak one
 chat's cookies/logins into another. The viewer plane keeps
 :data:`SHARED_SESSION` only as the dir builders' path-traversal safe-landing.
 See docs/plan/20260728T111318Z-cobrowse-per-chat-isolation.md.
+
+The agent surface is the Claude-in-Chrome extension's, verbatim — the same
+tool names, argument names and semantics (``computer``, ``read_page``,
+``find``, ``browser_batch``, …) plus a few sandbox-only extras (``login``,
+``wait_for``, ``download``, frames, dialogs, ``run_recipe``) documented as
+"not in the extension" — so a browser skill written against Anthropic's own
+surface runs here unchanged. docs/plan/20260914-cobrowse-extension-parity.md.
 """
 
 from __future__ import annotations
@@ -25,6 +32,7 @@ import logging
 import os
 import re
 import time
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 import loopwatch
@@ -34,8 +42,10 @@ from mcp.server.fastmcp.exceptions import ToolError
 from mcp.server.lowlevel.server import request_ctx
 
 from src import agent_ops, browser_driver, metrics, profile_gc, recipes
-from src.browser_driver import BrowserDriver, PlaywrightDriver
+from src.agent_ops import AgentPaused, ToolInputError
+from src.browser_driver import BrowserDriver, PlaywrightDriver, StaleRefError, UnknownTabError
 from src.cobrowse_ws import CoBrowseConnection
+from src.find_model import FindConfig
 from src.portal_creds import read_portals
 from src.sessions import SessionManager
 
@@ -47,38 +57,51 @@ log = logging.getLogger("workspace-tool-browser")
 # A missing value CrashLoops instead of silently binding a guessed port.
 HOST = os.environ["WORKSPACE_TOOL_HOST"]
 PORT = int(os.environ["WORKSPACE_TOOL_PORT"])
-# When the tenant volume is mounted, the operator points this at a dir on it so
-# Chromium's profile (cookies/logins) survives a pod restart. Unset → ephemeral.
+# When the data volume is mounted, the host points this at a dir on it so
+# Chromium's profile (cookies/logins) survives a restart. Unset → ephemeral.
 PROFILE_DIR = os.environ.get("BROWSER_PROFILE_DIR") or None
-# The operator points this at a node-disk emptyDir (NOT the PVC) so Chrome's
-# regenerable disk cache never syncs to S3. Unset → cache stays under the profile
-# (CI/local). DISK_CACHE_SIZE (bytes) caps Chrome's own writes. See the driver's
-# _cache_launch_args + docs/plan/20260810T182738Z-cobrowse-profile-footprint.md.
+# The host points this at a node-disk emptyDir (NOT the durable volume) so
+# Chrome's regenerable disk cache never syncs anywhere. Unset → cache stays
+# under the profile (CI/local). DISK_CACHE_SIZE (bytes) caps Chrome's own
+# writes. See the driver's _cache_launch_args.
 CACHE_DIR = os.environ.get("BROWSER_CACHE_DIR") or None
 DISK_CACHE_SIZE = os.environ.get("BROWSER_DISK_CACHE_SIZE") or None
+# The model tier of `find` (src/find_model.py): an Anthropic-compatible
+# endpoint + key. REQUIRED, with an explicit EMPTY url as the declared sentinel
+# for "literal tier only" — absence is not a mode.
+FIND_CONFIG = FindConfig(
+    url=os.environ["BROWSER_FIND_INFERENCE_URL"].strip(),
+    key=os.environ["BROWSER_FIND_INFERENCE_KEY"].strip(),
+    model=os.environ["BROWSER_FIND_MODEL"].strip(),
+)
 
 
-def _tenant_volume_root() -> str:
-    """The tenant PVC mount root — NOT the container's ``$HOME`` (the image
-    runs as ``tool`` with ``HOME=/home/tool``; the volume mounts at
-    ``/home/agent``). Derive from the ``BROWSER_PROFILE_DIR`` anchor; fall
-    back to ``$HOME`` only with no volume (CI/local, where they coincide).
-    Deriving from ``$HOME`` once pointed the file-ops guard AND the profile
-    GC at ``/home/tool`` — the GC fail-closed forever
+def _data_root() -> str:
+    """The data volume's mount root — NOT the container's ``$HOME`` (the image
+    runs as ``tool`` with ``HOME=/home/tool``; the volume mounts elsewhere).
+    Derived from the ``BROWSER_PROFILE_DIR`` anchor; falls back to ``$HOME``
+    only with no volume (CI/local, where they coincide). Deriving from
+    ``$HOME`` once pointed the file-ops guard AND the profile GC at
+    ``/home/tool`` — the GC fail-closed forever
     (docs/incidents/2026-08-11-cobrowse-gc-projects-root-home.md)."""
     if PROFILE_DIR:  # <mount>/.cobrowse/profile → <mount>
         return os.path.dirname(os.path.dirname(PROFILE_DIR.rstrip("/")))
     return os.path.realpath(os.environ["HOME"])
 
 
-# The tenant volume mount — browser_upload_file only accepts files under it, so
-# the agent can't attach arbitrary pod paths (e.g. /etc/…) to a web form.
-_AGENT_HOME = _tenant_volume_root()
+# The data volume mount — file_upload / download / run_recipe / save_to_disk
+# only touch files under it, so the agent can't attach arbitrary pod paths
+# (e.g. /etc/…) to a web form or write outside the volume.
+_DATA_ROOT = _data_root()
 
-# The SDK's chat-transcript root on the shared PVC. The profile GC reads chat
+# The SDK's chat-transcript root on the shared volume. The profile GC reads chat
 # existence straight off here (both pods mount this volume) to decide which
 # per-chat profiles are orphaned — no call to the workspace pod. See profile_gc.
-PROJECTS_ROOT = os.path.join(_AGENT_HOME, ".claude", "projects")
+PROJECTS_ROOT = os.path.join(_DATA_ROOT, ".claude", "projects")
+
+# Where captured network bodies and saved screenshots land when they are too
+# big for the context or the caller asked for a file.
+_ARTIFACT_DIR = os.path.join(_DATA_ROOT, ".cobrowse", "artifacts")
 
 # Path-traversal safe-landing id. The agent plane REJECTS chat_id-less calls
 # (Pillar C, see _session_id); this remains the viewer plane's default and
@@ -100,6 +123,9 @@ _MAX_SESSIONS = int(os.environ["BROWSER_MAX_SESSIONS"])
 # (Dockerfile ENV): an explicit empty value disables the root mount — absence is
 # not a mode, because "no viewer" and "viewer path forgotten" must not look alike.
 VIEWER_DIR = os.environ["BROWSER_VIEWER_DIR"]
+
+# file_upload: total bytes across the paths of one call (the extension's cap).
+_UPLOAD_CAP = 10 * 1024 * 1024
 
 # The id arrives from a URL the agent's MCP client sends, and is used
 # verbatim as a profile-dir NAME — a hostile ``../../etc`` could escape
@@ -236,222 +262,564 @@ mcp = FastMCP("browser", host=HOST, port=PORT, lifespan=loopwatch.lifespan)
 loopwatch.serve_health(mcp)
 
 
-@mcp.tool()
-async def browser_open(url: str, new_tab: bool = False, reason: str = "") -> dict[str, Any]:
-    """Open a URL in the shared co-browsing browser.
+# --- error mapping: domain errors become tool errors the model can act on ------
 
-    The browser runs server-side; the user watches it live in the viewer and can
-    take over at any time. Use this to start working a web page — a public form,
-    a portal, a vendor site — then read it with ``browser_snapshot``.
+_DOMAIN_ERRORS = (AgentPaused, UnknownTabError, StaleRefError, ToolInputError, recipes.RecipeError)
+
+
+async def _run(coro: Awaitable[Any]) -> Any:
+    """Await an agent op; a domain error becomes a ToolError (an error result
+    with its message, not a crash), so the model reads the corrective call."""
+    try:
+        return await coro
+    except _DOMAIN_ERRORS as exc:
+        raise ToolError(str(exc)) from exc
+
+
+def _resolve_data_path(path: str) -> str | None:
+    """Resolve ``path`` under the data volume, or None if it escapes it — so the
+    agent can't read/write arbitrary pod paths (``/etc/…``) via upload/download."""
+    base = path if os.path.isabs(path) else os.path.join(_DATA_ROOT, path)
+    resolved = os.path.realpath(base)
+    if resolved != _DATA_ROOT and not resolved.startswith(_DATA_ROOT + os.sep):
+        return None
+    return resolved
+
+
+def _read_text(path: str) -> str:
+    with open(path, encoding="utf-8") as fh:
+        return fh.read()
+
+
+def _ensure_parent(dest: str) -> None:
+    os.makedirs(os.path.dirname(dest) or _DATA_ROOT, exist_ok=True)
+
+
+def _write_bytes(dest: str, data: bytes) -> None:
+    _ensure_parent(dest)
+    with open(dest, "wb") as f:
+        f.write(data)
+
+
+def _write_text(dest: str, text: str) -> None:
+    _ensure_parent(dest)
+    with open(dest, "w", encoding="utf-8") as f:
+        f.write(text)
+
+
+def _artifact_path(kind: str, ext: str) -> str:
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    return os.path.join(
+        _ARTIFACT_DIR, f"{kind}-{stamp}-{os.getpid()}-{int(time.monotonic() * 1000) % 100000}.{ext}"
+    )
+
+
+def _image_result(out: dict[str, Any]) -> Any:
+    """A `computer` result: text, plus the PNG as an image block when there is one."""
+    png = out.get("png")
+    if png is None:
+        return out["text"]
+    return [out["text"], Image(data=png, format="png")]
+
+
+# --- tabs ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+async def tabs_context_mcp(createIfEmpty: bool = False) -> dict[str, Any]:
+    """List the browser's open tabs: ``{tabs: [{tabId, url, title, active, loaded}]}``.
+
+    Every other tool names its tab by ``tabId`` — call this first in a chat to
+    learn them. The browser runs server-side; the user watches it live in their
+    viewer and can take over at any time. ``loaded`` is False for a tab restored
+    from a previous session that has not been opened yet (its URL is real, the
+    page loads when you first act on it). ``createIfEmpty`` is accepted for
+    compatibility: a session always has at least one tab.
+    """
+    return await _run(agent_ops.tabs_context(manager, _session_id()))
+
+
+@mcp.tool()
+async def tabs_create_mcp() -> dict[str, Any]:
+    """Open a new blank tab and make it active; returns ``{tabId, url}``. Close it
+    with ``tabs_close_mcp`` when done — every open tab is a live page holding
+    memory, and the human inherits whatever you leave behind.
+    """
+    return await _run(agent_ops.tabs_create(manager, _session_id()))
+
+
+@mcp.tool()
+async def tabs_close_mcp(tabId: int) -> dict[str, Any]:
+    """Close tab ``tabId``. The browser never drops to zero tabs."""
+    return await _run(agent_ops.tabs_close(manager, _session_id(), tabId))
+
+
+# --- navigation ------------------------------------------------------------------------
+
+
+@mcp.tool()
+async def navigate(url: str, tabId: int, reason: str = "") -> dict[str, Any]:
+    """Navigate tab ``tabId`` to ``url`` (``"back"`` / ``"forward"`` walk history).
 
     **Not your default way to reach the web.** This spins up a real browser the
     user watches live — heavier and slower than it needs to be for anything that
-    doesn't require interactive, multi-step work (forms, logins, portals) or live
-    human collaboration. Before reaching for it:
-    - For "look something up" / "read this page" / "search for X", prefer your
-      WebSearch/WebFetch tools — they're cheaper and faster, and this browser adds
-      nothing for a plain read.
-    - If a purpose-built tool exists for the data you need (a connector, an MCP
-      data/API tool), prefer it over browsing the raw site — it's more reliable
-      and won't hit this browser's network limits.
-    - This browser cannot reach every site — it runs from the platform's own
-      infrastructure, and some sites block or are unreachable from that
-      network/region (e.g. some countries' financial data sites). A page that
-      hangs at a blank/loading state is often this, not a slow network — don't
-      retry indefinitely; say so and suggest an alternative instead.
+    doesn't require interactive, multi-step work (forms, logins, portals). Before
+    reaching for it: for "look something up" / "read this page" prefer
+    WebSearch/WebFetch; if a purpose-built tool exists for the data (a connector,
+    an API tool) prefer it. This browser cannot reach every site — it runs from
+    the platform's own network, and some sites block or are unreachable from it;
+    a page that hangs blank is often this, not a slow network — say so instead
+    of retrying.
 
-    **The FIRST call each chat is refused unless you've already tried
-    WebSearch/WebFetch, or you pass ``reason``.** If you already know this page
-    needs a login, a form, or a multi-step session — so WebSearch/WebFetch
-    couldn't do it anyway — say so in ``reason`` and it proceeds immediately, no
-    wasted round trip. Leave ``reason`` empty only when you're not yet sure this
-    needs a live browser.
+    **The FIRST call each chat is refused unless it carries ``reason``** — one
+    short phrase on why this can't be WebSearch/WebFetch (a login, a form, a
+    multi-step portal, "the user asked for the browser"). Ignored after that.
+
+    Returns ``{tabId, url, title, loaded, page_state, changes}``. A ``page_state``
+    other than ``"ok"`` means the site served a WALL, not content:
+    ``blocked_challenge`` (anti-bot/CAPTCHA), ``blocked_denied`` (401/403),
+    ``rate_limited`` (429), ``server_error``, or ``unknown``. Retrying a blocked
+    page will not change it — tell the user and suggest they take over in the
+    live view, or use another source.
+    """
+    return await _run(agent_ops.navigate(manager, _session_id(), url, tabId))
+
+
+# --- reading the page ------------------------------------------------------------------
+
+
+@mcp.tool()
+async def read_page(
+    tabId: int,
+    filter: str = "interactive",
+    depth: int | None = None,
+    max_chars: int = agent_ops.READ_PAGE_MAX_CHARS,
+    ref_id: str | None = None,
+    boxes: bool = False,
+) -> str:
+    """Read tab ``tabId`` as its accessibility tree: one line per node,
+    ``- role "name" [ref=e12]``, indented by nesting.
+
+    The ``ref`` is what you pass to ``computer`` (click/type/hover/scroll_to),
+    ``form_input``, ``file_upload`` and ``download``. Refs are stable while the
+    page stays the same document — re-reading, typing and scrolling keep them —
+    and die with a navigation, when a tool tells you the ref is from a previous
+    page: read again. Password values are never shown.
 
     Args:
-        url: Absolute URL to navigate to.
-        new_tab: Open in a NEW tab (and make it active) instead of navigating the
-            current one. Use this to keep a page open while working another.
-            Close it with ``browser_close_tab`` once you have what you need —
-            every open tab is a live page holding memory, and the human inherits
-            whatever you leave behind when they open the co-browse view.
-        reason: One short phrase on why this can't be a WebSearch/WebFetch
-            instead (e.g. "tender portal, needs login"). Only checked on a
-            chat's first browser_open; ignored after that.
-
-    Returns:
-        Navigation state ``{url, title, loaded, page_state, can_go_back,
-        can_go_forward}``. A ``page_state`` other than ``"ok"`` means the site
-        served a WALL, not content: ``blocked_challenge`` (anti-bot/CAPTCHA),
-        ``blocked_denied`` (401/403), ``rate_limited`` (429), ``server_error``,
-        or ``unknown`` (couldn't classify). Retrying a blocked page will not
-        change it — tell the user the site blocks automated access and suggest
-        they take over via the co-browse view, or use another source.
+        tabId: The tab to read.
+        filter: ``"interactive"`` (default) — only nodes with a ref, the things you
+            can act on; ``"all"`` — the whole tree including text, for reading.
+        depth: Limit nesting depth (a cheap overview of a huge page).
+        max_chars: Cap on the reply (default 50000); cut at a line boundary with
+            the full size stated.
+        ref_id: Read only the subtree under this ref (from an earlier read).
+        boxes: Add ``[box=x,y,w,h]`` coordinates to each node, for coordinate clicks
+            or a ``zoom`` region — without a screenshot.
     """
-    return await agent_ops.open_url(manager, _session_id(), url, new_tab=new_tab)
+    if filter not in ("interactive", "all"):
+        raise ToolError('filter must be "interactive" or "all"')
+    return await _run(
+        agent_ops.read_page(
+            manager,
+            _session_id(),
+            tabId,
+            filter=filter,
+            depth=depth,
+            max_chars=int(max_chars),
+            ref_id=ref_id,
+            boxes=boxes,
+        )
+    )
 
 
 @mcp.tool()
-async def browser_list_tabs() -> list[dict[str, Any]]:
-    """List the open browser tabs as ``[{id, title, url, active, loaded}]``.
-
-    Use the ``id`` with ``browser_switch_tab`` / ``browser_close_tab``. Snapshot,
-    click, and type always act on the ACTIVE tab.
-
-    ``loaded`` is False for a tab restored from a previous session that has not
-    been opened yet: the URL is real, the page is not fetched until you switch
-    to it. Close the ones you don't need rather than switching through them.
+async def get_page_text(tabId: int) -> str:
+    """The readable text of tab ``tabId`` — the main content (article/main first),
+    with a ``Title / URL / Source element`` header. Use it to actually READ what a
+    page says; ``read_page`` is for what you can click. Capped at 50000 chars at a
+    line boundary, the full size stated when cut.
     """
-    return await agent_ops.list_tabs(manager, _session_id())
+    return await _run(agent_ops.get_page_text(manager, _session_id(), tabId))
 
 
 @mcp.tool()
-async def browser_switch_tab(tab_id: str) -> dict[str, Any]:
-    """Switch to an open tab (from ``browser_list_tabs``), making it active.
+async def find(tabId: int, query: str) -> str:
+    """Find elements on tab ``tabId`` by description — "the search box in the
+    header", "add to cart", "the price".
 
-    Args:
-        tab_id: The tab's id.
+    A literal/regex match over the page's tree runs first (free); on a miss a small
+    model reads the tree and names the refs, each with a one-line reason. Up to
+    20 hits as ``ref: role "name"`` lines, tagged ``source: literal`` or
+    ``source: model``; the refs are ready to use with ``computer``. Cheaper than
+    reading a large page yourself.
     """
-    return await agent_ops.switch_tab(manager, _session_id(), tab_id)
+    return await _run(agent_ops.find(manager, _session_id(), tabId, query, config=FIND_CONFIG))
+
+
+# --- acting on the page --------------------------------------------------------------------
 
 
 @mcp.tool()
-async def browser_close_tab(tab_id: str) -> dict[str, Any]:
-    """Close an open tab (from ``browser_list_tabs``).
+async def computer(
+    action: str,
+    tabId: int,
+    coordinate: list[int] | None = None,
+    ref: str | None = None,
+    text: str | None = None,
+    scale: float | None = None,
+    region: list[int] | None = None,
+    scroll_direction: str | None = None,
+    scroll_amount: int | None = None,
+    modifiers: list[str] | None = None,
+    repeat: int | None = None,
+    duration: float | None = None,
+    start_coordinate: list[int] | None = None,
+    save_to_disk: bool = False,
+) -> Any:
+    """Act on tab ``tabId`` — every pointer and keyboard action in one tool.
 
-    Args:
-        tab_id: The tab's id.
+    Actions: ``left_click`` / ``right_click`` / ``double_click`` / ``triple_click``
+    (by ``ref`` from read_page/find, or by ``coordinate`` [x, y] in page CSS px;
+    ``modifiers`` like ["ctrl"]), ``type`` (``text`` typed as keystrokes into the
+    focused element, or into ``ref`` — for form fields prefer ``form_input``),
+    ``key`` (``text`` is a key or combo: "Return", "ctrl+a", "shift+Tab";
+    ``repeat``), ``scroll`` (``scroll_direction`` up/down/left/right,
+    ``scroll_amount`` in ~100 px clicks, default 5; at ``coordinate`` or ``ref``),
+    ``scroll_to`` (bring ``ref`` into view), ``hover`` (``ref`` or ``coordinate``),
+    ``left_click_drag`` (``start_coordinate`` → ``coordinate``), ``wait``
+    (``duration`` seconds, max 10), ``screenshot`` (the page as an image;
+    ``scale`` 0.1-2 shrinks/enlarges, ``region`` [x0, y0, x1, y1] crops; the reply
+    states the image-to-page coordinate mapping) and ``zoom`` (``region``
+    required, at 2x detail by default). ``save_to_disk`` also writes a
+    screenshot/zoom to the workspace and returns the path.
+
+    Clicks, typing, keys, drags, hover, scroll and scroll_to act on the page and
+    are approved by the user in chat before they run; screenshot, zoom and wait are
+    not. A mutating action replies with what it did plus ONLY what changed — a
+    navigation, a new tab, a dialog — never the page: chain it with ``read_page``
+    in one ``browser_batch`` when you want the page back.
     """
-    return await agent_ops.close_tab(manager, _session_id(), tab_id)
+    out = await _run(
+        agent_ops.computer(
+            manager,
+            _session_id(),
+            tabId,
+            action,
+            coordinate=coordinate,
+            ref=ref,
+            text=text,
+            scale=scale,
+            region=region,
+            scroll_direction=scroll_direction,
+            scroll_amount=scroll_amount,
+            modifiers=modifiers,
+            repeat=repeat,
+            duration=duration,
+            start_coordinate=start_coordinate,
+        )
+    )
+    if save_to_disk and out.get("png") is not None:
+        dest = _artifact_path("screenshot", "png")
+        await asyncio.to_thread(_write_bytes, dest, out["png"])
+        out["text"] = f"{out['text']}\nSaved to {dest}"
+    return _image_result(out)
 
 
 @mcp.tool()
-async def browser_snapshot() -> list[dict[str, Any]]:
-    """Read the current page as a list of interactable elements.
-
-    Each element has a ``ref`` you pass to ``browser_click`` / ``browser_type``,
-    plus its tag/type/name/value. Password field values are ALWAYS redacted —
-    you will never receive a secret you (or the user) typed.
+async def form_input(tabId: int, ref: str, value: str | bool | float) -> str:
+    """Set a form field's value on tab ``tabId``: fill a text field (replacing its
+    content), choose a ``<select>`` option by label or value, or check/uncheck a
+    box with a boolean. Prefer this over ``computer`` ``type`` for forms. Approved
+    in chat. The reply notes when the page reformatted or restricted the value,
+    or the field is an autocomplete (read_page and click the suggestion instead
+    of pressing Enter).
     """
-    return await agent_ops.snapshot(manager, _session_id())
+    return await _run(agent_ops.form_input(manager, _session_id(), tabId, ref, value))
 
 
 @mcp.tool()
-async def browser_login(portal_id: str, ref: str = "") -> dict[str, Any]:
-    """Log in to a portal the user has configured for this workspace.
+async def javascript_tool(tabId: int, text: str, action: str = "javascript_exec") -> dict[str, Any]:
+    """Run JavaScript ``text`` in tab ``tabId`` and return ``{result}`` (stringified,
+    a returned Promise awaited) or ``{error}``. Use it when the structured tools
+    can't answer (a computed value, a count, text a read misses). It runs IN the
+    page with the page's privileges, so the user approves it in chat.
+    """
+    if action != "javascript_exec":
+        raise ToolError('action must be "javascript_exec"')
+    return await _run(agent_ops.javascript(manager, _session_id(), tabId, text))
+
+
+@mcp.tool()
+async def file_upload(tabId: int, ref: str, paths: list[str]) -> dict[str, Any]:
+    """Attach workspace files to the file ``<input>`` at ``ref`` on tab ``tabId`` —
+    e.g. a document for a tender. Paths are under the workspace only, 10 MB in
+    total. Approved in chat.
+    """
+    resolved: list[str] = []
+    total = 0
+    for path in paths:
+        dest = _resolve_data_path(path)
+        if dest is None:
+            return {"status": "path_not_allowed", "path": path}
+        if not await asyncio.to_thread(os.path.isfile, dest):
+            return {"status": "not_found", "path": path}
+        total += await asyncio.to_thread(os.path.getsize, dest)
+        resolved.append(dest)
+    if not resolved:
+        raise ToolError("file_upload needs at least one path")
+    if total > _UPLOAD_CAP:
+        return {"status": "too_large", "bytes": total, "limit": _UPLOAD_CAP}
+    return await _run(agent_ops.upload(manager, _session_id(), tabId, ref, resolved))
+
+
+@mcp.tool()
+async def resize_window(tabId: int, width: int, height: int) -> dict[str, Any]:
+    """Resize the browser viewport (CSS px) — e.g. wider for a table, narrower to
+    see a mobile layout. Applies to every tab.
+    """
+    return await _run(agent_ops.resize(manager, _session_id(), tabId, width, height))
+
+
+# --- observability ----------------------------------------------------------------------------
+
+
+@mcp.tool()
+async def read_console_messages(
+    tabId: int,
+    pattern: str | None = None,
+    onlyErrors: bool = False,
+    limit: int = 100,
+    clear: bool = False,
+) -> list[dict[str, Any]]:
+    """Recent console messages of tab ``tabId`` as ``[{type, text}]`` (uncaught
+    errors included as type "error"). Diagnose an action that seemed to do
+    nothing — a validation error or exception usually logs here. ``pattern`` is a
+    regex filter; ``onlyErrors`` keeps errors/warnings; ``clear`` empties the
+    buffer after reading.
+    """
+    return await _run(
+        agent_ops.console_messages(
+            manager,
+            _session_id(),
+            tabId,
+            pattern=pattern,
+            only_errors=onlyErrors,
+            limit=int(limit),
+            clear=clear,
+        )
+    )
+
+
+@mcp.tool()
+async def read_network_requests(
+    tabId: int,
+    urlPattern: str | None = None,
+    limit: int = 100,
+    clear: bool = False,
+) -> list[dict[str, Any]]:
+    """Recent network requests of tab ``tabId`` as ``[{index, method, url, status,
+    resource_type, size}]`` — no headers, no bodies. ``status`` 0 = a request that
+    never completed (blocked/aborted) — a strong signal a submit silently failed.
+    ``urlPattern`` is a regex filter. Pass an ``index`` to ``get_network_request``
+    for headers or a body.
+    """
+    return await _run(
+        agent_ops.network_requests(
+            manager, _session_id(), tabId, url_pattern=urlPattern, limit=int(limit), clear=clear
+        )
+    )
+
+
+@mcp.tool()
+async def get_network_request(
+    tabId: int,
+    index: int,
+    reason: str,
+    part: str | None = None,
+    path: str | None = None,
+    raw_headers: bool = False,
+) -> dict[str, Any]:
+    """One request from ``read_network_requests`` in full: headers (cookie and
+    authorization redacted unless ``raw_headers``), and with ``part`` =
+    ``"response_body"`` or ``"request_body"`` the body — inline up to 10000 chars,
+    written to a workspace file above that (or to ``path`` when given).
+
+    Reading a body shows data the page may not render (a price behind a spinner,
+    an API payload) — that is why ``reason`` is required and every body read is
+    logged, and why the result is tagged ``source: "network"``: tell the user the
+    value came from the network, not the page. Bodies are captured for
+    xhr/fetch/document responses with a text content type, up to 256 KB.
+    """
+    if not (reason or "").strip():
+        raise ToolError("get_network_request needs a stated reason")
+    dest: str | None = None
+    if path:
+        dest = _resolve_data_path(path)
+        if dest is None:
+            return {"status": "path_not_allowed", "path": path}
+
+    async def write_file(text: str) -> str:
+        target = dest or _artifact_path(f"network-{tabId}-{index}", "txt")
+        await asyncio.to_thread(_write_text, target, text)
+        return target
+
+    return await _run(
+        agent_ops.network_request(
+            manager,
+            _session_id(),
+            tabId,
+            index,
+            part=part,
+            raw_headers=raw_headers,
+            reason=reason,
+            write_file=write_file,
+        )
+    )
+
+
+# --- extras (not in the extension) ------------------------------------------------------
+
+
+@mcp.tool()
+async def login(portal_id: str, ref: str | None = None, tabId: int | None = None) -> dict[str, Any]:
+    """Log in to a portal the user has configured for this workspace. Not in the
+    extension.
 
     You pass ONLY the portal id (e.g. "acme-portal"); the username and password
     are stored securely and injected server-side — they are never shown to you,
-    and you can never read them. Call ``browser_snapshot`` afterwards to see
-    whether login succeeded or a challenge (MFA/CAPTCHA) needs the user.
+    and every later result is scrubbed of them. Then ``read_page`` to see whether
+    login succeeded or a challenge (MFA/CAPTCHA) needs the user — if it does,
+    say so and END YOUR TURN; the user acts in the live view and your next
+    message resumes.
 
-    Two ways to use it:
+    Two ways to use it: **no ``ref``** — goes to the portal's saved login URL and
+    fills the form there (try this first); **with ``ref``** (the username/email
+    field from read_page on the page you are already on) — fills that form
+    without navigating, for sites that keep the form behind a menu or a separate
+    sign-in provider. A ``no_login_form`` answer is not a dead end — find the
+    real form and call again with its ref. Never ask the user for the password.
 
-    * **No ``ref``** — goes to the portal's saved login URL and fills the form
-      there. Try this first.
-    * **With ``ref``** — fills the form on the page you are ALREADY on, without
-      navigating. Use this when the saved URL turns out not to hold the login
-      form: many sites keep it behind an account menu, or hand off to a separate
-      sign-in provider. Navigate there yourself, ``browser_snapshot``, then pass
-      the ref of the username/email field.
-
-    So a `no_login_form` answer is not a dead end — find the real form and call
-    again with its ref. Never ask the user to tell you the password.
-
-    Args:
-        portal_id: The configured portal to authenticate to.
-        ref: Optional element ref of the username/email field on the current
-            page, from a prior ``browser_snapshot``. Omit to use the saved URL.
-
-    Returns:
-        ``{status, portal_id, url, ...}`` where status is ``submitted``
-        (credentials entered), ``unknown_portal`` (no such portal configured),
-        ``no_stored_password`` (the portal exists but has no password saved —
-        ask the user to add one in their settings; nothing was typed), or
-        ``no_login_form`` (no usable form where it looked — ``url`` and ``tried``
-        say where that was).
+    Returns ``{status, portal_id, url, ...}`` with status ``submitted``,
+    ``unknown_portal``, ``no_stored_password`` (ask the user to add one in their
+    settings; nothing was typed) or ``no_login_form`` (``url`` and ``tried`` say
+    where it looked).
     """
     portals = await asyncio.to_thread(read_portals)
-    return await agent_ops.login(manager, _session_id(), portal_id, portals, ref=ref or None)
+    return await _run(
+        agent_ops.login(manager, _session_id(), portal_id, portals, ref=ref or None, tab_id=tabId)
+    )
 
 
 @mcp.tool()
-async def browser_click(ref: str, label: str = "") -> str:
-    """Click an element on the current page.
-
-    The user's workspace asks them to approve click/type actions in the chat
-    before they run, so pass a short human-readable ``label`` — the approval
-    prompt shows it (e.g. "Click 'Submit application'" instead of a raw ref).
-
-    Args:
-        ref: An element ref from a prior ``browser_snapshot``.
-        label: A short description of what you're clicking (the element's visible
-            text), for the user's approval prompt. Optional but strongly preferred.
+async def wait_for(
+    tabId: int,
+    text: str | None = None,
+    selector: str | None = None,
+    url: str | None = None,
+    response: str | None = None,
+    timeout_ms: int = 8000,
+) -> dict[str, Any]:
+    """Wait until tab ``tabId`` is ready before reading/acting: for ``text`` to
+    appear, a CSS ``selector`` to match, the page ``url`` to contain a string
+    (after a submit), or a ``response`` whose URL contains a string (an async
+    save landing); with none, for the network to go idle. Returns ``{ready}``
+    (False on timeout). Not in the extension.
     """
-    await agent_ops.click(manager, _session_id(), ref)
-    return "ok"
+    return await _run(
+        agent_ops.wait_for(
+            manager,
+            _session_id(),
+            tabId,
+            text=text,
+            selector=selector,
+            url=url,
+            response=response,
+            timeout_ms=int(timeout_ms),
+        )
+    )
 
 
 @mcp.tool()
-async def browser_request_takeover(reason: str) -> dict[str, Any]:
-    """Ask the user to take over the browser when you can't proceed alone.
-
-    Use this for a two-factor prompt, a CAPTCHA, an unexpected login challenge,
-    or anything needing a human decision. It pauses you and shows the user a
-    take-over banner in their live view. After they act, call ``browser_snapshot``
-    to see the new page state and continue.
-
-    Args:
-        reason: A short, user-facing explanation of what you need them to do.
+async def download(tabId: int, ref: str, path: str) -> dict[str, Any]:
+    """Click the download link/button at ``ref`` on tab ``tabId`` and SAVE the file
+    into the workspace at ``path`` (e.g. "downloads/tender.pdf") so the user can
+    open it. Approved in chat. Not in the extension.
     """
-    return await agent_ops.request_takeover(manager, _session_id(), reason)
+    dest = _resolve_data_path(path)
+    if dest is None:
+        return {"status": "path_not_allowed", "path": path}
+    await asyncio.to_thread(_ensure_parent, dest)
+    result = await _run(agent_ops.download(manager, _session_id(), tabId, ref, dest))
+    return {"status": "downloaded", "path": dest, **result}
 
 
 @mcp.tool()
-async def browser_type(ref: str, text: str, label: str = "") -> str:
-    """Type text into a field on the current page.
-
-    As with ``browser_click``, the user approves this in chat first — pass a
-    short ``label`` (the field's name) so the prompt is readable.
-
-    Args:
-        ref: An element ref from a prior ``browser_snapshot``.
-        text: The text to enter.
-        label: A short description of the field you're typing into, for the user's
-            approval prompt. Optional but strongly preferred.
-
-    Returns:
-        ``"ok"``, or ``"ok — note: …"`` when the field's value after typing
-        differs from what you sent (the page reformatted or restricted your
-        input — react to it NOW, not at submit time) or the field is an
-        autocomplete (snapshot and click the right suggestion instead of
-        pressing Enter).
+async def list_frames(tabId: int) -> list[dict[str, Any]]:
+    """The frames (iframes) of tab ``tabId`` as ``[{index, name, url}]``; 0 is the
+    top page, 1+ are embedded frames — portals often put a login form or a PDF
+    viewer inside one. Then ``switch_frame`` to act inside it. Not in the extension.
     """
-    return await agent_ops.type_text(manager, _session_id(), ref, text)
+    return await _run(agent_ops.list_frames(manager, _session_id(), tabId))
 
 
 @mcp.tool()
-async def browser_run_recipe(path: str, params: dict[str, str] | None = None) -> dict[str, Any]:
-    """Run a SAVED click-path for a site in one call — prefer this over driving
-    the browser step by step whenever a recipe exists for the task.
+async def switch_frame(tabId: int, frame: str = "") -> dict[str, Any]:
+    """Choose which frame of tab ``tabId`` ``read_page`` / ``computer`` /
+    ``form_input`` act inside — a frame ``index`` or ``name`` from ``list_frames``;
+    empty, "main" or "0" resets to the top page. Returns ``{status, target}``:
+    ``switched`` / ``reset`` / ``unknown_frame``. Not in the extension.
+    """
+    return await _run(agent_ops.switch_frame(manager, _session_id(), tabId, frame))
 
-    A recipe is a proven sequence (open, sign in, search, read) stored as a JSON
-    file in the workspace. Running it costs ONE tool call instead of one per
-    step, so it is dramatically faster and cheaper than navigating yourself.
+
+@mcp.tool()
+async def set_dialog_mode(mode: str) -> dict[str, Any]:
+    """Choose how the browser answers native pop-ups (alert / confirm / prompt /
+    "leave this page?") that would otherwise freeze the page: ``"dismiss"``
+    (default — Cancel/stay; a confirm never commits) or ``"accept"`` (OK/leave —
+    use ONLY right before an action you KNOW raises a benign confirm, then set it
+    back). Accepting can approve a delete or an order, so the user approves this
+    in chat. Not in the extension.
+    """
+    return await _run(agent_ops.set_dialog_mode(manager, _session_id(), mode))
+
+
+@mcp.tool()
+async def last_dialog(tabId: int) -> dict[str, Any]:
+    """The most recent native pop-up the browser auto-handled: ``{status: "none"}``
+    or ``{status: "handled", type, message, action, ...}`` — ``action`` is how it
+    was answered; a dismissed confirm means the action did NOT go through. Not in
+    the extension.
+    """
+    return await _run(agent_ops.last_dialog(manager, _session_id(), tabId))
+
+
+@mcp.tool()
+async def run_recipe(
+    path: str, params: dict[str, str] | None = None, tabId: int | None = None
+) -> dict[str, Any]:
+    """Run a SAVED click-path in one call — prefer this over driving the browser
+    step by step whenever a recipe exists for the task. Not in the extension.
+
+    A recipe is a proven sequence stored as JSON in the workspace: a list of
+    ``{name, input}`` steps exactly like ``browser_batch`` items (``navigate``,
+    ``computer``, ``read_page``, ``find``, ``form_input``, ``wait_for``, ``login``),
+    where a step names its control by ``target: {role, name, nth}`` instead of a
+    ref. Running it costs ONE tool call with no model between the steps.
 
     Args:
-        path: Workspace path to the recipe JSON (e.g.
-            "skills/supplier-portal.recipe.json").
-        params: Values for the recipe's declared parameters, e.g.
-            ``{"keyword": "pumps"}``. Required ones are listed in the file.
+        path: Workspace path to the recipe JSON (e.g. "skills/supplier-portal.recipe.json").
+        params: Values for the recipe's declared parameters, e.g. ``{"keyword": "pumps"}``.
+        tabId: The tab to run on (default: the active tab).
 
-    Returns:
-        ``{status, steps_run, extracted}`` on success — ``extracted`` holds the
-        page content the recipe collected. On ``step_failed`` it names the step
-        index and why, which usually means the site changed: fall back to
-        driving the browser yourself from that point, and tell the user the
-        recipe needs re-recording.
+    Returns ``{status, steps_run, extracted}`` on success — ``extracted`` holds
+    the page content the recipe collected. On ``step_failed`` it names the step
+    index and why, which usually means the site changed: fall back to driving the
+    browser yourself from that point, and tell the user the recipe needs
+    re-recording.
     """
-    resolved = _resolve_workspace_path(path)
+    resolved = _resolve_data_path(path)
     if resolved is None:
         return {"status": "path_not_allowed", "path": path}
     if not await asyncio.to_thread(os.path.isfile, resolved):
@@ -463,458 +831,76 @@ async def browser_run_recipe(path: str, params: dict[str, str] | None = None) ->
         return {"status": "invalid_recipe", "reason": f"not valid JSON: {exc}"}
     except recipes.RecipeError as exc:
         return {"status": "invalid_recipe", "reason": str(exc)}
-    portals = await asyncio.to_thread(read_portals)
-    return await agent_ops.run_recipe(manager, _session_id(), recipe, params or {}, portals=portals)
+    session_id = _session_id()
+    if tabId is None:
+        session = await manager.get_or_create(session_id)
+        tabId = session.driver.active_num()
+    return await agent_ops.run_recipe(recipe, params or {}, tab_id=int(tabId), dispatch=_DISPATCH)
+
+
+# --- batch: several calls behind ONE round trip ------------------------------------------
 
 
 @mcp.tool()
-async def browser_fill_form(fields: list[dict[str, str]], label: str = "") -> dict[str, Any]:
-    """Fill MANY fields on a form in one call — prefer this over repeated
-    ``browser_type`` whenever you are filling more than one field.
+async def browser_batch(actions: list[dict[str, Any]]) -> Any:
+    """Run several browser tool calls in ONE round trip: ``actions`` is a list of
+    ``{name, input}`` (any tool here except browser_batch itself), executed in
+    order, stopping at the first error. The reply lists every item's result in
+    order, screenshots interleaved. Each item carries the SAME approval it would
+    standalone, so a batch with a click prompts the user once for the whole set.
 
-    Args:
-        fields: One entry per field, in the order to fill them. Each is
-            ``{"ref": "<ref from a snapshot>", "value": "<what to enter>"}``,
-            plus ``"kind": "select"`` for a native ``<select>`` dropdown
-            (default ``"text"`` covers inputs and textareas).
-        label: What the person approving this should see, naming the FORM rather
-            than the fields (e.g. "the pizza order form"). This is a mutating
-            action, so it routes through the in-chat permission modal; without a
-            label the modal can only show a blob of refs and values.
-
-    Returns ``{filled, requested, fields}`` — a per-field result, because a
-    form can partly succeed and you need to know which half landed.
+    This is the cheap way to act and look: ``[{computer left_click e5},
+    {read_page}]`` clicks and returns the new page in one call.
     """
-    return await agent_ops.fill_form(manager, _session_id(), fields)
-
-
-@mcp.tool()
-async def browser_scroll(direction: str = "down", amount: int = 600) -> str:
-    """Scroll the current page to reveal more content, then ``browser_snapshot``
-    to read the newly visible elements.
-
-    Scrolling is just viewing, so it runs without asking the user (unlike
-    click/type). Use it to reach content below or above the fold.
-
-    Args:
-        direction: "down" (default) or "up".
-        amount: How far to scroll in pixels (default 600, roughly one screen).
-    """
-    dirn = "up" if str(direction).lower() == "up" else "down"
-    await agent_ops.scroll(manager, _session_id(), dirn, int(amount))
-    return "ok"
-
-
-# --- reading / understanding the page (run without asking the user) ---------
-
-
-@mcp.tool()
-async def browser_read() -> str:
-    """Return the current page's readable text (article/main content, capped).
-
-    Use this to actually READ what a page says — instructions, data, prose,
-    tables as text. ``browser_snapshot`` lists what you can click; this gives you
-    the content. Viewing only, so it doesn't ask the user.
-    """
-    return await agent_ops.read(manager, _session_id())
-
-
-@mcp.tool()
-async def browser_find(query: str) -> dict[str, Any]:
-    """Find text on the current page (like Ctrl+F) and scroll the first match into
-    view. Returns how many times it appears and a snippet around the first hit.
-
-    Args:
-        query: The text to search for (case-insensitive).
-    """
-    return await agent_ops.find_text(manager, _session_id(), query)
-
-
-@mcp.tool()
-async def browser_screenshot() -> Image:
-    """Take a screenshot of the current page so you can SEE it — layout, images,
-    charts, or anything the DOM snapshot doesn't convey. Viewing only.
-    """
-    png = await agent_ops.screenshot(manager, _session_id())
-    return Image(data=png, format="png")
-
-
-@mcp.tool()
-async def browser_save_screenshot(path: str) -> dict[str, Any]:
-    """Save a screenshot of the current page to the user's workspace, so it's
-    stored and the user can open it in their files. Use when the user asks you to
-    capture something, or you want to keep a record of a page.
-
-    Args:
-        path: Where to save it in the workspace (e.g. "screenshots/quote.png").
-            A `.png` file under the user's workspace.
-    """
-    dest = _resolve_workspace_path(path)
-    if dest is None:
-        return {"status": "path_not_allowed", "path": path}
-    png = await agent_ops.screenshot(manager, _session_id())
-    await asyncio.to_thread(_write_bytes, dest, png)
-    return {"status": "saved", "path": dest}
-
-
-@mcp.tool()
-async def browser_inspect(ref: str) -> dict[str, Any]:
-    """Inspect one element from a snapshot: its tag, text, attributes, on-screen
-    box, and whether it's visible/enabled. Use it when a click/type didn't behave
-    as expected, or to understand a control before acting.
-
-    Args:
-        ref: An element ref from a prior ``browser_snapshot``.
-    """
-    return await agent_ops.inspect(manager, _session_id(), ref)
-
-
-@mcp.tool()
-async def browser_get_table(ref: str = "") -> list[list[list[str]]]:
-    """Extract tables on the page as structured rows (``[table][row][cell]``).
-    Great for reading tender listings, prices, or any tabular data.
-
-    Args:
-        ref: Optionally a ref inside/at one table (from a snapshot) to get just
-            that table; omit to get all tables on the page.
-    """
-    return await agent_ops.get_table(manager, _session_id(), ref or None)
-
-
-# --- history + reliability (navigation; run without asking the user) --------
-
-
-@mcp.tool()
-async def browser_back() -> str:
-    """Go back to the previous page in history."""
-    await agent_ops.go_back(manager, _session_id())
-    return "ok"
-
-
-@mcp.tool()
-async def browser_forward() -> str:
-    """Go forward in history."""
-    await agent_ops.go_forward(manager, _session_id())
-    return "ok"
-
-
-@mcp.tool()
-async def browser_reload() -> str:
-    """Reload the current page."""
-    await agent_ops.reload(manager, _session_id())
-    return "ok"
-
-
-@mcp.tool()
-async def browser_wait_for(
-    text: str = "", selector: str = "", timeout_ms: int = 8000
-) -> dict[str, Any]:
-    """Wait until content loads before reading/acting — pages often load
-    asynchronously. Wait for some ``text`` to appear, or a CSS ``selector`` to
-    match; with neither, wait for the network to go idle. Returns ``{ready: bool}``.
-
-    Args:
-        text: Text to wait for on the page.
-        selector: A CSS selector to wait for.
-        timeout_ms: How long to wait before giving up (default 8000).
-    """
-    ready = await agent_ops.wait_for(
-        manager,
-        _session_id(),
-        text=text or None,
-        selector=selector or None,
-        timeout_ms=int(timeout_ms),
-    )
-    return {"ready": ready}
-
-
-# --- extra actions (the user approves these in chat, like click/type) -------
-
-
-@mcp.tool()
-async def browser_press_key(key: str, label: str = "") -> str:
-    """Press a key on the current page — e.g. "Enter" to submit, "Escape" to close
-    a dialog, "Tab" to move fields, "ArrowDown" in a menu.
-
-    The user approves this in chat (Enter can submit a form), so pass a short
-    ``label`` describing the effect (e.g. "Submit the search").
-
-    Args:
-        key: A key name (Enter, Escape, Tab, ArrowDown, PageDown, …).
-        label: A short description of what pressing it does, for the approval prompt.
-    """
-    await agent_ops.press_key(manager, _session_id(), key)
-    return "ok"
-
-
-@mcp.tool()
-async def browser_select_option(ref: str, value: str, label: str = "") -> str:
-    """Choose an option in a native dropdown (``<select>``). Approved in chat.
-
-    Args:
-        ref: A ref (from a snapshot) for the ``<select>`` element.
-        value: The option's value or visible label to select.
-        label: A short description for the approval prompt (e.g. "Set Country = UK").
-    """
-    await agent_ops.select_option(manager, _session_id(), ref, value)
-    return "ok"
-
-
-@mcp.tool()
-async def browser_upload_file(ref: str, path: str, label: str = "") -> dict[str, Any]:
-    """Attach a file from the workspace to a file-upload field — e.g. to submit a
-    document with a tender. The file must be one of the user's workspace files.
-    Approved in chat.
-
-    Args:
-        ref: A ref (from a snapshot) for the file ``<input>``.
-        path: Path to the file in the workspace (under the agent home).
-        label: A short description for the approval prompt (e.g. "Upload proposal.pdf").
-    """
-    resolved = _resolve_workspace_path(path)
-    if resolved is None:
-        return {"status": "path_not_allowed", "path": path}
-    if not await asyncio.to_thread(os.path.isfile, resolved):
-        return {"status": "not_found", "path": path}
-    await agent_ops.upload_file(manager, _session_id(), ref, resolved)
-    return {"status": "attached", "path": resolved}
-
-
-@mcp.tool()
-async def browser_download(ref: str, path: str, label: str = "") -> dict[str, Any]:
-    """Download a file the page offers (click a download link/button by ``ref``)
-    and SAVE it into the user's workspace so it's kept and the user can open it —
-    e.g. a tender document, receipt, or export. Approved in chat.
-
-    Args:
-        ref: A ref (from a snapshot) for the download link/button to click.
-        path: Where to save it in the workspace (e.g. "downloads/tender.pdf").
-        label: A short description for the approval prompt (e.g. "Download the tender pack").
-    """
-    dest = _resolve_workspace_path(path)
-    if dest is None:
-        return {"status": "path_not_allowed", "path": path}
-    await asyncio.to_thread(_ensure_parent, dest)
-    result = await agent_ops.download(manager, _session_id(), ref, dest)
-    return {"status": "downloaded", "path": dest, **result}
-
-
-# --- frames / iframes (viewing — no chat prompt) ----------------------------
-
-
-@mcp.tool()
-async def browser_list_frames() -> list[dict[str, Any]]:
-    """List the frames (iframes) in the active tab as ``[{index, name, url}]``.
-
-    Index 0 is the top-level page; 1+ are embedded iframes in document order —
-    portals often put a login form or PDF viewer inside one. Then
-    ``browser_switch_frame`` to act inside it. Viewing only.
-    """
-    return await agent_ops.list_frames(manager, _session_id())
-
-
-@mcp.tool()
-async def browser_switch_frame(target: str = "") -> dict[str, Any]:
-    """Choose which frame of the active tab ``browser_snapshot`` / ``browser_click``
-    / ``browser_type`` act inside — e.g. an embedded form or PDF viewer. Switching
-    between views you already have open, so it runs without asking the user.
-
-    Args:
-        target: A frame ``index`` (from ``browser_list_frames``) or ``name``.
-            Empty (default), "main", or "0" resets to the top-level page.
-
-    Returns:
-        ``{status, target}`` — ``switched`` / ``reset`` / ``unknown_frame``.
-    """
-    return await agent_ops.switch_frame(manager, _session_id(), target)
-
-
-# --- native dialogs ---------------------------------------------------------
-
-
-@mcp.tool()
-async def browser_set_dialog_mode(mode: str, label: str = "") -> dict[str, Any]:
-    """Choose how the browser answers native JS pop-ups (alert / confirm / prompt /
-    the "leave this page?" beforeunload) that would otherwise freeze the page.
-
-    Modes:
-      * "dismiss" (default) — click Cancel / stay. SAFE: a confirm never commits,
-        a beforeunload never abandons unsaved work.
-      * "accept" — click OK / leave. Use ONLY right before an action you KNOW
-        raises a benign confirm you intend to accept (e.g. a cookie banner's "I
-        agree"). Accepting is committing — it can approve a delete, submit, or
-        order — so the user must approve this. Set it back to "dismiss" after.
-
-    Args:
-        mode: "accept" or "dismiss" (anything else is treated as "dismiss").
-        label: Short reason (shown in the user's approval prompt).
-    """
-    return await agent_ops.set_dialog_mode(manager, _session_id(), mode)
-
-
-@mcp.tool()
-async def browser_last_dialog() -> dict[str, Any]:
-    """Report the most recent native pop-up the browser auto-handled: ``{status:
-    "none"}`` or ``{status: "handled", type, message, action, ...}`` (``action`` is
-    how it was answered). A "dismiss"ed confirm means the action did NOT go
-    through. Viewing only.
-    """
-    return await agent_ops.last_dialog(manager, _session_id())
-
-
-# --- console / network observability (viewing) ------------------------------
-
-
-@mcp.tool()
-async def browser_console() -> list[dict[str, Any]]:
-    """Read the page's recent console messages as ``[{type, text}]`` (incl. uncaught
-    errors, type "error"). Use this to diagnose an action that appeared to do
-    nothing — a validation error or thrown exception usually logs here. Viewing only.
-    """
-    return await agent_ops.console_log(manager, _session_id())
-
-
-@mcp.tool()
-async def browser_network(url_substring: str = "", limit: int = 20) -> list[dict[str, Any]]:
-    """Read the page's recent network requests as ``[{method, url, status,
-    resource_type}]``. ``status`` 0 = a request that never completed
-    (blocked/aborted) — a strong signal a submit silently failed. Filter with
-    ``url_substring`` (e.g. "/api/save"). Viewing only.
-
-    Args:
-        url_substring: Only entries whose URL contains this (empty = all).
-        limit: Max entries (default 20).
-    """
-    sub = url_substring or None
-    return await agent_ops.network_log(manager, _session_id(), url_substring=sub, limit=int(limit))
-
-
-@mcp.tool()
-async def browser_wait_for_response(url_substring: str, timeout_ms: int = 15000) -> dict[str, Any]:
-    """Wait for a network response whose URL contains ``url_substring`` — use right
-    after a click that triggers an async save/submit to confirm it landed. Returns
-    ``{matched, status, url}`` (matched False on timeout). Viewing only.
-
-    Args:
-        url_substring: Text the target response URL must contain (e.g. "/api/apply").
-        timeout_ms: How long to wait (default 15000, capped at 60000).
-    """
-    sub = (url_substring or "").strip()
-    if not sub:
-        return {"matched": False, "status": 0, "url": "", "error": "url_substring is required"}
-    budget = max(0, min(int(timeout_ms), 60000))
-    return await agent_ops.wait_for_response(manager, _session_id(), sub, budget)
-
-
-# --- interaction extras -----------------------------------------------------
-
-
-@mcp.tool()
-async def browser_hover(ref: str, label: str = "") -> str:
-    """Hover the pointer over an element to reveal a menu/tooltip it only shows on
-    hover; then ``browser_snapshot`` to read what appeared. Acts on the page, so
-    the user approves it in chat — pass a short ``label``.
-
-    Args:
-        ref: An element ref from a prior ``browser_snapshot``.
-        label: Short description of what you're hovering, for the approval prompt.
-    """
-    await agent_ops.hover(manager, _session_id(), ref)
-    return "ok"
-
-
-@mcp.tool()
-async def browser_drag(from_ref: str, to_ref: str, label: str = "") -> str:
-    """Drag one element onto another (reorder a list, drop onto a drop-zone). Both
-    refs come from a prior snapshot. Changes the page, so the user approves it.
-
-    Args:
-        from_ref: The element to drag.
-        to_ref: The element to drop it onto.
-        label: Short description of the drag, for the approval prompt.
-    """
-    await agent_ops.drag(manager, _session_id(), from_ref, to_ref)
-    return "ok"
-
-
-@mcp.tool()
-async def browser_scroll_to(ref: str) -> dict[str, Any]:
-    """Scroll a specific element into view so it can be clicked or read — use when
-    a click reports "not interactable" or to reveal a below-fold element. Viewing
-    only.
-
-    Args:
-        ref: An element ref from a prior ``browser_snapshot``.
-
-    Returns:
-        ``{status}`` — ``scrolled`` or ``not_found`` (re-snapshot and retry).
-    """
-    return await agent_ops.scroll_to(manager, _session_id(), ref)
-
-
-@mcp.tool()
-async def browser_get_options(ref: str) -> list[dict[str, Any]]:
-    """List a dropdown's (``<select>``) options as ``[{value, label, selected}]`` so
-    you can pick a real ``value`` before ``browser_select_option``. A snapshot only
-    shows the current value. Empty if ``ref`` isn't a select. Viewing only.
-
-    Args:
-        ref: The ``<select>`` element's ref from a prior ``browser_snapshot``.
-    """
-    return await agent_ops.get_options(manager, _session_id(), ref)
-
-
-@mcp.tool()
-async def browser_get_links() -> list[dict[str, str]]:
-    """List the page's links as ``[{text, href}]`` with absolute URLs (up to ~200),
-    to plan navigation without scrolling and snapshotting the whole page. Viewing
-    only.
-    """
-    return await agent_ops.get_links(manager, _session_id())
-
-
-@mcp.tool()
-async def browser_eval(js: str, label: str = "") -> dict[str, Any]:
-    """Run a small JavaScript snippet on the current page and get its result. Use
-    ONLY when the structured tools can't answer (read a computed value, count
-    nodes, extract text a snapshot misses). It runs IN the page with the page's
-    privileges, so the user must approve it — pass a ``label`` saying what it does.
-    A script error returns ``{error}`` instead of failing.
-
-    Args:
-        js: A JS expression or block; its value (or a returned Promise's) is
-            returned, stringified and length-capped.
-        label: A short description of what the script does, for the approval prompt.
-
-    Returns:
-        ``{result}`` with the stringified value, or ``{error}`` on a JS error.
-    """
-    return await agent_ops.eval_js(manager, _session_id(), js)
-
-
-def _resolve_workspace_path(path: str) -> str | None:
-    """Resolve ``path`` under the tenant volume, or None if it escapes it — so the
-    agent can't read/write arbitrary pod paths (``/etc/…``) via upload/download."""
-    base = path if os.path.isabs(path) else os.path.join(_AGENT_HOME, path)
-    resolved = os.path.realpath(base)
-    if resolved != _AGENT_HOME and not resolved.startswith(_AGENT_HOME + os.sep):
-        return None
-    return resolved
-
-
-def _read_text(path: str) -> str:
-    with open(path, encoding="utf-8") as fh:
-        return fh.read()
-
-
-def _ensure_parent(dest: str) -> None:
-    os.makedirs(os.path.dirname(dest) or _AGENT_HOME, exist_ok=True)
-
-
-def _write_bytes(dest: str, data: bytes) -> None:
-    _ensure_parent(dest)
-    with open(dest, "wb") as f:
-        f.write(data)
+    if not isinstance(actions, list) or not actions:
+        raise ToolError("browser_batch needs a non-empty actions list of {name, input}")
+    results = await agent_ops.run_batch(actions, _DISPATCH)
+    content: list[Any] = []
+    for i, item in enumerate(results, 1):
+        if item["status"] != "ok":
+            error = str(item["error"]).removeprefix("ToolError: ")
+            content.append(f"#{i} {item['name']}: ERROR — {error}")
+            break
+        out = item["result"]
+        if isinstance(out, list) and any(isinstance(x, Image) for x in out):
+            texts = [x for x in out if isinstance(x, str)]
+            content.append(f"#{i} {item['name']}: " + "\n".join(texts))
+            content.extend(x for x in out if isinstance(x, Image))
+        elif isinstance(out, str):
+            content.append(f"#{i} {item['name']}:\n{out}")
+        else:
+            content.append(f"#{i} {item['name']}: {json.dumps(out, ensure_ascii=False)}")
+    return content
+
+
+# The handlers a batch item (and a recipe step) can name, by bare tool name.
+# Explicit, not `getattr(module, name)`: the allowlist in recipes.py is only a
+# real boundary if nothing here can reach a function it does not name.
+_DISPATCH: dict[str, Callable[..., Awaitable[Any]]] = {
+    "tabs_context_mcp": tabs_context_mcp,
+    "tabs_create_mcp": tabs_create_mcp,
+    "tabs_close_mcp": tabs_close_mcp,
+    "navigate": navigate,
+    "read_page": read_page,
+    "get_page_text": get_page_text,
+    "find": find,
+    "computer": computer,
+    "form_input": form_input,
+    "javascript_tool": javascript_tool,
+    "file_upload": file_upload,
+    "resize_window": resize_window,
+    "read_console_messages": read_console_messages,
+    "read_network_requests": read_network_requests,
+    "get_network_request": get_network_request,
+    "login": login,
+    "wait_for": wait_for,
+    "download": download,
+    "list_frames": list_frames,
+    "switch_frame": switch_frame,
+    "set_dialog_mode": set_dialog_mode,
+    "last_dialog": last_dialog,
+    "run_recipe": run_recipe,
+}
 
 
 def build_app() -> Any:

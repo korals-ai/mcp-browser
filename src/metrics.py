@@ -1,7 +1,7 @@
 """Prometheus metrics for the co-browse browser pod (one series per pod).
 
-The browser pod is per-tenant, fixed single replica, so each metric is a single
-per-pod series; prometheus attaches the pod's ``platform_tenant_id`` label at
+The browser pod serves one data volume, fixed single replica, so each metric is
+a single per-pod series; prometheus attaches the pod's owner label at
 scrape time (the PodMonitor in the prometheus overlay). Scraped at ``/metrics``
 on the pod's one port (8096), alongside ``/mcp`` and ``/cobrowse``.
 
@@ -14,7 +14,7 @@ Signals worth alerting on:
     (the class of bug where a failed send tore down the session and silently
     dropped the human's next input). Any sustained rate is a regression.
   * ``cobrowse_chromium_launch_failures_total`` — Chromium wouldn't start, so
-    co-browse is dead for that tenant.
+    co-browse is dead for that pod.
   * ``cobrowse_restore_guard_trips_total`` / ``cobrowse_tab_restores_total``
     ``{outcome="degraded"}`` — a session start found its own saved tab set
     marked with an unfinished attempt, i.e. the last restore died mid-flight.
@@ -92,7 +92,7 @@ _chromium_launches = Counter(
 )
 _chromium_launch_failures = Counter(
     "cobrowse_chromium_launch_failures_total",
-    "Times Chromium failed to launch — co-browse is unavailable for this tenant.",
+    "Times Chromium failed to launch — co-browse is unavailable from this pod.",
     registry=_registry,
 )
 _sessions_ended = Counter(
@@ -120,7 +120,7 @@ _pages_blocked = Counter(
     "cobrowse_pages_blocked_total",
     "Agent navigations that landed on a wall instead of content, by page_state "
     "(blocked_challenge/blocked_denied/rate_limited/server_error — see "
-    "src/page_state.py). The measure of how often anti-bot walls cost tenants "
+    "src/page_state.py). The measure of how often anti-bot walls cost users "
     "a browsing task; in-cluster diagnostic, not alert-wired.",
     ["state"],
     registry=_registry,
@@ -301,14 +301,14 @@ _input_denied = Counter(
 _gc_deleted = Counter(
     "cobrowse_gc_profiles_deleted_total",
     "Orphaned per-chat Chromium profiles reclaimed by the profile GC (their chat "
-    "was deleted). rate() = the reclaim throughput draining a tenant's backlog.",
+    "was deleted). rate() = the reclaim throughput draining a volume's backlog.",
     registry=_registry,
 )
 _gc_denied_perm = Counter(
     "cobrowse_gc_denied_perm_total",
     "Profiles the GC could NOT delete because they were foreign-owned (EPERM/EACCES). "
     "MUST stay 0 today (every pod is uid 65532). A sustained non-zero is the R2 "
-    "tripwire: per-user Linux isolation has landed and the tenant-global sweep now "
+    "tripwire: per-user Linux isolation has landed and the volume-wide sweep now "
     "leaks other users' orphans — the GC needs its root/drop-to-uid helper. Alert on "
     "any increase.",
     registry=_registry,

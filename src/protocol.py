@@ -67,19 +67,6 @@ class BrowserNav:
 
 
 @dataclass(frozen=True)
-class BrowserTakeoverRequest:
-    """The agent hit a challenge it can't handle (MFA / CAPTCHA / unknown login)
-    and is asking the human to take over. The pod pauses the agent and pushes
-    this so the viewer raises a take-over banner."""
-
-    reason: str
-    type: Literal["browser_takeover_request"] = "browser_takeover_request"
-
-    def to_json(self) -> dict[str, Any]:
-        return {"type": self.type, "reason": self.reason}
-
-
-@dataclass(frozen=True)
 class BrowserAgentState:
     """Whether the agent is currently acting / paused / idle on this session.
 

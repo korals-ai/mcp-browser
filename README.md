@@ -3,9 +3,12 @@
 A real browser an agent can drive — and a human can watch. An [MCP](https://modelcontextprotocol.io) server speaking Streamable
 HTTP: run it in a container, point your agent at `http://localhost:8096/mcp`.
 
-A full Playwright-driven Chrome exposed as MCP tools: navigate, snapshot the page as structured
-elements the agent reads, click, type, scroll, inspect tables and links, handle frames, dialogs,
-downloads and uploads, and read console and network activity.
+A full Playwright-driven Chrome exposed as MCP tools **with the Claude-in-Chrome
+extension's tool contract, verbatim** — `computer`, `read_page`, `find`,
+`form_input`, `navigate`, `browser_batch`, … — so a skill written for the
+extension drives this browser unchanged. The page is read as an accessibility
+tree of `[ref=eN]` elements; a mutating call returns only what it did plus what
+changed; `browser_batch` runs several calls in one round trip.
 
 It serves a **second plane on the same port**: `/cobrowse`, a WebSocket that streams a live CDP
 screencast of the session and accepts human input, so a person can watch the agent browse and
@@ -66,24 +69,52 @@ MCP_UID=$(id -u) MCP_GID=$(id -g) docker compose up   # if your uid is not 1000
 
 ## Tools
 
-- `browser_open`
-- `browser_snapshot`
-- `browser_click`
-- `browser_type`
-- `browser_read`
-- `browser_find`
-- `browser_screenshot`
-- `browser_get_table`
-- `browser_wait_for`
-- `browser_upload_file`
-- `browser_download`
-- `browser_console`
-- `browser_network`
-- `browser_eval`
-- `…and 22 more`
+The 15 the extension has, same names, same argument shapes:
 
-Each tool's own description and typed signature — what the agent actually reads
-to decide when to call it — is in `src/server.py`.
+- `tabs_context_mcp` / `tabs_create_mcp` / `tabs_close_mcp` — every per-tab tool
+  takes the numeric `tabId`
+- `navigate` — `url`, `"back"` or `"forward"`; returns where it landed, and a
+  `page_state` that names a bot wall
+- `read_page` — the accessibility tree with refs (`filter: interactive|all`,
+  `max_chars`, `depth`, `ref_id`, `boxes`)
+- `get_page_text` — the readable text
+- `find` — refs matching a description: a literal tier over the tree, then a
+  model tier if configured (below)
+- `form_input` — set a field / checkbox / select by ref
+- `computer` — `left_click`, `right_click`, `double_click`, `triple_click`,
+  `type`, `key`, `screenshot`, `zoom`, `wait`, `scroll`, `scroll_to`, `hover`,
+  `left_click_drag`; by `ref` or by `coordinate`
+- `read_console_messages` / `read_network_requests`
+- `file_upload` / `resize_window` / `javascript_tool`
+- `browser_batch` — a list of `{name, input}` run in order, stopping at the
+  first error
+
+And what a sandboxed browser needs that the extension does not:
+
+- `get_network_request` — one request's headers and body by index (a `reason`
+  is required and logged; cookie/authorization headers are redacted)
+- `login` — portal credentials injected server-side (below)
+- `wait_for` — text / selector / url / response
+- `download`, `list_frames` / `switch_frame`, `set_dialog_mode` / `last_dialog`
+- `run_recipe` — replay a stored batch (`{name, input, target?}` steps) with no
+  model between the steps
+
+Refs are valid for one document: after a navigation, `read_page` again — a stale
+ref is refused by name, never guessed. Each tool's own description and typed
+signature — what the agent actually reads to decide when to call it — is in
+`src/server.py`.
+
+## Configuration
+
+Every variable is required; the server fails at startup on a missing one rather
+than picking a default.
+
+| variable | meaning |
+| --- | --- |
+| `BROWSER_FIND_INFERENCE_URL` | base URL of an Anthropic-compatible `/v1/messages` endpoint for `find`'s model tier; `""` = literal matching only |
+| `BROWSER_FIND_INFERENCE_KEY` | its API key (`""` when the URL is empty) |
+| `BROWSER_FIND_MODEL` | the model `find` asks, e.g. `claude-haiku-4-5-20251001` |
+| `BROWSER_HEADLESS`, `BROWSER_EXECUTABLE_PATH`, `BROWSER_MAX_SESSIONS`, `BROWSER_VIEWER_DIR`, `WORKSPACE_TOOL_HOST`, `WORKSPACE_TOOL_PORT`, `CONNECTORS_CREDS_DIR` | see `docker-compose.yml` |
 
 ## Requirements
 
@@ -91,7 +122,7 @@ Chrome for Testing, Xvfb and Playwright — the largest image here (~1.5 GB).
 
 ## Portal logins
 
-`browser_login` reads credentials from a directory of files, one file per key, named by
+`login` reads credentials from a directory of files, one file per key, named by
 `CONNECTORS_CREDS_DIR`. Put a `PORTAL_CREDENTIALS_JSON` file there holding a JSON array of
 `{portal_id, login_url, username, password}` and the tool can log into those sites without the
 password ever entering the agent's context. Leave the variable unset and the tool is simply

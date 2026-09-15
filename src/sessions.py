@@ -3,10 +3,10 @@
 A session is the join point of the two planes — the agent's MCP tools and the
 human's co-browse WS both resolve the SAME :class:`BrowserSession` by id and act
 on its driver. The id is the chat id, so each chat gets its OWN isolated browser
-(own cookies/window/tabs); a tenant with no chat id falls back to one shared id.
+(own cookies/window/tabs); a caller with no chat id falls back to one shared id.
 
 Sessions are created lazily (first agent tool call OR first viewer connect) and
-closed when idle on BOTH planes past a timeout, so a tenant that opened one and
+closed when idle on BOTH planes past a timeout, so a user who opened one and
 walked away doesn't pin a Chromium forever. Creation is serialized per id with a
 lock so a racing tool-call + viewer-connect don't launch two browsers. A hard
 ``max_sessions`` cap bounds how many Chromiums one pod holds at once: opening a
@@ -50,6 +50,10 @@ class BrowserSession:
         # take-over); MCP tools reject until resumed. Kept here (not on the
         # driver) so both planes see one flag.
         self.agent_paused = False
+        # Every stored credential `login` injected this session, kept ONLY so
+        # every later tool result (tree, page text, script output, a captured
+        # request body) can be redacted by value before it reaches the agent.
+        self.injected_secrets: set[str] = set()
         self._last_activity = time.monotonic()
         # Live viewer sinks (a WS ``send_json``): lets an MCP tool push an
         # unsolicited frame to attached viewers (e.g. a take-over request).

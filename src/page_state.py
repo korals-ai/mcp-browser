@@ -3,7 +3,7 @@
 Anti-bot walls (Cloudflare challenges, retailer robot checks) come back as a
 plausible-looking HTML page, so the agent re-reads and retries them as if they
 were content — burning turns on a page no retry will change (observed in a
-live tenant chat, 2026-09-09). This module names the wall from protocol-level
+live chat, 2026-09-09). This module names the wall from protocol-level
 evidence in ONE place, as a pure function; the navigate tool puts the result
 on its response as ``page_state``.
 

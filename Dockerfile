@@ -2,7 +2,7 @@
 # Chrome (Chrome for Testing) — run HEADED under Xvfb — and exposes it on TWO
 # planes over one port (8096):
 #   * /mcp       — the agent control plane (FastMCP streamable-HTTP); the in-pod
-#                  broker dials it for browser_open/snapshot/click/type.
+#                  broker dials it for navigate/read_page/computer/form_input.
 #   * /cobrowse  — the human view+input plane (WebSocket); the dispatcher proxies
 #                  the browser tab here for the live screencast.
 #   * /          — a bundled standalone viewer for that plane. The platform
@@ -115,6 +115,13 @@ ENV BROWSER_MAX_SESSIONS=3
 # Where the per-tenant connectors Secret is mounted. The DIR is declared; a
 # tenant with no portal logins simply has no file at this path.
 ENV CONNECTORS_CREDS_DIR=/var/run/connectors-creds
+# The model tier of `find` (src/find_model.py): an Anthropic-compatible
+# /v1/messages endpoint + key. An EMPTY url is the declared sentinel for
+# "literal tier only" (what a standalone container gets); the host sets a
+# real endpoint (the platform's AI gateway) and the caller's key.
+ENV BROWSER_FIND_INFERENCE_URL=""
+ENV BROWSER_FIND_INFERENCE_KEY=""
+ENV BROWSER_FIND_MODEL=claude-haiku-4-5-20251001
 # root-owned, sticky X socket dir so Xvfb (running as the unprivileged tool user)
 # places its display socket here without complaint; the entrypoint recreates it
 # if the runtime /tmp is a fresh mount.

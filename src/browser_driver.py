@@ -7,29 +7,37 @@ tests substitute a fake and never launch Chromium — matching the repo's
 
 :class:`PlaywrightDriver` is the real implementation: it owns a Chromium context
 with N **tabs** (pages), a CDP session per tab, and screencasts the ACTIVE tab.
-Snapshot/click/type act on the active tab; switching a tab moves the screencast
-to the newly-active tab's CDP session. Imported lazily so the test image doesn't
-need Playwright's Chromium on the pre-build path.
+The agent reads a tab as Playwright's accessibility tree with refs
+(:meth:`PlaywrightDriver.read_page`) and acts on it through ONE ``computer``
+surface (click/type/key/scroll/hover/drag/screenshot); every ref is checked
+against the tab's CURRENT document before use, so a stale ref is an explicit
+error, never a silent re-target. Switching a tab moves the screencast to the
+newly-active tab's CDP session. Imported lazily so the test image doesn't need
+Playwright's Chromium on the pre-build path.
 """
 
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import fcntl
 import json
 import logging
 import os
+import re
 import shutil
+import struct
 import subprocess
 import time
 from collections import deque
-from typing import TYPE_CHECKING, Any, NamedTuple, NoReturn, Protocol
+from typing import TYPE_CHECKING, Any, NamedTuple, Protocol
 
 from src import metrics
 from src.input_map import to_cdp_command
+from src.keys import to_playwright_combo
 from src.page_state import classify_page_state
-from src.snapshot import Element
+from src.refs_tree import redact_values, refs_in
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
@@ -42,6 +50,24 @@ _CONSOLE_RING = 50
 _NETWORK_RING = 100
 _CONSOLE_TEXT_CAP = 2000
 _URL_CAP = 512
+# Response bodies are captured for the request kinds a page's data rides on,
+# when the body is text, up to this many bytes per entry (the ring holds at
+# most _NETWORK_RING of them, so the per-tab ceiling is ~25 MB).
+_BODY_RESOURCE_TYPES = frozenset({"xhr", "fetch", "document"})
+_BODY_CAP = 256 * 1024
+_TEXTUAL_CONTENT_TYPES = ("json", "text/", "xml", "javascript", "x-www-form-urlencoded")
+# Headers that are credentials, redacted from get_network_request unless the
+# caller asks for raw headers.
+_SECRET_HEADERS = frozenset({"cookie", "set-cookie", "authorization", "proxy-authorization"})
+# A ref action (click/type/hover/…) waits this long for the element; a stale
+# or covered element then reports as such instead of a 30 s Playwright default.
+_ACTION_TIMEOUT_MS = 5000
+# After a mutating action: how long a navigation gets to START before the
+# reply is built, and how long a started one gets to reach domcontentloaded.
+_SETTLE_WINDOW_S = 0.1
+_SETTLE_LOAD_TIMEOUT_MS = 10000
+_DIALOG_LOG = 20
+_WAIT_MAX_S = 10.0
 
 # Screencast picture tuning — the three knobs balance each other, set TOGETHER;
 # don't tune one in isolation:
@@ -87,7 +113,7 @@ _STEALTH_LAUNCH_ARGS = ["--disable-blink-features=AutomationControlled"]
 _IGNORED_DEFAULT_ARGS = ["--enable-automation"]
 
 # Chrome's setuid/namespace sandbox can't initialize in the unprivileged
-# per-tenant pod (uid 65532, no CAP_SYS_ADMIN); the pod itself (per-tenant,
+# pod (uid 65532, no CAP_SYS_ADMIN); the pod itself (one per data volume,
 # non-root, egress-fenced) is the isolation boundary, so --no-sandbox is safe.
 # K8s /dev/shm is 64Mi (too small for Chrome) → /tmp; no GPU → software render.
 _CONTAINER_LAUNCH_ARGS = ["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"]
@@ -151,7 +177,7 @@ def _type_note(typed: str, observed: dict[str, Any] | None) -> str:
     if role == "combobox" or (autocomplete and autocomplete != "none"):
         notes.append(
             "this is an autocomplete field — suggestions may have appeared; "
-            "call browser_snapshot and click the right suggestion instead of "
+            "call read_page and click the right suggestion instead of "
             "pressing Enter"
         )
     if not notes:
@@ -159,20 +185,51 @@ def _type_note(typed: str, observed: dict[str, Any] | None) -> str:
     return "ok — " + "; ".join(notes)
 
 
-def _raise_ref_action_error(action: str, ref: str, exc: Exception) -> NoReturn:
-    """Rewrite a Playwright selector timeout on a ref action into an error that
-    tells the agent its corrective call, instead of a selector-soup timeout the
-    agent can only guess at. Only TimeoutError is rewritten — any other failure
-    re-raises untouched. Both causes of a ref timeout are named (stale ref vs
-    blocked element) because they have opposite fixes and the timeout alone
-    cannot distinguish them."""
+class StaleRefError(ValueError):
+    """A ref the agent passed cannot be used on this tab as it is now — no
+    read_page yet, a read_page of a previous document, or a ref that read did
+    not return. The message names the corrective call."""
+
+
+class UnknownTabError(ValueError):
+    """No open tab has that number."""
+
+
+def _action_error(action: str, ref: str, exc: Exception) -> Exception:
+    """Rewrite a Playwright actionability timeout into an error that tells the
+    agent WHY and what to do. The covering element, when Playwright names it
+    (``<div class="overlay"> intercepts pointer events``), is the whole
+    diagnosis; without it the element is hidden, disabled or detached. Any
+    other failure passes through untouched."""
     if type(exc).__name__ != "TimeoutError":
-        raise exc
-    raise ValueError(
-        f"could not {action} ref '{ref}': either the ref is stale (refs change "
-        "after any navigation or page update — call browser_snapshot for fresh "
-        "refs), or the element is covered/not interactable right now"
-    ) from exc
+        return exc
+    m = re.search(r"(<[^>]{1,200}>)[^\n]*intercepts pointer events", str(exc))
+    if m:
+        why = f"{m.group(1)} covers it and intercepts pointer events"
+    else:
+        why = "the element is not interactable right now (hidden, disabled or detached)"
+    return ValueError(
+        f"could not {action} {ref}: {why} — scroll_to it, wait_for the overlay to go, "
+        "or read_page again for fresh refs"
+    )
+
+
+def _png_size(data: bytes) -> tuple[int, int]:
+    """Width/height from a PNG's IHDR, so the screenshot reply states the
+    REAL pixel frame the model is looking at rather than what was asked for."""
+    if len(data) >= 24 and data[:8] == b"\x89PNG\r\n\x1a\n":
+        w, h = struct.unpack(">II", data[16:24])
+        return int(w), int(h)
+    return 0, 0
+
+
+def _is_textual(content_type: str) -> bool:
+    ct = content_type.lower()
+    return any(marker in ct for marker in _TEXTUAL_CONTENT_TYPES)
+
+
+def _redact_headers(headers: dict[str, str]) -> dict[str, str]:
+    return {k: ("<redacted>" if k.lower() in _SECRET_HEADERS else v) for k, v in headers.items()}
 
 
 def _truncate_url(url: str) -> str:
@@ -226,7 +283,7 @@ _TWO_STEP_PASSWORD_TIMEOUT_MS = 15000
 # the operator gets a loud log rather than silent data loss.
 _RESTORE_GUARD_EXHAUSTED_ATTEMPTS = 3
 
-# Chrome's user-data-dir runs LIVE on the tenant volume, so every cookie/login/
+# Chrome's user-data-dir runs LIVE on the data volume, so every cookie/login/
 # IndexedDB write is durable the moment Chrome makes it. The two costs are
 # handled at their owners: Chrome's dangling Singleton* lock symlinks are
 # cleared by US at every launch + container boot under a per-profile flock, and
@@ -280,7 +337,7 @@ def _clear_singleton_locks(profile_dir: str) -> None:
 # weight; the GPU/shader/crx/Service-Worker tail is un-relocatable but equally
 # regenerable. Deleting at launch keeps the on-PVC profile to durable state
 # (cookies/logins/IndexedDB) and stops cache syncing to S3 — the
-# WorkspaceTenantBloat cause. Paths relative to the profile dir (root +
+# volume-bloat cause. Paths relative to the profile dir (root +
 # `Default`). See docs/plan/20260810T182738Z-cobrowse-profile-footprint.md.
 _REGENERABLE_CACHE_SUBDIRS = (
     "Cache",
@@ -349,7 +406,7 @@ def purge_regenerable_cache(profile_dir: str) -> int:
 
 def clear_stale_profile_locks(base_dir: str) -> int:
     """Container-boot hygiene: remove stale ``Singleton*`` left by hard-killed
-    pods so the tenant-volume S3 sync runs clean. Each profile is tried under a
+    pods so the data volume's S3 sync runs clean. Each profile is tried under a
     NON-blocking flock — a held lock means another pod's live Chrome owns it,
     and we must not touch its locks. Returns the profile count swept.
     Best-effort: a boot sweep must never block serving."""
@@ -385,7 +442,11 @@ def clear_stale_profile_locks(base_dir: str) -> int:
 
 class BrowserDriver(Protocol):
     """Everything the pod needs from ONE browser session (with N tabs). Async
-    throughout — every method touches the browser over CDP."""
+    throughout — every method touches the browser over CDP. Agent-facing
+    methods act on the ACTIVE tab; the handler activates the tab the call
+    names first (:meth:`activate_num`)."""
+
+    # --- tabs ---------------------------------------------------------------
 
     async def open(self, url: str, *, new_tab: bool = False) -> str:
         """Navigate (optionally in a new tab) and return the landed page's
@@ -394,80 +455,143 @@ class BrowserDriver(Protocol):
         ...
 
     async def list_tabs(self) -> list[dict[str, Any]]:
-        """The open tabs as ``[{id, title, url, active}]`` in tab order."""
+        """The open tabs as ``[{id, tabId, title, url, active, loaded}]``."""
         ...
 
     async def switch_tab(self, tab_id: str) -> bool:
-        """Make ``tab_id`` active (screencast + actions follow it). False if
-        unknown."""
+        """Make ``tab_id`` (``t<N>``) active. False if unknown. Human plane."""
         ...
 
     async def close_tab(self, tab_id: str) -> bool:
         """Close a tab; if it was active, activate another. Never leaves zero
-        tabs (opens a blank one). False if unknown."""
+        tabs. False if unknown. Human plane."""
         ...
 
-    async def snapshot(self) -> list[Element]:
-        """Return the active tab's raw interactable-element list (UN-redacted;
-        the caller redacts — see :mod:`src.snapshot`)."""
+    async def activate_num(self, tab_num: int) -> bool:
+        """Make tab number ``tab_num`` active (agent plane). False if unknown."""
         ...
 
-    async def click(self, ref: str) -> None: ...
-
-    async def type_text(self, ref: str, text: str) -> str:
-        """Type into the ref'd field. Returns ``"ok"``, or ``"ok — note: …"``
-        when the field's post-type value differs from what was typed or the
-        field is an autocomplete (see :func:`_type_note`)."""
+    async def new_tab(self) -> int:
+        """Open a blank tab, activate it, return its number."""
         ...
 
-    async def scroll(self, direction: str, amount: int) -> None: ...
+    async def close_tab_num(self, tab_num: int) -> bool: ...
 
-    # --- reading / understanding (view-only) --------------------------------
-
-    async def read(self) -> str:
-        """The active tab's readable text (main content, capped)."""
+    def active_num(self) -> int:
+        """The active tab's number."""
         ...
 
-    async def find_text(self, query: str) -> dict[str, Any]:
-        """Find ``query`` on the page; scroll the first hit into view. Returns
-        ``{count, snippet}``."""
+    # --- the tree + refs (view-only) ----------------------------------------
+
+    async def read_page(
+        self, *, depth: int | None = None, boxes: bool = False, ref_id: str | None = None
+    ) -> str:
+        """The active frame's accessibility tree with refs (raw, uncapped;
+        password values blanked). Registers its refs for the tab's current
+        document."""
         ...
 
-    async def screenshot(self) -> bytes: ...
-
-    async def inspect(self, ref: str) -> dict[str, Any]:
-        """Details of one element (tag, attributes, text, box, visible/enabled)."""
+    async def page_text(self) -> dict[str, Any]:
+        """``{title, url, source, text}`` — the readable text of the main
+        content (article/main first), uncapped."""
         ...
 
-    async def get_table(self, ref: str | None = None) -> list[list[list[str]]]:
-        """Extract HTML tables as ``[table][row][cell]``. ``ref`` = one table;
-        None = all tables on the page."""
+    async def screenshot(
+        self, *, scale: float = 1.0, region: tuple[int, int, int, int] | None = None
+    ) -> tuple[bytes, dict[str, Any]]:
+        """PNG plus ``{width, height, image_width, image_height, scale, region}``
+        — the CSS-px frame captured and the real pixel size of the image."""
         ...
 
-    # --- history / reliability (view-only) ----------------------------------
+    async def secret_values(self) -> list[str]:
+        """Values currently typed into password fields on the active tab (all
+        frames) — for outbound redaction only; never returned to the agent."""
+        ...
+
+    # --- `computer` actions (mutating — approved in chat) --------------------
+
+    async def click(
+        self,
+        *,
+        ref: str | None = None,
+        coordinate: tuple[int, int] | None = None,
+        button: str = "left",
+        count: int = 1,
+        modifiers: list[str] | None = None,
+    ) -> str: ...
+
+    async def type_text(self, text: str, *, ref: str | None = None) -> str:
+        """Type ``text`` (keystrokes) into the focused element, focusing ``ref``
+        first when given. Returns ``"ok"`` or ``"ok — note: …"`` (see
+        :func:`_type_note`)."""
+        ...
+
+    async def press_keys(self, combo: str, *, repeat: int = 1) -> None: ...
+
+    async def scroll(
+        self,
+        direction: str,
+        amount: int,
+        *,
+        coordinate: tuple[int, int] | None = None,
+        ref: str | None = None,
+    ) -> None: ...
+
+    async def scroll_to(self, ref: str) -> bool: ...
+
+    async def hover(
+        self, *, ref: str | None = None, coordinate: tuple[int, int] | None = None
+    ) -> None: ...
+
+    async def drag(self, start: tuple[int, int], end: tuple[int, int]) -> None: ...
+
+    async def wait(self, seconds: float) -> None: ...
+
+    async def form_input(self, ref: str, value: str | bool | float) -> str:
+        """Set a field's value: fill a text field, choose a select option,
+        check/uncheck a box. Returns ``"ok"`` or a read-back note."""
+        ...
+
+    async def upload_files(self, ref: str, paths: list[str]) -> None: ...
+
+    async def download(self, ref: str, dest_path: str) -> dict[str, Any]:
+        """Click ``ref`` to trigger a download and save it to ``dest_path``.
+        Returns ``{filename, saved}``."""
+        ...
+
+    async def eval_js(self, js: str) -> dict[str, Any]:
+        """Run ``js`` via evaluate; ``{result}`` or ``{error}`` — never raises."""
+        ...
+
+    # --- settling + "what changed" -------------------------------------------
+
+    def state_marker(self) -> dict[str, Any]:
+        """A marker taken BEFORE a mutating action; :meth:`settle` compares."""
+        ...
+
+    async def settle(self, marker: dict[str, Any]) -> list[str]:
+        """Wait for the page to settle after an action and return what changed
+        since ``marker``: a navigation, a new tab, a dialog."""
+        ...
+
+    # --- history / waiting -------------------------------------------------
 
     async def go_back(self) -> None: ...
 
     async def go_forward(self) -> None: ...
 
-    async def reload(self) -> None: ...
-
-    async def wait_for(self, *, text: str | None, selector: str | None, timeout_ms: int) -> bool:
-        """Wait until ``text`` appears (or CSS ``selector`` matches). False on
+    async def wait_for(
+        self,
+        *,
+        text: str | None,
+        selector: str | None,
+        url: str | None = None,
+        response: str | None = None,
+        timeout_ms: int,
+    ) -> bool:
+        """Wait until ``text`` appears, CSS ``selector`` matches, the page URL
+        contains ``url``, or a response URL contains ``response``. False on
         timeout."""
-        ...
-
-    # --- extra actions (mutating — approved in chat) ------------------------
-
-    async def press_key(self, key: str) -> None: ...
-
-    async def select_option(self, ref: str, value: str) -> None: ...
-
-    async def upload_file(self, ref: str, path: str) -> None: ...
-
-    async def download(self, ref: str, dest_path: str) -> dict[str, Any]:
-        """Click ``ref`` to trigger a download and save it to ``dest_path`` on the
-        tenant volume. Returns ``{filename, saved}``."""
         ...
 
     # --- frames (active-frame model, like active-tab) -----------------------
@@ -491,41 +615,22 @@ class BrowserDriver(Protocol):
 
     # --- console / network observability ------------------------------------
 
-    async def console_log(self) -> list[dict[str, Any]]:
-        """Recent console messages of the active tab as ``[{type, text}]``."""
-        ...
+    async def console_messages(
+        self, *, pattern: str | None, only_errors: bool, limit: int, clear: bool
+    ) -> list[dict[str, Any]]: ...
 
-    async def network_log(
-        self, *, url_substring: str | None = None, limit: int = 100
+    async def network_requests(
+        self, *, url_pattern: str | None, limit: int, clear: bool
     ) -> list[dict[str, Any]]:
-        """Recent network entries as ``[{method, url, status, resource_type}]``."""
+        """Numbered entries ``[{index, method, url, status, resource_type, size}]``
+        — no headers, no bodies."""
         ...
 
-    async def wait_for_response(self, url_substring: str, timeout_ms: int) -> dict[str, Any]:
-        """Wait for a response whose URL contains ``url_substring``. ``{matched, status, url}``."""
+    async def network_request(self, index: int) -> dict[str, Any] | None:
+        """One entry in full (headers unredacted, bodies) or None."""
         ...
 
-    # --- interaction extras -------------------------------------------------
-
-    async def hover(self, ref: str) -> None: ...
-
-    async def drag(self, from_ref: str, to_ref: str) -> None: ...
-
-    async def scroll_to(self, ref: str) -> bool:
-        """Scroll ``ref`` into view. False if the ref isn't on the page."""
-        ...
-
-    async def get_options(self, ref: str) -> list[dict[str, Any]]:
-        """A native ``<select>``'s options as ``[{value, label, selected}]``."""
-        ...
-
-    async def get_links(self, cap: int = 200) -> list[dict[str, str]]:
-        """All anchors as ``[{text, href}]`` (absolute), capped at ``cap``."""
-        ...
-
-    async def eval_js(self, js: str) -> dict[str, Any]:
-        """Run ``js`` via evaluate; ``{result}`` or ``{error}`` — never raises."""
-        ...
+    # --- login (the credential never enters the agent's context) -----------
 
     async def fill_login(self, username: str, password: str) -> bool:
         """Best-effort: find the active tab's username + password fields, fill
@@ -545,8 +650,10 @@ class BrowserDriver(Protocol):
         ...
 
     async def nav_state(self) -> dict[str, Any]:
-        """Active tab's ``{url, title, can_go_back, can_go_forward}``."""
+        """Active tab's ``{url, title, loaded, can_go_back, can_go_forward}``."""
         ...
+
+    # --- the human plane (screencast, input, viewport) ----------------------
 
     async def add_frame_sink(self, sink: Callable[[str, dict[str, Any]], Awaitable[None]]) -> str:
         """Register a viewer's frame sink and report what this viewer got NOW.
@@ -647,8 +754,22 @@ class _Tab:
 
     def __init__(self, tab_id: str, page: Any, cdp: Any) -> None:
         self.id = tab_id
+        # The number the agent addresses this tab by (``t7`` → 7). The human
+        # plane keeps the string id; the two never diverge because both come
+        # from _next_tab_id.
+        self.num = int(tab_id[1:]) if tab_id[1:].isdigit() else 0
         self.page = page
         self.cdp = cdp
+        # Refs are valid for ONE document: every main-frame navigation bumps
+        # the epoch, read_page records the epoch its refs belong to, and a ref
+        # from an older epoch is refused by name (StaleRefError) rather than
+        # re-resolved against whatever now happens to carry it.
+        self.doc_epoch = 0
+        self.refs: set[str] = set()
+        self.refs_epoch = -1
+        # Network entries are numbered per tab so get_network_request(index)
+        # is stable while the ring rotates.
+        self.net_seq = 0
         # The Page.screencastFrame listener bound to THIS tab's CDP session while
         # streaming (None otherwise). Stored so removal targets the exact callable
         # registered — pyee removes by identity, and a per-tab closure acks a late
@@ -684,7 +805,7 @@ class PlaywrightDriver:
         executable_path: str | None = None,
     ) -> None:
         self._viewport = viewport
-        # Chrome's user-data-dir, LIVE on the tenant volume (see the module-level
+        # Chrome's user-data-dir, LIVE on the data volume (see the module-level
         # durability block). None → fully ephemeral context (unit/CI runs).
         self._profile_dir = profile_dir or None
         # Regenerable disk cache redirected to a PER-SESSION node-disk emptyDir
@@ -732,9 +853,18 @@ class PlaywrightDriver:
         self._capturing_cdp: Any = None
         # Native JS dialog policy. Default DISMISS — auto-accepting a confirm
         # would silently OK a "Delete?"/beforeunload with no human in the loop;
-        # accept is opted into via the approval-gated browser_set_dialog_mode.
+        # accept is opted into via the approval-gated set_dialog_mode.
         self._dialog_mode = "dismiss"
         self._last_dialog: dict[str, Any] | None = None
+        # Every handled dialog, numbered, so a reply can say which dialogs
+        # fired since the action it reports on.
+        self._dialog_seq = 0
+        self._dialog_log: deque[dict[str, Any]] = deque(maxlen=_DIALOG_LOG)
+        # Pages reach the tab list by two routes — our own new_page() and the
+        # context's "page" event (a popup, a target=_blank link). The lock +
+        # identity check make each page exactly one tab. Created in start():
+        # __init__ can run off a loop.
+        self._adopt_lock = asyncio.Lock()
         # Cleaned UA (Headless token stripped), computed once from the browser's
         # own UA at start() and pushed onto every tab's CDP session. None when
         # the UA needs no cleaning.
@@ -770,17 +900,61 @@ class PlaywrightDriver:
         with contextlib.suppress(Exception):
             await page.set_viewport_size({"width": self._viewport[0], "height": self._viewport[1]})
 
-    async def _new_page_tab(self) -> _Tab:
-        page = await self._context.new_page()
+    async def _register_page(self, page: Any) -> _Tab:
+        """Make ``page`` a tab: viewport, dialog handler, CDP session, UA,
+        observers, close hook. The ONE registration path, whichever route the
+        page arrived by."""
         await self._match_viewport(page)  # keep a human resize across new tabs
-        self._install_dialog_handler(page)  # cover every new tab before it navigates
+        self._install_dialog_handler(page)  # cover every tab before it navigates
         cdp = await self._context.new_cdp_session(page)
         await self._apply_ua_override(cdp)  # every tab carries the cleaned UA
         tab = _Tab(self._next_tab_id(), page, cdp)
         self._install_observers(tab)
         self._tabs.append(tab)
         metrics.add_open_tabs(1)
+
+        def on_close() -> None:
+            # A page the SITE closed (window.close, a popup that finished): drop
+            # it from the list so the agent and the tab strip stop seeing it.
+            with contextlib.suppress(Exception):
+                asyncio.get_running_loop().create_task(self._on_page_closed(tab))
+
+        page.on("close", on_close)
         return tab
+
+    async def _on_page_closed(self, tab: _Tab) -> None:
+        if tab not in self._tabs:
+            return
+        was_active = tab.id == self._active_id
+        self._tabs = [t for t in self._tabs if t is not tab]
+        metrics.add_open_tabs(-1)
+        if not self._tabs:
+            fresh = await self._new_page_tab()
+            self._active_id = None
+            await self._activate(fresh.id)
+        elif was_active:
+            self._active_id = None
+            await self._activate(self._tabs[0].id)
+        self._persist_open_tabs()
+
+    async def _on_context_page(self, page: Any) -> None:
+        """The context's ``page`` event: a popup / target=_blank / window.open
+        the SITE opened. Adopted as a tab so the agent can address it (the
+        reply names it as ``Opened tab N``). Our own new_page() calls also fire
+        this; the lock + identity check make them a no-op here."""
+        async with self._adopt_lock:
+            if any(t.page is page for t in self._tabs):
+                return
+            with contextlib.suppress(Exception):
+                tab = await self._register_page(page)
+                log.info(
+                    "cobrowse adopted a site-opened tab id=%s tabs=%d", tab.id, len(self._tabs)
+                )
+
+    async def _new_page_tab(self) -> _Tab:
+        async with self._adopt_lock:
+            page = await self._context.new_page()
+            return await self._register_page(page)
 
     async def _apply_ua_override(self, cdp: Any) -> None:
         """Push the cleaned UA onto one tab's CDP session. No-op until start() has
@@ -793,7 +967,7 @@ class PlaywrightDriver:
 
     async def start(self) -> None:
         """Launch Chromium + open the first tab. With ``profile_dir`` set, runs
-        a persistent user-data-dir live on the tenant volume: takes the
+        a persistent user-data-dir live on the data volume: takes the
         per-profile flock, reverse-migrates an archive-era ``profile.tar.gz``,
         clears stale Singleton* locks. Without one, a throwaway ephemeral
         context (unit/CI, or a pod with no volume)."""
@@ -829,6 +1003,7 @@ class PlaywrightDriver:
                 )
                 first = await self._new_page_tab()
             self._active_id = first.id
+            self._context.on("page", self._on_context_page)  # popups become tabs
             await self._prime_ua_override(first)  # UA set before any restore navigation
             if self._profile_dir:
                 self._tab_persist_wake = asyncio.Event()
@@ -1220,16 +1395,10 @@ class PlaywrightDriver:
     async def _adopt_first_tab(self) -> _Tab:
         """A persistent context opens with one blank page — adopt it as tab 1
         rather than spawning a second (else every restart accretes a blank tab)."""
-        pages = list(self._context.pages)
-        page = pages[0] if pages else await self._context.new_page()
-        await self._match_viewport(page)  # a restored profile may reopen at a resized size
-        self._install_dialog_handler(page)  # cover the first (adopted) tab too
-        cdp = await self._context.new_cdp_session(page)
-        tab = _Tab(self._next_tab_id(), page, cdp)
-        self._install_observers(tab)
-        self._tabs.append(tab)
-        metrics.add_open_tabs(1)
-        return tab
+        async with self._adopt_lock:
+            pages = list(self._context.pages)
+            page = pages[0] if pages else await self._context.new_page()
+            return await self._register_page(page)
 
     # --- native dialogs (alert/confirm/prompt/beforeunload) -----------------
 
@@ -1247,6 +1416,9 @@ class PlaywrightDriver:
                 "url": page.url,
             }
             self._last_dialog = info
+            self._dialog_seq += 1
+            info["seq"] = self._dialog_seq
+            self._dialog_log.append(info)
             metrics.inc_dialog(str(dialog.type), self._dialog_mode)
             # NEVER leave it unhandled (that blocks the page). accept()/dismiss()
             # can raise if Chromium already freed the dialog (navigation/close) —
@@ -1272,8 +1444,8 @@ class PlaywrightDriver:
     # --- console + network observability (bounded per-tab rings) -------------
 
     def _install_observers(self, tab: _Tab) -> None:
-        """Wire the console + network rings onto one tab's page. Idempotent so
-        re-adopting a tab never double-registers."""
+        """Wire the console + network rings and the document epoch onto one
+        tab's page. Idempotent so re-adopting a tab never double-registers."""
         if tab._observers_installed:
             return
         tab._observers_installed = True
@@ -1290,36 +1462,40 @@ class PlaywrightDriver:
             with contextlib.suppress(Exception):
                 tab.console_ring.append({"type": "error", "text": str(exc)[:_CONSOLE_TEXT_CAP]})
 
-        def on_response(resp: Any) -> None:
+        async def on_response(resp: Any) -> None:
             with contextlib.suppress(Exception):
-                req = resp.request
-                tab.network_ring.append(
-                    {
-                        "method": str(req.method),
-                        "url": _truncate_url(resp.url),
-                        "status": int(resp.status),
-                        "resource_type": str(req.resource_type),
-                    }
-                )
+                await self._record_response(tab, resp)
 
         def on_request_failed(req: Any) -> None:
             # A request with no response (blocked/DNS/aborted/CORS) — status 0.
             with contextlib.suppress(Exception):
+                tab.net_seq += 1
                 tab.network_ring.append(
                     {
+                        "index": tab.net_seq,
                         "method": str(req.method),
                         "url": _truncate_url(req.url),
                         "status": 0,
                         "resource_type": str(req.resource_type),
+                        "size": 0,
+                        "request_headers": dict(req.headers),
+                        "response_headers": {},
+                        "request_body": None,
+                        "response_body": None,
+                        "body_truncated": False,
+                        "content_type": "",
                     }
                 )
 
         def on_frame_navigated(frame: Any) -> None:
-            # A MAIN-frame navigation changed this tab's URL (agent nav, human nav,
-            # OR a click that followed a link) — re-record the open-tab set so a
-            # restart reopens the page it's actually on. Subframe navs are ignored.
+            # A MAIN-frame navigation changed this tab's document (agent nav,
+            # human nav, OR a click that followed a link): the refs of the old
+            # document are dead — bump the epoch so they are refused by name —
+            # and re-record the open-tab set so a restart reopens the page it's
+            # actually on. Subframe navs are ignored.
             with contextlib.suppress(Exception):
                 if frame is page.main_frame:
+                    tab.doc_epoch += 1
                     self._persist_open_tabs()
 
         page.on("console", on_console)
@@ -1328,31 +1504,92 @@ class PlaywrightDriver:
         page.on("requestfailed", on_request_failed)
         page.on("framenavigated", on_frame_navigated)
 
-    async def console_log(self) -> list[dict[str, Any]]:
-        return list(self._active().console_ring)
+    async def _record_response(self, tab: _Tab, resp: Any) -> None:
+        """One network entry, with headers and — for the request kinds a
+        page's data rides on, when textual and small enough — the bodies. The
+        entry is complete when appended, so a reader never sees a body that
+        is still arriving."""
+        req = resp.request
+        rtype = str(req.resource_type)
+        headers = dict(resp.headers)
+        content_type = str(headers.get("content-type", ""))
+        response_body: str | None = None
+        truncated = False
+        if rtype in _BODY_RESOURCE_TYPES and _is_textual(content_type):
+            with contextlib.suppress(Exception):
+                raw = await resp.body()
+                truncated = len(raw) > _BODY_CAP
+                response_body = raw[:_BODY_CAP].decode("utf-8", errors="replace")
+        request_body: str | None = None
+        with contextlib.suppress(Exception):
+            post = req.post_data
+            if post:
+                request_body = str(post)[:_BODY_CAP]
+        size = 0
+        with contextlib.suppress(Exception):
+            size = int(headers.get("content-length") or 0)
+        if response_body is not None and not size:
+            size = len(response_body)
+        tab.net_seq += 1
+        tab.network_ring.append(
+            {
+                "index": tab.net_seq,
+                "method": str(req.method),
+                "url": _truncate_url(resp.url),
+                "status": int(resp.status),
+                "resource_type": rtype,
+                "size": size,
+                "request_headers": dict(req.headers),
+                "response_headers": headers,
+                "request_body": request_body,
+                "response_body": response_body,
+                "body_truncated": truncated,
+                "content_type": content_type,
+            }
+        )
 
-    async def network_log(
-        self, *, url_substring: str | None = None, limit: int = 100
+    async def console_messages(
+        self, *, pattern: str | None, only_errors: bool, limit: int, clear: bool
     ) -> list[dict[str, Any]]:
-        entries = list(self._active().network_ring)
-        if url_substring:
-            needle = url_substring.lower()
-            entries = [e for e in entries if needle in e["url"].lower()]
+        tab = self._active()
+        entries = list(tab.console_ring)
+        if only_errors:
+            entries = [e for e in entries if e["type"] in ("error", "warning")]
+        if pattern:
+            try:
+                rx = re.compile(pattern, re.IGNORECASE)
+            except re.error:
+                rx = re.compile(re.escape(pattern), re.IGNORECASE)
+            entries = [e for e in entries if rx.search(e["text"])]
         if limit > 0:
             entries = entries[-limit:]
+        if clear:
+            tab.console_ring.clear()
         return entries
 
-    async def wait_for_response(self, url_substring: str, timeout_ms: int) -> dict[str, Any]:
-        page = self._active().page
-        needle = url_substring.lower()
-        try:
-            async with page.expect_response(
-                lambda r: needle in r.url.lower(), timeout=float(timeout_ms)
-            ) as info:
-                resp = await info.value
-            return {"matched": True, "status": int(resp.status), "url": _truncate_url(resp.url)}
-        except Exception:
-            return {"matched": False, "status": 0, "url": ""}
+    async def network_requests(
+        self, *, url_pattern: str | None, limit: int, clear: bool
+    ) -> list[dict[str, Any]]:
+        tab = self._active()
+        entries = list(tab.network_ring)
+        if url_pattern:
+            try:
+                rx = re.compile(url_pattern, re.IGNORECASE)
+            except re.error:
+                rx = re.compile(re.escape(url_pattern), re.IGNORECASE)
+            entries = [e for e in entries if rx.search(e["url"])]
+        if limit > 0:
+            entries = entries[-limit:]
+        if clear:
+            tab.network_ring.clear()
+        keys = ("index", "method", "url", "status", "resource_type", "size")
+        return [{k: e[k] for k in keys} for e in entries]
+
+    async def network_request(self, index: int) -> dict[str, Any] | None:
+        for entry in self._active().network_ring:
+            if entry["index"] == index:
+                return dict(entry)
+        return None
 
     # --- frames / iframes ---------------------------------------------------
 
@@ -1478,6 +1715,7 @@ class PlaywrightDriver:
             out.append(
                 {
                     "id": t.id,
+                    "tabId": t.num,
                     "title": title,
                     "url": _tab_url(t),
                     "active": t.id == self._active_id,
@@ -1492,6 +1730,37 @@ class PlaywrightDriver:
         await self._activate(tab_id)
         self._persist_open_tabs()  # record the new active tab
         return True
+
+    def _tab_by_num(self, tab_num: int) -> _Tab | None:
+        return next((t for t in self._tabs if t.num == tab_num), None)
+
+    def active_num(self) -> int:
+        return self._active().num
+
+    async def activate_num(self, tab_num: int) -> bool:
+        tab = self._tab_by_num(tab_num)
+        if tab is None:
+            return False
+        if tab.id != self._active_id:
+            await self._activate(tab.id)
+            self._persist_open_tabs()
+        return True
+
+    async def new_tab(self) -> int:
+        tab = await self._new_page_tab()
+        log.info(
+            "cobrowse new tab id=%s tabs=%d mem=%s",
+            tab.id,
+            len(self._tabs),
+            await _memory_snapshot(),
+        )
+        await self._activate(tab.id)
+        self._persist_open_tabs()
+        return tab.num
+
+    async def close_tab_num(self, tab_num: int) -> bool:
+        tab = self._tab_by_num(tab_num)
+        return False if tab is None else await self.close_tab(tab.id)
 
     async def close_tab(self, tab_id: str) -> bool:
         tab = next((t for t in self._tabs if t.id == tab_id), None)
@@ -1538,69 +1807,323 @@ class PlaywrightDriver:
             self._expect_repaint("tab_switch")
             await self._start_screencast_on(self._active())
 
-    # --- page actions (on the active tab) -----------------------------------
+    # --- the tree + refs ----------------------------------------------------
 
-    async def snapshot(self) -> list[Element]:
-        # Snapshot the ACTIVE FRAME (main by default; a child after switch_frame).
-        # data-cobrowse-ref attributes are written into that frame's document, so
-        # click/type/etc. resolve refs in the same frame.
-        raw = await self._active_frame().evaluate(_SNAPSHOT_JS)
-        return list(raw)
+    def _check_ref(self, tab: _Tab, ref: str) -> None:
+        """Refuse a ref that cannot mean anything on this tab NOW. Three
+        cases, three messages, each naming the corrective call."""
+        if tab.refs_epoch < 0:
+            raise StaleRefError(
+                f"No read_page has been taken for tab {tab.num} yet — call read_page "
+                "(or find) first and use the refs it returns."
+            )
+        if tab.refs_epoch != tab.doc_epoch:
+            raise StaleRefError(
+                f"{ref} is from a previous page (tab {tab.num} navigated since that "
+                "read_page) — call read_page again for fresh refs."
+            )
+        if ref not in tab.refs:
+            raise StaleRefError(
+                f"{ref} is not in the latest read_page of tab {tab.num} — call read_page "
+                "(or find) again and use a ref it returns."
+            )
 
-    async def click(self, ref: str) -> None:
+    def _ref_locator(self, tab: _Tab, ref: str) -> Any:
+        self._check_ref(tab, ref)
+        return self._active_frame().locator(f"aria-ref={ref}")
+
+    async def read_page(
+        self, *, depth: int | None = None, boxes: bool = False, ref_id: str | None = None
+    ) -> str:
+        # Playwright's own refs tree (mode="ai"): a ref per visible pointer-
+        # receiving node, stable per document — measured 287/287 refs kept
+        # across a re-read of a live retail home page (2026-09-15).
+        tab = self._active()
+        frame = self._active_frame()
+        kwargs: dict[str, Any] = {"mode": "ai"}
+        if depth is not None:
+            kwargs["depth"] = depth
+        if boxes:
+            kwargs["boxes"] = True
+        if ref_id:
+            tree = await self._ref_locator(tab, ref_id).aria_snapshot(**kwargs)
+        elif frame is tab.page.main_frame:
+            tree = await tab.page.aria_snapshot(**kwargs)
+        else:
+            tree = await frame.locator(":root").aria_snapshot(**kwargs)
+        text = str(tree)
+        # A subtree read ADDS refs; a full read is the new set.
+        tab.refs = (tab.refs | refs_in(text)) if ref_id else refs_in(text)
+        tab.refs_epoch = tab.doc_epoch
+        # Capture-time blanking: the tree prints a textbox's value, so after a
+        # login it would print the password. Blank by VALUE, so a mislabelled
+        # field is covered too.
+        return redact_values(text, await self.secret_values())
+
+    async def secret_values(self) -> list[str]:
+        out: list[str] = []
+        for fr in list(self._active().page.frames):
+            with contextlib.suppress(Exception):
+                vals = await fr.evaluate(_MASKED_FIELD_VALUES_JS)
+                out.extend(str(v) for v in vals if v)
+        return out
+
+    async def page_text(self) -> dict[str, Any]:
+        raw = await self._active().page.evaluate(_PAGE_TEXT_JS)
+        out = dict(raw) if isinstance(raw, dict) else {"text": str(raw)}
+        out["text"] = redact_values(str(out.get("text", "")), await self.secret_values())
+        return out
+
+    async def screenshot(
+        self, *, scale: float = 1.0, region: tuple[int, int, int, int] | None = None
+    ) -> tuple[bytes, dict[str, Any]]:
+        # CDP directly, so `scale` and a `region` cost no image library: the
+        # clip's scale is relative to CSS px, and the context renders at
+        # _DEVICE_SCALE, so a requested 1.0 maps to 1 image px per CSS px.
+        tab = self._active()
+        w, h = self._viewport
+        if region:
+            x0, y0, x1, y1 = region
+            clip = {"x": x0, "y": y0, "width": max(1, x1 - x0), "height": max(1, y1 - y0)}
+        else:
+            clip = {"x": 0, "y": 0, "width": w, "height": h}
+        res = await tab.cdp.send(
+            "Page.captureScreenshot",
+            {"format": "png", "clip": {**clip, "scale": scale / _DEVICE_SCALE}},
+        )
+        data = base64.b64decode(res["data"])
+        iw, ih = _png_size(data)
+        meta = {
+            "width": int(clip["width"]),
+            "height": int(clip["height"]),
+            "x": int(clip["x"]),
+            "y": int(clip["y"]),
+            "image_width": iw,
+            "image_height": ih,
+            "scale": scale,
+            "region": list(region) if region else None,
+        }
+        return data, meta
+
+    # --- `computer` actions (on the active tab) -----------------------------
+
+    async def click(
+        self,
+        *,
+        ref: str | None = None,
+        coordinate: tuple[int, int] | None = None,
+        button: str = "left",
+        count: int = 1,
+        modifiers: list[str] | None = None,
+    ) -> str:
+        tab = self._active()
+        mods = list(modifiers or [])
+        if ref:
+            loc = self._ref_locator(tab, ref)
+            try:
+                await loc.click(
+                    button=button, click_count=count, modifiers=mods, timeout=_ACTION_TIMEOUT_MS
+                )
+            except Exception as exc:
+                raise _action_error("click", ref, exc) from exc
+            return f"Clicked {ref}"
+        if coordinate is None:
+            raise ValueError("click needs a ref or a coordinate")
+        x, y = coordinate
+        for m in mods:
+            await tab.page.keyboard.down(m)
         try:
-            await self._active_frame().click(f"[data-cobrowse-ref='{ref}']")
-        except Exception as e:
-            _raise_ref_action_error("click", ref, e)
+            await tab.page.mouse.click(x, y, button=button, click_count=count)
+        finally:
+            for m in reversed(mods):
+                with contextlib.suppress(Exception):
+                    await tab.page.keyboard.up(m)
+        return f"Clicked at ({x}, {y})"
 
-    async def type_text(self, ref: str, text: str) -> str:
-        selector = f"[data-cobrowse-ref='{ref}']"
-        try:
-            await self._active_frame().fill(selector, text)
-        except Exception as e:
-            _raise_ref_action_error("type", ref, e)
+    async def type_text(self, text: str, *, ref: str | None = None) -> str:
+        tab = self._active()
+        loc: Any = None
+        if ref:
+            loc = self._ref_locator(tab, ref)
+            try:
+                await loc.click(timeout=_ACTION_TIMEOUT_MS)  # focus it first
+            except Exception as exc:
+                raise _action_error("type into", ref, exc) from exc
+        await tab.page.keyboard.type(text)
+        if loc is None:
+            return "ok"
         # Read the field BACK (best-effort): pages reformat/restrict input and
         # autocomplete widgets pop suggestions, and without a read-back the
-        # agent only learns at submit time — one wasted turn to discover, one
-        # to diagnose. The fill above already succeeded, so a failed read-back
-        # degrades to a bare "ok", never to an error.
+        # agent only learns at submit time. The typing already happened, so a
+        # failed read-back degrades to a bare "ok", never to an error.
         observed: dict[str, Any] | None = None
         with contextlib.suppress(Exception):
-            raw = await self._active_frame().evaluate(_TYPE_READBACK_JS, selector)
+            raw = await loc.evaluate(_TYPE_READBACK_JS)
             observed = dict(raw) if raw else None
         return _type_note(text, observed)
 
-    async def scroll(self, direction: str, amount: int) -> None:
-        dy = -amount if direction == "up" else amount
-        await self._active().page.mouse.wheel(0, dy)
+    async def press_keys(self, combo: str, *, repeat: int = 1) -> None:
+        key = to_playwright_combo(combo)
+        page = self._active().page
+        for _ in range(max(1, repeat)):
+            await page.keyboard.press(key)
 
-    # --- reading / understanding --------------------------------------------
+    async def scroll(
+        self,
+        direction: str,
+        amount: int,
+        *,
+        coordinate: tuple[int, int] | None = None,
+        ref: str | None = None,
+    ) -> None:
+        tab = self._active()
+        if ref:
+            await self._ref_locator(tab, ref).hover(timeout=_ACTION_TIMEOUT_MS)
+        elif coordinate is not None:
+            await tab.page.mouse.move(coordinate[0], coordinate[1])
+        px = max(0, int(amount)) * 100
+        dx, dy = {
+            "up": (0, -px),
+            "down": (0, px),
+            "left": (-px, 0),
+            "right": (px, 0),
+        }.get(str(direction).lower(), (0, px))
+        await tab.page.mouse.wheel(dx, dy)
 
-    async def read(self) -> str:
-        raw = await self._active().page.evaluate(_READ_JS)
-        return str(raw)
+    async def scroll_to(self, ref: str) -> bool:
+        loc = self._ref_locator(self._active(), ref)
+        try:
+            await loc.scroll_into_view_if_needed(timeout=_ACTION_TIMEOUT_MS)
+        except Exception:
+            return False
+        return True
 
-    async def find_text(self, query: str) -> dict[str, Any]:
-        result = await self._active().page.evaluate(_FIND_JS, query)
-        return dict(result)
+    async def hover(
+        self, *, ref: str | None = None, coordinate: tuple[int, int] | None = None
+    ) -> None:
+        tab = self._active()
+        if ref:
+            try:
+                await self._ref_locator(tab, ref).hover(timeout=_ACTION_TIMEOUT_MS)
+            except Exception as exc:
+                raise _action_error("hover", ref, exc) from exc
+            return
+        if coordinate is None:
+            raise ValueError("hover needs a ref or a coordinate")
+        await tab.page.mouse.move(coordinate[0], coordinate[1])
 
-    async def screenshot(self) -> bytes:
-        # scale="css" (Playwright defaults to "device"): the 2x _DEVICE_SCALE
-        # exists for the HUMAN screencast — without this cap every agent
-        # screenshot would carry 4x the pixels into model context, a silent
-        # per-step token-cost multiplier on every tenant's browsing.
-        data = await self._active().page.screenshot(type="png", scale="css")
-        return bytes(data)
+    async def drag(self, start: tuple[int, int], end: tuple[int, int]) -> None:
+        mouse = self._active().page.mouse
+        await mouse.move(start[0], start[1])
+        await mouse.down()
+        await mouse.move(end[0], end[1], steps=12)
+        await mouse.up()
 
-    async def inspect(self, ref: str) -> dict[str, Any]:
-        result = await self._active().page.evaluate(_INSPECT_JS, ref)
-        return dict(result) if result else {"found": False, "ref": ref}
+    async def wait(self, seconds: float) -> None:
+        await asyncio.sleep(max(0.0, min(float(seconds), _WAIT_MAX_S)))
 
-    async def get_table(self, ref: str | None = None) -> list[list[list[str]]]:
-        result = await self._active().page.evaluate(_TABLE_JS, ref)
-        return list(result)
+    async def form_input(self, ref: str, value: str | bool | float) -> str:
+        tab = self._active()
+        loc = self._ref_locator(tab, ref)
+        try:
+            info = await loc.evaluate(_FIELD_KIND_JS)
+        except Exception as exc:
+            raise _action_error("fill", ref, exc) from exc
+        kind = dict(info or {})
+        tag, itype = str(kind.get("tag", "")), str(kind.get("type", ""))
+        if tag == "select":
+            try:
+                await loc.select_option(label=str(value), timeout=_ACTION_TIMEOUT_MS)
+            except Exception:
+                await loc.select_option(value=str(value), timeout=_ACTION_TIMEOUT_MS)
+            return "ok"
+        if itype in ("checkbox", "radio"):
+            checked = (
+                value
+                if isinstance(value, bool)
+                else str(value).lower() in ("true", "1", "on", "yes")
+            )
+            await loc.set_checked(checked, timeout=_ACTION_TIMEOUT_MS)
+            return "ok"
+        try:
+            await loc.fill(str(value), timeout=_ACTION_TIMEOUT_MS)
+        except Exception as exc:
+            raise _action_error("fill", ref, exc) from exc
+        observed: dict[str, Any] | None = None
+        with contextlib.suppress(Exception):
+            raw = await loc.evaluate(_TYPE_READBACK_JS)
+            observed = dict(raw) if raw else None
+        return _type_note(str(value), observed)
 
-    # --- history / reliability ----------------------------------------------
+    async def upload_files(self, ref: str, paths: list[str]) -> None:
+        loc = self._ref_locator(self._active(), ref)
+        await loc.set_input_files(paths, timeout=_ACTION_TIMEOUT_MS)
+
+    async def download(self, ref: str, dest_path: str) -> dict[str, Any]:
+        tab = self._active()
+        loc = self._ref_locator(tab, ref)
+        async with tab.page.expect_download() as dl:
+            await loc.click(timeout=_ACTION_TIMEOUT_MS)
+        download = await dl.value
+        await download.save_as(dest_path)
+        return {"filename": download.suggested_filename, "saved": True}
+
+    async def eval_js(self, js: str) -> dict[str, Any]:
+        # The wrapper stringifies + length-caps INSIDE the page and returns
+        # throws as {error} — a broken/hostile snippet can't crash the tool or
+        # dump an un-cappable blob into the agent's context.
+        try:
+            out = await self._active_frame().evaluate(_EVAL_WRAPPER_JS, js)
+        except Exception as exc:  # context destroyed by a navigation, syntax error…
+            return {"error": str(exc)[:500]}
+        if isinstance(out, dict) and "error" in out:
+            return {"error": str(out["error"])[:2000]}
+        return {"result": str(out.get("result", "")) if isinstance(out, dict) else str(out)}
+
+    # --- settling + "what changed" ------------------------------------------
+
+    def state_marker(self) -> dict[str, Any]:
+        tab = self._active()
+        return {
+            "tab": tab.num,
+            "url": str(tab.page.url),
+            "epoch": tab.doc_epoch,
+            "tabs": {t.num for t in self._tabs},
+            "dialog_seq": self._dialog_seq,
+        }
+
+    async def settle(self, marker: dict[str, Any]) -> list[str]:
+        """The extension's shape: a mutating action replies with only what
+        changed. A navigation gets a short window to start and a bounded wait
+        to load; a dialog that fired ends the wait (the page is blocked on it).
+        """
+        tab = self._active()
+        await asyncio.sleep(_SETTLE_WINDOW_S)
+        changes: list[str] = []
+        if tab.doc_epoch != marker.get("epoch") or str(tab.page.url) != marker.get("url"):
+            with contextlib.suppress(Exception):
+                await tab.page.wait_for_load_state(
+                    "domcontentloaded", timeout=_SETTLE_LOAD_TIMEOUT_MS
+                )
+            title = ""
+            with contextlib.suppress(Exception):
+                title = await tab.page.title()
+            changes.append(f'Page navigated to {_truncate_url(str(tab.page.url))} — "{title}"')
+        known = marker.get("tabs", set())
+        changes.extend(
+            f"Opened tab {t.num} ({_truncate_url(_tab_url(t))})"
+            for t in self._tabs
+            if t.num not in known
+        )
+        since = int(marker.get("dialog_seq", 0))
+        changes.extend(
+            f'Dialog {d.get("type")} "{str(d.get("message", ""))[:200]}" was {d.get("action")}ed'
+            for d in self._dialog_log
+            if int(d.get("seq", 0)) > since
+        )
+        return changes
+
+    # --- history / waiting --------------------------------------------------
 
     async def go_back(self) -> None:
         self._expect_repaint("go_back")
@@ -1610,41 +2133,37 @@ class PlaywrightDriver:
         self._expect_repaint("go_forward")
         await self._active().page.go_forward(wait_until="domcontentloaded")
 
-    async def reload(self) -> None:
-        self._expect_repaint("reload")
-        await self._active().page.reload(wait_until="domcontentloaded")
-
-    async def wait_for(self, *, text: str | None, selector: str | None, timeout_ms: int) -> bool:
+    async def wait_for(
+        self,
+        *,
+        text: str | None,
+        selector: str | None,
+        url: str | None = None,
+        response: str | None = None,
+        timeout_ms: int,
+    ) -> bool:
         page = self._active().page
         try:
             if selector:
                 await page.wait_for_selector(selector, timeout=timeout_ms)
             elif text:
                 await page.get_by_text(text).first.wait_for(timeout=timeout_ms)
+            elif url:
+                needle = url.lower()
+                await page.wait_for_url(lambda u: needle in u.lower(), timeout=timeout_ms)
+            elif response:
+                needle = response.lower()
+                async with page.expect_response(
+                    lambda r: needle in r.url.lower(), timeout=float(timeout_ms)
+                ) as info:
+                    await info.value
             else:
                 await page.wait_for_load_state("networkidle", timeout=timeout_ms)
         except Exception:
             return False
         return True
 
-    # --- extra actions ------------------------------------------------------
-
-    async def press_key(self, key: str) -> None:
-        await self._active().page.keyboard.press(key)
-
-    async def select_option(self, ref: str, value: str) -> None:
-        await self._active().page.select_option(f"[data-cobrowse-ref='{ref}']", value)
-
-    async def upload_file(self, ref: str, path: str) -> None:
-        await self._active().page.set_input_files(f"[data-cobrowse-ref='{ref}']", path)
-
-    async def download(self, ref: str, dest_path: str) -> dict[str, Any]:
-        page = self._active().page
-        async with page.expect_download() as dl:
-            await page.click(f"[data-cobrowse-ref='{ref}']")
-        download = await dl.value
-        await download.save_as(dest_path)
-        return {"filename": download.suggested_filename, "saved": True}
+    # --- login --------------------------------------------------------------
 
     async def _visible_selector(self, frame: Any, selector: str) -> Any:
         """First element matching ``selector`` that is actually VISIBLE, else None.
@@ -1687,16 +2206,16 @@ class PlaywrightDriver:
         somewhere itself, selector-guessing is the wrong tool: ``_USERNAME_SELECTOR``
         matches a bare ``input[type=text]``, so on an arbitrary page it can land on
         a search box and submit it. Anchoring on a ref the caller picked out of a
-        snapshot removes the guess — the caller says which field, this types into
-        it.
+        read_page removes the guess — the caller says which field, this types
+        into it.
 
         Same two shapes as ``fill_login``: password already visible → fill both and
         submit; password not present yet → submit the username and wait for the
         second screen.
         """
         frame = self._active_frame()
-        user = frame.locator(f"[data-cobrowse-ref='{ref}']")
         try:
+            user = self._ref_locator(self._active(), ref)
             if await user.count() == 0:
                 return False
         except Exception:
@@ -1746,44 +2265,6 @@ class PlaywrightDriver:
         await pw.fill(password)
         await pw.press("Enter")
         return True
-
-    # --- interaction extras -------------------------------------------------
-
-    async def hover(self, ref: str) -> None:
-        await self._active_frame().hover(f"[data-cobrowse-ref='{ref}']")
-
-    async def drag(self, from_ref: str, to_ref: str) -> None:
-        await self._active_frame().drag_and_drop(
-            f"[data-cobrowse-ref='{from_ref}']", f"[data-cobrowse-ref='{to_ref}']"
-        )
-
-    async def scroll_to(self, ref: str) -> bool:
-        loc = self._active_frame().locator(f"[data-cobrowse-ref='{ref}']")
-        try:
-            await loc.scroll_into_view_if_needed(timeout=2000)
-        except Exception:
-            return False
-        return True
-
-    async def get_options(self, ref: str) -> list[dict[str, Any]]:
-        raw = await self._active_frame().evaluate(_GET_OPTIONS_JS, ref)
-        return list(raw)
-
-    async def get_links(self, cap: int = 200) -> list[dict[str, str]]:
-        raw = await self._active_frame().evaluate(_GET_LINKS_JS, cap)
-        return list(raw)
-
-    async def eval_js(self, js: str) -> dict[str, Any]:
-        # The wrapper stringifies + length-caps INSIDE the page and returns
-        # throws as {error} — a broken/hostile snippet can't crash the tool or
-        # dump an un-cappable blob into the agent's context.
-        try:
-            out = await self._active_frame().evaluate(_EVAL_WRAPPER_JS, js)
-        except Exception as exc:  # context destroyed by a navigation, syntax error…
-            return {"error": str(exc)[:500]}
-        if isinstance(out, dict) and "error" in out:
-            return {"error": str(out["error"])[:2000]}
-        return {"result": str(out.get("result", "")) if isinstance(out, dict) else str(out)}
 
     async def nav_state(self) -> dict[str, Any]:
         tab = self._active()
@@ -2118,84 +2599,11 @@ class PlaywrightDriver:
         self._release_profile_lock()
 
 
-# Injected into every candidate element as data-cobrowse-ref. Password inputs
-# keep their type so redaction can find them. The label fallback chain exists
-# because an <input> has no textContent: a login form once came back as two
-# indistinguishable `{tag: "input", type: "text"}` entries, costing the agent a
-# whole extra browser_read per field — measured 3x per task.
-_LABEL_JS = """
-  function labelFor(el) {
-    const byIds = el.getAttribute('aria-labelledby');
-    if (byIds) {
-      const text = byIds.split(/\\s+/)
-        .map((id) => document.getElementById(id))
-        .filter(Boolean)
-        .map((n) => n.textContent || '')
-        .join(' ')
-        .trim();
-      if (text) return text;
-    }
-    if (el.id) {
-      // CSS.escape: an id like "user.name" is a valid id but an invalid bare
-      // selector, and would throw rather than simply not match.
-      const explicit = document.querySelector('label[for="' + CSS.escape(el.id) + '"]');
-      if (explicit && explicit.textContent.trim()) return explicit.textContent.trim();
-    }
-    const wrapping = el.closest('label');
-    // An <input> contributes no textContent, so the wrapping label's text is
-    // the label alone — it does not echo what the user typed.
-    if (wrapping && wrapping.textContent.trim()) return wrapping.textContent.trim();
-    return '';
-  }
-"""
-
-_SNAPSHOT_JS = (
-    """
-() => {
-"""
-    + _LABEL_JS
-    + """
-  // Interactivity net: native controls, common widget ARIA roles, and the
-  // generic interactivity attributes ([onclick], focusable tabindex). Custom
-  // checkboxes/tabs/menus are invisible to the agent without the role list —
-  // it cannot click what the snapshot does not show.
-  const sel = 'a,button,input,textarea,select,summary,' +
-    '[onclick],[tabindex]:not([tabindex="-1"]),' +
-    '[role=button],[role=link],[role=checkbox],[role=radio],[role=switch],' +
-    '[role=tab],[role=menuitem],[role=option],[role=combobox],' +
-    '[role=searchbox],[role=slider]';
-  const nodes = Array.from(document.querySelectorAll(sel));
-  return nodes.slice(0, 200).map((el, i) => {
-    const ref = 'e' + i;
-    el.setAttribute('data-cobrowse-ref', ref);
-    const out = { ref, tag: el.tagName.toLowerCase() };
-    if (el.type) out.type = el.type;
-    const role = el.getAttribute('role'); if (role) out.role = role;
-    const name = (
-      el.getAttribute('aria-label') ||
-      el.textContent ||
-      labelFor(el) ||
-      el.getAttribute('placeholder') ||
-      el.getAttribute('name') ||
-      el.id ||
-      ''
-    ).trim().slice(0, 120);
-    if (name) out.name = name;
-    if ('value' in el && el.value != null) out.value = String(el.value).slice(0, 200);
-    const ph = el.getAttribute('placeholder'); if (ph) out.placeholder = ph;
-    return out;
-  });
-}
-"""
-)
-
-# Post-type read-back for _type_note: the field's live value plus the two
-# attributes that mark an autocomplete widget. Takes the same selector string
-# type_text just filled, so the two cannot disagree about the target.
+# Post-type read-back for _type_note, evaluated ON the element the action
+# targeted (so the two cannot disagree about the target): the field's live
+# value plus the two attributes that mark an autocomplete widget.
 _TYPE_READBACK_JS = """
-(sel) => {
-  const el = document.querySelector(sel);
-  if (!el) return null;
+(el) => {
   const out = { tag: el.tagName.toLowerCase() };
   if (el.type) out.type = el.type;
   if ('value' in el && el.value != null) out.value = String(el.value).slice(0, 200);
@@ -2205,111 +2613,33 @@ _TYPE_READBACK_JS = """
 }
 """
 
-# Readable text of the main content (article/main if present, else body), capped
-# so a huge page can't blow the agent's context.
-_READ_JS = """
+# What kind of field form_input is setting: a <select>, a checkbox/radio, or
+# a text-like input.
+_FIELD_KIND_JS = """
+(el) => ({ tag: el.tagName.toLowerCase(), type: String(el.type || '').toLowerCase() })
+"""
+
+# Values typed into password fields — read for OUTBOUND redaction only. The
+# list never leaves the driver; the tree and page text are blanked by value.
+_MASKED_FIELD_VALUES_JS = """
+() => Array.from(document.querySelectorAll('input[type=password]'))
+  .map((e) => e.value).filter((v) => v)
+"""
+
+# Readable text of the main content (article/main if present, else body), with
+# the header get_page_text prints. Uncapped here — the handler caps at a line
+# boundary and states the full size.
+_PAGE_TEXT_JS = """
 () => {
-  const main = document.querySelector('main, article, [role=main]') || document.body;
-  const text = (main.innerText || '').replace(/\\n{3,}/g, '\\n\\n').trim();
-  return text.slice(0, 15000);
-}
-"""
-
-# Count case-insensitive occurrences of a query in the page text and scroll the
-# first hit into view; return a short surrounding snippet.
-_FIND_JS = """
-(query) => {
-  const q = (query || '').toLowerCase();
-  if (!q) return { count: 0, snippet: '' };
-  const text = document.body.innerText || '';
-  const hay = text.toLowerCase();
-  let count = 0, idx = hay.indexOf(q);
-  const first = idx;
-  while (idx !== -1) { count++; idx = hay.indexOf(q, idx + q.length); }
-  let snippet = '';
-  if (first !== -1) snippet = text.slice(Math.max(0, first - 60), first + q.length + 60).trim();
-  // Best-effort scroll: find the first element whose text contains the query.
-  const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
-  let n;
-  while ((n = walker.nextNode())) {
-    if ((n.textContent || '').toLowerCase().includes(q)) {
-      const el = n.parentElement;
-      if (el && el.scrollIntoView) { el.scrollIntoView({ block: 'center' }); }
-      break;
-    }
-  }
-  return { count, snippet };
-}
-"""
-
-# Details of one element, addressed by its data-cobrowse-ref from a snapshot.
-_INSPECT_JS = """
-(ref) => {
-  const el = document.querySelector('[data-cobrowse-ref="' + ref + '"]');
-  if (!el) return null;
-  const r = el.getBoundingClientRect();
-  const attrs = {};
-  for (const a of el.attributes) attrs[a.name] = a.value;
-  const style = getComputedStyle(el);
+  const main = document.querySelector('main, article, [role=main]');
+  const el = main || document.body;
+  const text = (el.innerText || '').replace(/\\n{3,}/g, '\\n\\n').trim();
   return {
-    found: true, ref,
-    tag: el.tagName.toLowerCase(),
-    text: (el.innerText || el.textContent || '').trim().slice(0, 300),
-    attributes: attrs,
-    box: { x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height) },
-    visible: !!(r.width && r.height && style.visibility !== 'hidden' && style.display !== 'none'),
-    disabled: !!el.disabled,
+    title: document.title || '',
+    url: location.href,
+    source: main ? (main.tagName.toLowerCase() + (main.getAttribute('role') ? '[role=main]' : '')) : 'body',
+    text,
   };
-}
-"""
-
-# Extract tables as [table][row][cell]. With a ref, just that table.
-_TABLE_JS = """
-(ref) => {
-  let tables;
-  if (ref) {
-    const el = document.querySelector('[data-cobrowse-ref="' + ref + '"]');
-    const t = el ? el.closest('table') || el.querySelector('table') : null;
-    tables = t ? [t] : [];
-  } else {
-    tables = Array.from(document.querySelectorAll('table')).slice(0, 10);
-  }
-  return tables.map((t) =>
-    Array.from(t.rows).slice(0, 200).map((row) =>
-      Array.from(row.cells).map((c) => (c.innerText || '').trim().slice(0, 300))
-    )
-  );
-}
-"""
-
-
-# Native <select> options, addressed by data-cobrowse-ref. Empty for a non-select.
-_GET_OPTIONS_JS = """
-(ref) => {
-  const el = document.querySelector("[data-cobrowse-ref='" + ref + "']");
-  if (!el || el.tagName.toLowerCase() !== 'select') return [];
-  return Array.from(el.options).slice(0, 200).map((o) => ({
-    value: String(o.value),
-    label: (o.textContent || '').trim().slice(0, 200),
-    selected: !!o.selected,
-  }));
-}
-"""
-
-# All links as [{text, href}] with ABSOLUTE hrefs (a.href is DOM-resolved), deduped
-# and capped for navigation planning.
-_GET_LINKS_JS = """
-(cap) => {
-  const seen = new Set();
-  const out = [];
-  for (const a of Array.from(document.querySelectorAll('a[href]'))) {
-    const href = a.href;
-    if (!href || href.startsWith('javascript:') || seen.has(href)) continue;
-    seen.add(href);
-    out.push({ text: (a.textContent || '').trim().slice(0, 200), href: href });
-    if (out.length >= cap) break;
-  }
-  return out;
 }
 """
 

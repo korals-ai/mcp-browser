@@ -70,13 +70,13 @@ class FakeFrame:
         self.username = username
         self.password = password
         self.waited: list[str] = []
-        # Elements addressable by the cobrowse ref attribute, for fill_login_at.
+        # Elements addressable by ref (aria-ref=eN), for fill_login_at.
         self.by_ref = by_ref or {}
 
     def locator(self, selector: str) -> FakeLocator:
-        prefix, suffix = "[data-cobrowse-ref='", "']"
-        assert selector.startswith(prefix) and selector.endswith(suffix), selector
-        return FakeLocator(self.by_ref.get(selector[len(prefix) : -len(suffix)]))
+        prefix = "aria-ref="
+        assert selector.startswith(prefix), selector
+        return FakeLocator(self.by_ref.get(selector[len(prefix) :]))
 
     def _match(self, selector: str) -> FakeElement | None:
         if selector == _PASSWORD_SELECTOR:
@@ -113,6 +113,11 @@ def _driver(frame: FakeFrame) -> PlaywrightDriver:
     """
     drv = object.__new__(PlaywrightDriver)
     drv._active_frame = lambda: frame  # type: ignore[method-assign]
+    # fill_login_at resolves its ref through the tab's ref registry; the
+    # registry is covered by test_refs.py, so here the ref goes straight to
+    # the frame — the login logic is what this file tests.
+    drv._active = lambda: None  # type: ignore[method-assign]
+    drv._ref_locator = lambda _tab, ref: frame.locator(f"aria-ref={ref}")  # type: ignore[method-assign]
     return drv
 
 

@@ -17,3 +17,8 @@ uvicorn[standard]>=0.30
 # Prometheus metrics exposed at /metrics on the pod port (scraped by the
 # ws-tool-browser PodMonitor). Co-browse session/viewer/chromium counters.
 prometheus_client>=0.20
+
+# The model tier of `find` (src/find_model.py) POSTs to an Anthropic-
+# compatible /v1/messages endpoint. `mcp` pulls httpx in transitively, but a
+# runtime import belongs in the runtime pins, not in a neighbour's.
+httpx>=0.27

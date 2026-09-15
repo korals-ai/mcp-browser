@@ -34,11 +34,6 @@ export interface BrowserAgentState {
   lastActor: string | null;
 }
 
-export interface BrowserTakeoverRequest {
-  type: "browser_takeover_request";
-  reason: string;
-}
-
 export interface BrowserTabInfo {
   id: string;
   title: string;
@@ -74,7 +69,6 @@ export type CoBrowseServerFrame =
   | BrowserFrame
   | BrowserNav
   | BrowserAgentState
-  | BrowserTakeoverRequest
   | BrowserTabs
   | BrowserCursor
   | CoBrowseError;
@@ -179,11 +173,6 @@ export function decodeServerFrame(raw: unknown): CoBrowseServerFrame | null {
         state:
           msg.state === "acting" || msg.state === "paused" ? msg.state : "idle",
         lastActor: typeof msg.lastActor === "string" ? msg.lastActor : null,
-      };
-    case "browser_takeover_request":
-      return {
-        type: "browser_takeover_request",
-        reason: typeof msg.reason === "string" ? msg.reason : "",
       };
     case "browser_tabs":
       return {
