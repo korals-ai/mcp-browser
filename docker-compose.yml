@@ -13,9 +13,11 @@ services:
       - "8096:8096"
     volumes:
       # The tools operate on paths, so whatever is mounted here is what the
-      # agent can read and write. Defaults to the directory you ran this from;
-      # override with WORKDIR=/path/to/project docker compose up
-      - "${WORKDIR:-.}:/work"
+      # agent can read and write — and what a page that manipulates the agent
+      # could get attached to a form. Defaults to ./work, NOT this directory
+      # (its .env holds find's API key); override with
+      # WORKDIR=/path/to/project docker compose up
+      - "${WORKDIR:-./work}:/work"
     # Run as you, so files the tools create are owned by you on the host rather
     # than by the image's unprivileged uid. Override on a non-1000 host with
     # MCP_UID=$(id -u) MCP_GID=$(id -g) docker compose up  (UID is readonly in bash)
@@ -23,6 +25,10 @@ services:
     environment:
       # The image's own HOME is not writable under a different uid; /tmp is.
       HOME: /tmp
+      # Anchors the data root at /work (the server derives it as this path's
+      # grandparent): the file tools reach /work, downloads and saved
+      # screenshots land there, and the browser profile persists under it.
+      BROWSER_PROFILE_DIR: /work/.cobrowse/profile
       # `find`'s model tier, chosen in .env. Required: an EMPTY url is the
       # explicit "literal matching only" choice, and an unset one stops compose
       # here instead of silently picking for you.

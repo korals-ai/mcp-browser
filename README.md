@@ -109,9 +109,17 @@ opens it in place and writes results back. Nothing but the path and the verdict
 crosses the MCP wire, so a 200 MB file costs no tokens.
 
 That means the container has to be able to see your files. `docker compose up`
-mounts the directory you ran it from at `/work`, so tell the agent about
-`/work/drawing.dxf`, not `~/drawing.dxf`. Mount somewhere else with
+mounts `./work` (next to this README) at `/work`: put the files the agent should
+use there and tell it about `/work/drawing.dxf`, not `~/drawing.dxf`. Downloads
+and saved screenshots land there too, and so does the browser profile
+(`/work/.cobrowse/`), so logins survive a restart. Mount another folder with
 `WORKDIR=/path/to/project docker compose up`.
+
+**Everything in that folder is reachable by the agent's file tools** — and an
+agent that a web page has talked into it could attach any of those files to a
+form on that page. Mount a folder of working files, never your home directory
+or a folder that holds keys; this repo's own `.env` sits outside `./work` for
+exactly that reason.
 
 Files the tools create are written as your host user, not root:
 

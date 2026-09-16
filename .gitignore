@@ -12,3 +12,6 @@ __pycache__/
 node_modules/
 # docker compose's local settings — carries find's API key (.env.example is the template).
 .env
+# The folder docker compose mounts for the agent's files (kept, contents local).
+/work/*
+!/work/.gitkeep

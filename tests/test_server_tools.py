@@ -93,6 +93,22 @@ def test_resolve_data_path_keeps_the_agent_inside_the_volume(workspace: Any) -> 
     assert server._resolve_data_path("/etc/hosts") is None
 
 
+def test_the_credentials_mount_is_never_a_data_path(
+    workspace: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`login` keeps portal passwords server-side; a layout that mounts them
+    under the data volume must not let `file_upload` attach them to a page."""
+    creds = workspace / "creds"
+    creds.mkdir()
+    (creds / "PORTAL_CREDENTIALS_JSON").write_text("[]")
+    monkeypatch.setattr(server, "_CREDS_ROOT", str(creds.resolve()))
+    assert server._resolve_data_path("creds/PORTAL_CREDENTIALS_JSON") is None
+    assert server._resolve_data_path(str(creds)) is None
+    assert server._resolve_data_path("creds/../a.pdf") == str((workspace / "a.pdf").resolve())
+    # A sibling whose name merely starts the same is data.
+    assert server._resolve_data_path("creds-archive/x") is not None
+
+
 async def test_file_upload_refuses_outside_missing_and_oversized(
     workspace: Any, fake: FakeDriver
 ) -> None:

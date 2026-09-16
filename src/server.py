@@ -119,6 +119,12 @@ def _data_root() -> str:
 # (e.g. /etc/…) to a web form or write outside the volume.
 _DATA_ROOT = _data_root()
 
+# The portal-credentials mount (src/portal_creds.py). `login` reads it on the
+# server side so the agent never sees a password; if a layout ever puts it
+# under the data volume, the file tools would hand the same file to any page
+# the agent is on. Refused by path, whatever the layout.
+_CREDS_ROOT = os.path.realpath(os.environ["CONNECTORS_CREDS_DIR"])
+
 # The SDK's chat-transcript root on the shared volume. The profile GC reads chat
 # existence straight off here (both pods mount this volume) to decide which
 # per-chat profiles are orphaned — no call to the workspace pod. See profile_gc.
@@ -324,6 +330,8 @@ def _resolve_data_path(path: str) -> str | None:
     base = path if os.path.isabs(path) else os.path.join(_DATA_ROOT, path)
     resolved = os.path.realpath(base)
     if resolved != _DATA_ROOT and not resolved.startswith(_DATA_ROOT + os.sep):
+        return None
+    if resolved == _CREDS_ROOT or resolved.startswith(_CREDS_ROOT + os.sep):
         return None
     return resolved
 
