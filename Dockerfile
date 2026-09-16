@@ -52,6 +52,13 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 
 FROM python:3.12-slim
 
+# This image is also published as a public package on GitHub's container
+# registry. The source label is what links that package to its repository.
+LABEL org.opencontainers.image.source="https://github.com/korals-ai/mcp-browser" \
+      org.opencontainers.image.title="mcp-browser" \
+      org.opencontainers.image.description="A real browser an MCP agent can drive and a person can watch." \
+      org.opencontainers.image.licenses="Apache-2.0"
+
 COPY --from=py-builder /usr/local/lib/python3.12/site-packages /usr/local/lib/python3.12/site-packages
 COPY --from=py-builder /usr/local/bin /usr/local/bin
 
