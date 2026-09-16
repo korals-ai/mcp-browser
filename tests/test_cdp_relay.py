@@ -150,6 +150,23 @@ async def test_session_command_routes_to_the_tab_and_echoes_session_id() -> None
     assert cmd["params"] == [{"tabId": 7}, "Page.enable", {}]
 
 
+async def test_bring_to_front_is_answered_and_never_reaches_the_persons_browser() -> None:
+    # Page.bringToFront raises the whole browser window over the app the person
+    # is working in; Playwright sends it on every tab switch.
+    bridge, ext = _make()
+    await _handshake(bridge, 7)
+    await _cdp(bridge, ext, id=1, method="Target.setAutoAttach", params={})
+    sent_before = len(ext.commands)
+    reply = await _cdp(
+        bridge, ext, id=2, sessionId="pw-tab-1", method="Page.bringToFront", params={}
+    )
+    assert reply == {"id": 2, "sessionId": "pw-tab-1", "result": {}}
+    assert ext.commands[sent_before:] == []
+    # The same session's other commands still reach the tab.
+    await _cdp(bridge, ext, id=3, sessionId="pw-tab-1", method="Page.enable", params={})
+    assert ext.commands[-1]["params"] == [{"tabId": 7}, "Page.enable", {}]
+
+
 async def test_browser_level_command_rides_any_attached_tab() -> None:
     bridge, ext = _make()
     await _handshake(bridge, 7)
@@ -375,9 +392,12 @@ async def test_create_target_makes_a_tab_and_attaches_it() -> None:
     await _cdp(bridge, ext, id=1, method="Target.setAutoAttach", params={})
     reply = await _cdp(bridge, ext, id=2, method="Target.createTarget", params={"url": "https://x"})
     assert reply["result"] == {"targetId": "T99"}
-    assert {"id": 1, "method": "chrome.tabs.create", "params": [{"url": "https://x"}]} in [
-        {k: v for k, v in c.items() if k != "id"} | {"id": 1} for c in ext.commands
-    ]
+    # Opened in the background: the person's selected tab stays theirs.
+    assert {
+        "id": 1,
+        "method": "chrome.tabs.create",
+        "params": [{"url": "https://x", "active": False}],
+    } in [{k: v for k, v in c.items() if k != "id"} | {"id": 1} for c in ext.commands]
     r = await _cdp(bridge, ext, id=3, method="Target.closeTarget", params={"targetId": "T99"})
     assert r["result"] == {"success": True}
     assert ext.commands[-1]["method"] == "chrome.tabs.remove"

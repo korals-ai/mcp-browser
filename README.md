@@ -229,6 +229,11 @@ it was forked from also works, minus `download`.
    a `BROWSER_EXTENSION_TOKEN=…` value — put it in the server's environment
    and later connections skip the dialog.
 
+The agent works in background tabs of its own tab group: opening or switching
+tabs never raises your browser window over the app you are working in, and the
+tab you have selected stays selected. Only connecting may bring the browser
+forward, once.
+
 The tools work the same, with these differences: `download` saves through
 your browser (wherever it saves downloads) and the server copies the file
 from there — it needs the server on the same machine; `resize_window`

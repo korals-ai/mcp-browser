@@ -243,6 +243,12 @@ class ExtensionBridge:
             # carry a forwarded command.
             sess = self._session_by_id(session_id) if session_id else None
             return {"targetInfo": sess.target_info} if sess else {}
+        if method == "Page.bringToFront":
+            # Answered, never forwarded. In the person's own browser it raises
+            # the whole window over the app they are working in (measured: every
+            # tab switch put Chrome in front). Every other command still reaches
+            # a tab that stays in the background.
+            return {}
         if session_id in self._browser_aliases:
             return await self._handle_root_command(method, params, session_id)
         if session_id is None:
@@ -353,7 +359,11 @@ class ExtensionBridge:
                 log.warning("cdp-relay: attach to tab %s failed: %s", tid, res)
 
     async def _create_target(self, url: str | None) -> dict[str, Any]:
-        tab = await self._call_extension("chrome.tabs.create", [{"url": url or "about:blank"}])
+        # A background tab: the agent's new tab must not take the tab the person
+        # is looking at away from them.
+        tab = await self._call_extension(
+            "chrome.tabs.create", [{"url": url or "about:blank", "active": False}]
+        )
         if not isinstance(tab, dict) or tab.get("id") is None:
             raise RelayError("Failed to create tab")
         self._known_tabs[int(tab["id"])] = tab
