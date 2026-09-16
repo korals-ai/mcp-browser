@@ -115,7 +115,39 @@ than picking a default.
 | `BROWSER_FIND_INFERENCE_URL` | base URL of an Anthropic-compatible `/v1/messages` endpoint for `find`'s model tier; `""` = literal matching only |
 | `BROWSER_FIND_INFERENCE_KEY` | its API key (`""` when the URL is empty) |
 | `BROWSER_FIND_MODEL` | the model `find` asks, e.g. `claude-haiku-4-5-20251001` |
+| `BROWSER_ATTACH` | `launch` (the server runs its own Chromium — what the image does) or `extension` (drive YOUR browser through the Playwright Extension; see below) |
+| `BROWSER_EXTENSION_TOKEN` | extension mode only: the token the extension's connect page shows, so it connects without asking each time; `""` = approve in the browser every time |
 | `BROWSER_HEADLESS`, `BROWSER_EXECUTABLE_PATH`, `BROWSER_MAX_SESSIONS`, `BROWSER_VIEWER_DIR`, `WORKSPACE_TOOL_HOST`, `WORKSPACE_TOOL_PORT`, `CONNECTORS_CREDS_DIR` | see `docker-compose.yml` |
+
+## Driving your own browser (extension mode)
+
+The server can attach to a browser you already use instead of running its
+own — every tool then acts in your tabs, with your logins. It speaks the
+[Playwright Extension](https://chromewebstore.google.com/detail/playwright-extension/mmlmfjhmonkocbjadbfplnigmagldckm)'s
+protocol (Chromium browsers only — the extension needs `chrome.debugger`).
+
+1. Install the extension in the Chrome profile you want to drive.
+2. Run the server on the host (not in Docker: it has to open a page in your
+   browser) with `BROWSER_ATTACH=extension`, `BROWSER_EXECUTABLE_PATH` set to
+   that browser's binary, and `BROWSER_EXTENSION_TOKEN=""`.
+3. The first tool call opens the extension's connect page; click **Allow**.
+   That page shows a `PLAYWRIGHT_MCP_EXTENSION_TOKEN=…` value — put it in
+   `BROWSER_EXTENSION_TOKEN` and later connections skip the dialog.
+
+The tools work the same, with these differences: `download` reports that it
+cannot capture the file (a click still saves it to the browser's Downloads
+folder), `resize_window` emulates the size inside the window rather than
+resizing it, and the co-browse viewer is off — you are looking at the browser.
+Disconnecting the extension (its button, or closing the last tab you gave
+it) ends the session: the next tool call reports it and the one after that
+reconnects.
+
+The connect page is opened by launching the browser binary with its URL, and
+with a token set the token is IN that URL. When the browser is already
+running, the launched process hands the URL over and exits at once; when it is
+not, that process IS the browser and its command line (the token included)
+stays readable to other users of the machine for as long as it runs. Have the
+browser running first, or use `BROWSER_EXTENSION_TOKEN=""` and click.
 
 ## Requirements
 

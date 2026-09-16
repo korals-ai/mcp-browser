@@ -34,6 +34,7 @@ from collections import deque
 from typing import TYPE_CHECKING, Any, NamedTuple, Protocol
 
 from src import metrics
+from src.cdp_relay import PLAYWRIGHT_EXTENSION_ID, CdpRelay, RelayError
 from src.input_map import to_cdp_command
 from src.keys import to_playwright_combo
 from src.page_state import classify_page_state
@@ -124,6 +125,20 @@ def _launch_args() -> list[str]:
     return [*_STEALTH_LAUNCH_ARGS, *_CONTAINER_LAUNCH_ARGS]
 
 
+# How the driver obtains its browser. ``launch`` starts a Chromium of its own
+# (the tool pod, the docker runner); ``extension`` attaches to the USER's own
+# browser through the relay in :mod:`src.cdp_relay` and the extension
+# installed there. Declared values only — anything else fails at startup.
+ATTACH_MODES = ("launch", "extension")
+# Shown by the extension's connect page ("<name> is trying to connect").
+_EXTENSION_CLIENT_NAME = "MCP browser tool"
+# With a matching token the extension auto-approves and the wait is a
+# liveness bound; without one a human is reading the connect page and
+# picking a tab. Both are bounded — a wait with no end is a wedged session.
+_EXTENSION_CONNECT_TIMEOUT_S = 30.0
+_EXTENSION_APPROVE_TIMEOUT_S = 180.0
+
+
 def _env_headless() -> bool:
     """Prod runs HEADED (real window under Xvfb) for the lowest automation
     fingerprint. REQUIRED (Tier 0.5): ``BROWSER_HEADLESS=false`` is declared in
@@ -190,6 +205,12 @@ class StaleRefError(ValueError):
     """A ref the agent passed cannot be used on this tab as it is now — no
     read_page yet, a read_page of a previous document, or a ref that read did
     not return. The message names the corrective call."""
+
+
+class NotInThisRuntimeError(ValueError):
+    """The tool cannot work in the driver's current runtime (extension mode,
+    where the browser is the user's own). Raised with the reason and what the
+    agent can do instead — never a silent empty result."""
 
 
 class UnknownTabError(ValueError):
@@ -718,6 +739,14 @@ class BrowserDriver(Protocol):
         device scale (screencast crispness) is preserved."""
         ...
 
+    def gone(self) -> str | None:
+        """Why this driver can no longer serve calls — the user's own browser
+        detached from it (extension mode) — or None while it can. The session
+        manager ends a gone session on its next use, so the call after that
+        starts a fresh one; a driver whose browser cannot leave on its own
+        is never gone."""
+        return None
+
     async def close(self) -> None: ...
 
 
@@ -826,7 +855,27 @@ class PlaywrightDriver:
         disk_cache_size: str | None = None,
         headless: bool | None = None,
         executable_path: str | None = None,
+        attach: str = "launch",
+        extension_token: str = "",
+        extension_id: str = PLAYWRIGHT_EXTENSION_ID,
+        connect_opener: Callable[[str], Awaitable[None]] | None = None,
     ) -> None:
+        if attach not in ATTACH_MODES:
+            raise ValueError(f"attach must be one of {ATTACH_MODES}, got {attach!r}")
+        self._attach = attach
+        # Extension mode: the pairing token the extension compares (a match
+        # skips its approval dialog), the extension to open the connect page
+        # of, and how that page gets opened — by default the browser binary
+        # is spawned with the URL (upstream's way); the S1 harness and tests
+        # inject an opener that drives their own browser instead.
+        self._extension_token = extension_token
+        self._extension_id = extension_id
+        self._connect_opener = connect_opener
+        self._relay: CdpRelay | None = None
+        # Extension mode: set (with the extension's own reason) when the user's
+        # browser detached — the user clicked disconnect or closed the last
+        # controlled tab. Read by :meth:`gone`.
+        self._gone: str | None = None
         self._viewport = viewport
         # Chrome's user-data-dir, LIVE on the data volume (see the module-level
         # durability block). None → fully ephemeral context (unit/CI runs).
@@ -848,6 +897,9 @@ class PlaywrightDriver:
         ) or None
         self._playwright: Any = None
         self._browser: Any = None
+        # Set by close(): the tabs' close events that follow must not replace
+        # each closed tab with a fresh blank one against a dying browser.
+        self._closing = False
         self._context: Any = None
         self._tabs: list[_Tab] = []
         self._active_id: str | None = None
@@ -927,7 +979,8 @@ class PlaywrightDriver:
         """Make ``page`` a tab: viewport, dialog handler, CDP session, UA,
         observers, close hook. The ONE registration path, whichever route the
         page arrived by."""
-        await self._match_viewport(page)  # keep a human resize across new tabs
+        if self._attach != "extension":
+            await self._match_viewport(page)  # keep a human resize across new tabs
         self._install_dialog_handler(page)  # cover every tab before it navigates
         cdp = await self._context.new_cdp_session(page)
         await self._apply_ua_override(cdp)  # every tab carries the cleaned UA
@@ -946,11 +999,17 @@ class PlaywrightDriver:
         return tab
 
     async def _on_page_closed(self, tab: _Tab) -> None:
-        if tab not in self._tabs:
+        if tab not in self._tabs or self._closing:
             return
         was_active = tab.id == self._active_id
         self._tabs = [t for t in self._tabs if t is not tab]
         metrics.add_open_tabs(-1)
+        if not self._tabs and self._attach == "extension":
+            # The user closed the last tab they gave us: the extension ends
+            # the session on its own ~150 ms later (relay → gone()). Spawning
+            # a replacement would race that, and win only by opening a blank
+            # tab in their browser they did not ask for.
+            return
         if not self._tabs:
             fresh = await self._new_page_tab()
             self._active_id = None
@@ -1002,7 +1061,9 @@ class PlaywrightDriver:
             w, h = self._viewport
             if self._cache_dir:
                 await asyncio.to_thread(os.makedirs, self._cache_dir, exist_ok=True)
-            if self._profile_dir:
+            if self._attach == "extension":
+                first = await self._attach_to_extension()
+            elif self._profile_dir:
                 # ONE hop for the whole pre-launch profile step. Every part of it
                 # blocks — mkdir, an flock, a directory sweep, a `tar -xzf`
                 # subprocess, and an rmtree of up to nineteen cache dirs — and it
@@ -1027,7 +1088,8 @@ class PlaywrightDriver:
                 first = await self._new_page_tab()
             self._active_id = first.id
             self._context.on("page", self._on_context_page)  # popups become tabs
-            await self._prime_ua_override(first)  # UA set before any restore navigation
+            if self._attach != "extension":
+                await self._prime_ua_override(first)  # UA set before any restore navigation
             if self._profile_dir:
                 self._tab_persist_wake = asyncio.Event()
                 self._tab_persist_task = asyncio.create_task(self._tab_persist_writer())
@@ -1044,6 +1106,77 @@ class PlaywrightDriver:
         # which is indistinguishable from "this container is using no memory"
         # and would let a headroom alert bind to a series that never moves.
         log.info("cobrowse session ready tabs=%d mem=%s", len(self._tabs), await _memory_snapshot())
+
+    async def _attach_to_extension(self) -> _Tab:
+        """Extension mode: start the relay, open the extension's connect page
+        in the user's browser, wait for the extension to dial in, then attach
+        Playwright to the relay's CDP endpoint. The browser's default context
+        IS the user's profile; nothing here touches its tabs beyond the ones
+        the extension handed over."""
+        relay = CdpRelay(client_name=_EXTENSION_CLIENT_NAME, token=self._extension_token)
+        relay.on_extension_closed = self._on_extension_closed
+        await relay.start()
+        self._relay = relay
+        try:
+            await self._open_connect_page(relay.connect_url(self._extension_id))
+            timeout = (
+                _EXTENSION_CONNECT_TIMEOUT_S
+                if self._extension_token
+                else _EXTENSION_APPROVE_TIMEOUT_S
+            )
+            await relay.wait_for_extension(timeout)
+            self._browser = await self._playwright.chromium.connect_over_cdp(
+                relay.cdp_url, timeout=0
+            )
+            contexts = list(self._browser.contexts)
+            if not contexts:
+                raise RelayError("extension bridge exposed no browser context")
+            self._context = contexts[0]
+            log.info("cobrowse attached to the user's browser via extension relay")
+            return await self._adopt_first_tab()
+        except BaseException:
+            # Whatever failed — no browser binary, no extension, a refused
+            # CDP connect — the loopback listener and any half-made browser
+            # link must not outlive the attempt: each retried tool call
+            # would otherwise add a listener and hold the user's tabs.
+            if self._browser is not None:
+                with contextlib.suppress(Exception):
+                    await self._browser.close()
+                self._browser = None
+            await relay.stop()
+            self._relay = None
+            raise
+
+    def _on_extension_closed(self, reason: str) -> None:
+        if self._closing:
+            return
+        log.info("cobrowse extension detached: %s", reason)
+        self._gone = reason
+
+    def gone(self) -> str | None:
+        return self._gone
+
+    async def _open_connect_page(self, url: str) -> None:
+        """Open the extension's connect page. Injected opener first (harness,
+        tests); otherwise spawn the configured browser binary with the URL —
+        an already-running instance of that browser opens it as a new tab."""
+        if self._connect_opener is not None:
+            await self._connect_opener(url)
+            return
+        if not self._executable_path:
+            raise RelayError(
+                "extension mode needs BROWSER_EXECUTABLE_PATH to name the browser that has "
+                "the extension installed (it is spawned with the connect page URL)"
+            )
+        log.info("cobrowse opening extension connect page in %s", self._executable_path)
+        await asyncio.to_thread(
+            subprocess.Popen,
+            [self._executable_path, url],
+            start_new_session=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
 
     async def _prime_ua_override(self, first: _Tab) -> None:
         """Compute the cleaned UA from the first tab and apply it there NOW
@@ -2083,6 +2216,18 @@ class PlaywrightDriver:
         await loc.set_input_files(paths, timeout=_ACTION_TIMEOUT_MS)
 
     async def download(self, ref: str, dest_path: str) -> dict[str, Any]:
+        if self._attach == "extension":
+            # S1 (2026-09-16): chrome.debugger refuses both Browser.setDownloadBehavior
+            # and the tab-level Page.setDownloadBehavior ("Cannot not access
+            # browser-level commands"), so nothing here can observe or place the
+            # file. A plain click still downloads it — into the user's own
+            # Downloads folder, where only the user can see it.
+            raise NotInThisRuntimeError(
+                "download is not available when attached to the user's own browser: "
+                "the tool cannot capture the file. A `computer` left_click on the link "
+                "downloads it into the browser's Downloads folder; tell the user that is "
+                "where to find it."
+            )
         tab = self._active()
         loc = self._ref_locator(tab, ref)
         async with tab.page.expect_download() as dl:
@@ -2611,6 +2756,7 @@ class PlaywrightDriver:
         # open — the gauge is the headroom signal, so it has to be honest about
         # a session that went away badly.
         metrics.add_open_tabs(-len(self._tabs))
+        self._closing = True
         self._sinks.clear()
         self._repaint_expected_at = None
         self._cancel_repaint_watch()
@@ -2623,10 +2769,13 @@ class PlaywrightDriver:
         # exit path that makes Chrome unlink its Singleton* locks (SIGTERM/SIGKILL
         # do not; verified) — so a graceful close leaves a lock-free profile on the
         # volume and the next sync round runs clean.
-        if self._context is not None:
-            await self._context.close()
+        if self._context is not None and self._attach != "extension":
+            await self._context.close()  # extension mode: the context is the user's
         if self._browser is not None:
             await self._browser.close()
+        if self._relay is not None:
+            await self._relay.stop()
+            self._relay = None
         if self._playwright is not None:
             await self._playwright.stop()
         await self._stop_tab_persist_writer()

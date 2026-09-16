@@ -33,6 +33,13 @@ log = logging.getLogger("workspace-tool-browser")
 DriverFactory = Callable[[str], Awaitable[BrowserDriver]]
 
 
+class BrowserGoneError(RuntimeError):
+    """The session's browser detached from it (the user disconnected the
+    extension or closed the last tab they gave it). Raised ONCE, by the first
+    use after it happened, with the browser's own reason; that use also ends
+    the session, so the next call starts a fresh one."""
+
+
 class BrowserSession:
     """One shared browser + the bookkeeping both planes touch."""
 
@@ -114,12 +121,12 @@ class SessionManager:
         """Return the session for ``session_id``, launching Chromium on first
         use. Concurrent callers on a cold id serialize on the per-id lock and
         share the one session."""
-        existing = self._sessions.get(session_id)
+        existing = await self._live(session_id)
         if existing is not None:
             existing.touch()
             return existing
         async with self._lock_for(session_id):
-            existing = self._sessions.get(session_id)  # re-check under lock
+            existing = await self._live(session_id)  # re-check under lock
             if existing is not None:
                 existing.touch()
                 return existing
@@ -129,6 +136,23 @@ class SessionManager:
             session = BrowserSession(session_id, driver)
             self._sessions[session_id] = session
             return session
+
+    async def _live(self, session_id: str) -> BrowserSession | None:
+        """The existing session, or None when there is none. A session whose
+        browser is gone is closed here and reported — every call would
+        otherwise keep touching a dead session the idle reaper never
+        reclaims, and the connect page would never be shown again."""
+        existing = self._sessions.get(session_id)
+        if existing is None:
+            return None
+        reason = existing.driver.gone()
+        if reason is None:
+            return existing
+        log.info("cobrowse session=%s browser gone: %s", session_id, reason)
+        await self.close(session_id)
+        raise BrowserGoneError(
+            f"the browser detached from this session ({reason}); the next call starts a new one"
+        )
 
     async def _evict_for_headroom(self, incoming_id: str) -> None:
         """Before launching a new session, if the pod is at the cap, close the

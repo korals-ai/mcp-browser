@@ -43,11 +43,17 @@ from mcp.server.lowlevel.server import request_ctx
 
 from src import agent_ops, browser_driver, metrics, profile_gc, recipes
 from src.agent_ops import AgentPaused, ToolInputError
-from src.browser_driver import BrowserDriver, PlaywrightDriver, StaleRefError, UnknownTabError
+from src.browser_driver import (
+    BrowserDriver,
+    NotInThisRuntimeError,
+    PlaywrightDriver,
+    StaleRefError,
+    UnknownTabError,
+)
 from src.cobrowse_ws import CoBrowseConnection
 from src.find_model import FindConfig
 from src.portal_creds import read_portals
-from src.sessions import SessionManager
+from src.sessions import BrowserGoneError, SessionManager
 
 log = logging.getLogger("workspace-tool-browser")
 
@@ -74,6 +80,18 @@ FIND_CONFIG = FindConfig(
     key=os.environ["BROWSER_FIND_INFERENCE_KEY"].strip(),
     model=os.environ["BROWSER_FIND_MODEL"].strip(),
 )
+# Which browser the driver drives. REQUIRED, two declared values: ``launch``
+# (its own Chromium — the image declares it) or ``extension`` (the USER's own
+# browser through the extension relay, src/cdp_relay.py). Anything else fails
+# here, at import, so a misspelt mode never runs as one of them.
+ATTACH = os.environ["BROWSER_ATTACH"].strip()
+if ATTACH not in browser_driver.ATTACH_MODES:
+    raise SystemExit(f"BROWSER_ATTACH={ATTACH!r} is not one of {browser_driver.ATTACH_MODES}")
+# Extension mode only: the pairing token the extension compares with the one it
+# shows on its connect page. A match skips the approval dialog; the empty
+# string is the declared "ask me in the browser each time" — a missing var in
+# extension mode is a crash, not a mode.
+EXTENSION_TOKEN = os.environ["BROWSER_EXTENSION_TOKEN"].strip() if ATTACH == "extension" else ""
 
 
 def _data_root() -> str:
@@ -224,12 +242,19 @@ def _schedule_profile_gc(force: bool = False) -> None:
 
 async def _playwright_factory(session_id: str) -> BrowserDriver:
     """Mint a started real driver for one chat's session (own profile + cache
-    subdirs). Injected into the manager in prod; tests pass a fake factory."""
-    driver = PlaywrightDriver(
-        profile_dir=_profile_dir_for(session_id),
-        cache_dir=_cache_dir_for(session_id),
-        disk_cache_size=DISK_CACHE_SIZE,
-    )
+    subdirs). Injected into the manager in prod; tests pass a fake factory.
+    In extension mode the profile IS the user's browser: no profile or cache
+    dir of ours; when the extension disconnects the driver reports itself
+    gone and the manager ends the session on its next use
+    (:class:`BrowserGoneError`)."""
+    if ATTACH == "extension":
+        driver = PlaywrightDriver(attach="extension", extension_token=EXTENSION_TOKEN)
+    else:
+        driver = PlaywrightDriver(
+            profile_dir=_profile_dir_for(session_id),
+            cache_dir=_cache_dir_for(session_id),
+            disk_cache_size=DISK_CACHE_SIZE,
+        )
     await driver.start()
     log.info("cobrowse session started session=%s", session_id)
     _schedule_profile_gc()
@@ -264,7 +289,15 @@ loopwatch.serve_health(mcp)
 
 # --- error mapping: domain errors become tool errors the model can act on ------
 
-_DOMAIN_ERRORS = (AgentPaused, UnknownTabError, StaleRefError, ToolInputError, recipes.RecipeError)
+_DOMAIN_ERRORS = (
+    AgentPaused,
+    UnknownTabError,
+    StaleRefError,
+    ToolInputError,
+    NotInThisRuntimeError,
+    BrowserGoneError,
+    recipes.RecipeError,
+)
 
 
 async def _run(coro: Awaitable[Any]) -> Any:
@@ -842,7 +875,7 @@ async def run_recipe(
         return {"status": "invalid_recipe", "reason": str(exc)}
     session_id = _session_id()
     if tabId is None:
-        session = await manager.get_or_create(session_id)
+        session = await _run(manager.get_or_create(session_id))
         tabId = session.driver.active_num()
     return await agent_ops.run_recipe(recipe, params or {}, tab_id=int(tabId), dispatch=_DISPATCH)
 

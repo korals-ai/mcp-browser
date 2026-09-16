@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 
-from src.sessions import SessionManager
+import pytest
+
+from src.sessions import BrowserGoneError, SessionManager
 from tests.conftest import FakeDriver, make_manager
 
 
@@ -91,3 +93,47 @@ async def test_cap_never_evicts_a_watched_session() -> None:
 
     assert manager.get("a") is a
     assert manager.get("b") is not None
+
+
+class _GoneDriver(FakeDriver):
+    """A driver whose browser can leave (extension mode): gone() carries the
+    browser's reason once it has."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.gone_reason: str | None = None
+
+    def gone(self) -> str | None:
+        return self.gone_reason
+
+
+async def test_a_gone_browser_ends_the_session_on_its_next_use_and_says_why() -> None:
+    """Without this the dead session is touched by every failing call, the
+    idle reaper never reclaims it, and the browser is never re-attached: the
+    first use after the browser left closes the session and reports the
+    browser's own reason; the use after that starts a fresh one."""
+    first = _GoneDriver()
+    drivers = [first, _GoneDriver()]
+    created: list[FakeDriver] = []
+
+    async def factory(_session_id: str) -> FakeDriver:
+        d = drivers.pop(0)
+        created.append(d)
+        return d
+
+    manager = SessionManager(factory)
+    session = await manager.get_or_create("chat1")
+    assert session.driver is first
+    first.gone_reason = "All controlled tabs detached"
+    with pytest.raises(BrowserGoneError, match="All controlled tabs detached"):
+        await manager.get_or_create("chat1")
+    assert first.closed is True
+    fresh = await manager.get_or_create("chat1")
+    assert fresh.driver is created[1] and fresh is not session
+
+
+async def test_a_driver_that_cannot_leave_is_never_gone() -> None:
+    manager, created = make_manager()
+    a = await manager.get_or_create("chat1")
+    b = await manager.get_or_create("chat1")
+    assert a is b and created[0].gone() is None

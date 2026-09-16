@@ -114,6 +114,28 @@ async def test_download_refuses_a_path_outside_the_volume(workspace: Any, fake: 
     assert (workspace / "downloads").is_dir()
 
 
+# --- a gone browser -----------------------------------------------------------------------
+
+
+async def test_a_gone_browser_is_a_tool_error_the_agent_reads_not_a_crash(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _Leaves(FakeDriver):
+        reason: str | None = None
+
+        def gone(self) -> str | None:
+            return self.reason
+
+    driver = _Leaves(DEFAULT_TREE)
+    manager, _ = make_manager(driver)
+    monkeypatch.setattr(server, "manager", manager)
+    await server.tabs_context_mcp()
+    driver.reason = "User disconnected"
+    with pytest.raises(ToolError, match="User disconnected"):
+        await server.tabs_context_mcp()
+    assert driver.closed is True
+
+
 # --- get_network_request ------------------------------------------------------------------
 
 

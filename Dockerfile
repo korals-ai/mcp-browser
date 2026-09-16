@@ -82,6 +82,9 @@ RUN playwright install-deps chromium \
 # makes the driver launch it headed (needs the Xvfb DISPLAY set by the entrypoint).
 ENV BROWSER_EXECUTABLE_PATH=/opt/chrome-linux64/chrome
 ENV BROWSER_HEADLESS=false
+# The image drives its own Chrome. The other value, `extension`, attaches to
+# a browser the extension is installed in — a host-side run, never this image.
+ENV BROWSER_ATTACH=launch
 
 WORKDIR /app
 
