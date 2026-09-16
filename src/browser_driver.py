@@ -137,6 +137,12 @@ _EXTENSION_CLIENT_NAME = "MCP browser tool"
 # picking a tab. Both are bounded — a wait with no end is a wedged session.
 _EXTENSION_CONNECT_TIMEOUT_S = 30.0
 _EXTENSION_APPROVE_TIMEOUT_S = 180.0
+# Once the extension is connected, Playwright's attach to the tab it handed
+# over (connect_over_cdp + adopting the tab) is bounded too — a healthy one
+# measures ~1 s, so 20 s is a dead tab, not a slow one: an unresponsive
+# tab otherwise hangs start() forever under the session lock — every later
+# call on that session waits on it, and the relay is never released.
+_EXTENSION_ATTACH_TIMEOUT_S = 20.0
 
 
 def _env_headless() -> bool:
@@ -1125,15 +1131,18 @@ class PlaywrightDriver:
                 else _EXTENSION_APPROVE_TIMEOUT_S
             )
             await relay.wait_for_extension(timeout)
-            self._browser = await self._playwright.chromium.connect_over_cdp(
-                relay.cdp_url, timeout=0
-            )
-            contexts = list(self._browser.contexts)
-            if not contexts:
-                raise RelayError("extension bridge exposed no browser context")
-            self._context = contexts[0]
-            log.info("cobrowse attached to the user's browser via extension relay")
-            return await self._adopt_first_tab()
+            try:
+                return await asyncio.wait_for(
+                    self._attach_over_cdp(relay), _EXTENSION_ATTACH_TIMEOUT_S
+                )
+            except TimeoutError as exc:
+                stuck = ", ".join(relay.unanswered()[:6]) or "nothing — Playwright itself"
+                raise RelayError(
+                    "the browser extension connected but attaching to the tab it handed "
+                    f"over did not finish within {_EXTENSION_ATTACH_TIMEOUT_S:.0f}s "
+                    f"(still unanswered by the browser: {stuck}) — the tab may be "
+                    "unresponsive; pick a different tab or reload that one"
+                ) from exc
         except BaseException:
             # Whatever failed — no browser binary, no extension, a refused
             # CDP connect — the loopback listener and any half-made browser
@@ -1146,6 +1155,15 @@ class PlaywrightDriver:
             await relay.stop()
             self._relay = None
             raise
+
+    async def _attach_over_cdp(self, relay: CdpRelay) -> _Tab:
+        self._browser = await self._playwright.chromium.connect_over_cdp(relay.cdp_url, timeout=0)
+        contexts = list(self._browser.contexts)
+        if not contexts:
+            raise RelayError("extension bridge exposed no browser context")
+        self._context = contexts[0]
+        log.info("cobrowse attached to the user's browser via extension relay")
+        return await self._adopt_first_tab()
 
     def _on_extension_closed(self, reason: str) -> None:
         if self._closing:

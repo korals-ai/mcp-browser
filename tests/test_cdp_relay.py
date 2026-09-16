@@ -461,6 +461,30 @@ async def test_debugger_detach_event_detaches_too() -> None:
     assert ext.cdp_out[-1]["method"] == "Target.detachedFromTarget"
 
 
+async def test_unanswered_names_the_extension_calls_still_in_flight() -> None:
+    bridge, ext = _make()
+    await _handshake(bridge, 7)
+    ext.fail_next = None
+    # Hold the extension's replies: swap the sender for one that records only.
+    held: list[dict[str, Any]] = []
+
+    async def hold(msg: dict[str, Any]) -> None:
+        held.append(msg)
+
+    bridge._send_ext = hold  # the seam the fake extension uses
+    task = asyncio.ensure_future(
+        bridge.on_cdp_message({"id": 1, "method": "Target.setAutoAttach", "params": {}})
+    )
+    await asyncio.sleep(0.01)
+    assert bridge.unanswered() == ["chrome.debugger.attach (tab 7)"]
+    await bridge.on_extension_message({"id": held[0]["id"], "result": {}})
+    await asyncio.sleep(0.01)
+    assert bridge.unanswered() == ["Target.getTargetInfo (tab 7)"]
+    bridge.close("gone")
+    assert bridge.unanswered() == []
+    await task  # the failed attach is swallowed like upstream; the reply is still sent
+
+
 async def test_close_fails_every_in_flight_extension_call() -> None:
     bridge, ext = _make()
     await _handshake(bridge, 7)

@@ -10,6 +10,7 @@ the loud degradations (``download``), and the server's ``BROWSER_ATTACH`` /
 
 from __future__ import annotations
 
+import asyncio
 import importlib
 from typing import Any, ClassVar
 
@@ -120,6 +121,9 @@ class _FakeRelay:
         self.waited_s = timeout_s
         if _FakeRelay.wait_outcome is not None:
             raise _FakeRelay.wait_outcome
+
+    def unanswered(self) -> list[str]:
+        return ["Page.getFrameTree (tab 7)"]
 
     async def stop(self) -> None:
         self.stopped = True
@@ -325,6 +329,39 @@ async def test_connect_failing_after_the_extension_arrived_releases_the_relay(
     monkeypatch.setattr(chromium, "connect_over_cdp", refuse)
     with pytest.raises(RuntimeError, match="refused"):
         await d.start()
+    assert fake_relay.instances[0].stopped
+    assert d._relay is None
+
+
+async def test_an_attach_that_never_finishes_is_bounded_and_releases_the_relay(
+    monkeypatch: pytest.MonkeyPatch, fake_relay: type[_FakeRelay]
+) -> None:
+    """An unresponsive tab hung connect_over_cdp forever (real Chrome,
+    2026-09-16): start() sat under the session lock, every later call
+    queued behind it, the relay stayed up. Now it is a RelayError naming
+    the tab, and the relay is gone with it."""
+
+    async def opener(_url: str) -> None:
+        pass
+
+    d = PlaywrightDriver(
+        attach="extension",
+        extension_token="t",
+        connect_opener=opener,
+        headless=True,
+        executable_path="",
+    )
+    chromium, _ctx, _page = _wire(d, monkeypatch)
+
+    async def hang(_url: str, **_kw: Any) -> _FakeBrowser:
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    monkeypatch.setattr(chromium, "connect_over_cdp", hang)
+    monkeypatch.setattr(browser_driver, "_EXTENSION_ATTACH_TIMEOUT_S", 0.05)
+    with pytest.raises(RelayError, match="did not finish within 0s") as info:
+        await d.start()
+    assert "Page.getFrameTree (tab 7)" in str(info.value)  # what it was stuck on
     assert fake_relay.instances[0].stopped
     assert d._relay is None
 

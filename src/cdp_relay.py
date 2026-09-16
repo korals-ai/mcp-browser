@@ -100,6 +100,8 @@ class ExtensionBridge:
         # answered under their own id. chrome.debugger refuses the real one.
         self._browser_aliases: set[str] = set()
         self._ext_pending: dict[int, asyncio.Future[Any]] = {}
+        # id → one-line description of the call, for :meth:`unanswered`.
+        self._ext_inflight: dict[int, str] = {}
         self._ext_last_id = 0
         # Set by `extension.initialized`; CDP commands are not processed before.
         self.initialized = asyncio.Event()
@@ -111,6 +113,7 @@ class ExtensionBridge:
         msg_id = msg.get("id")
         if msg_id is not None and msg_id in self._ext_pending:
             fut = self._ext_pending.pop(msg_id)
+            self._ext_inflight.pop(msg_id, None)
             if fut.done():
                 return
             if msg.get("error"):
@@ -420,8 +423,15 @@ class ExtensionBridge:
         msg_id = self._ext_last_id
         fut: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
         self._ext_pending[msg_id] = fut
+        self._ext_inflight[msg_id] = _describe_call(method, params)
         await self._send_ext({"id": msg_id, "method": method, "params": params})
         return await fut
+
+    def unanswered(self) -> list[str]:
+        """The extension calls still waiting for a reply, oldest first — what
+        a stalled attach is stuck on (the tab that never answered
+        ``Page.getFrameTree``, the attach Chrome never acknowledged)."""
+        return [self._ext_inflight[i] for i in sorted(self._ext_inflight)]
 
     def _spawn(self, coro: Awaitable[Any]) -> None:
         task = asyncio.ensure_future(coro)
@@ -434,6 +444,16 @@ class ExtensionBridge:
             if not fut.done():
                 fut.set_exception(RelayError(f"Extension disconnected: {reason}"))
         self._ext_pending.clear()
+        self._ext_inflight.clear()
+
+
+def _describe_call(method: str, params: list[Any]) -> str:
+    if method == "chrome.debugger.sendCommand" and len(params) > 1:
+        target = params[0] if isinstance(params[0], dict) else {}
+        return f"{params[1]} (tab {target.get('tabId')})"
+    if params and isinstance(params[0], dict) and "tabId" in params[0]:
+        return f"{method} (tab {params[0]['tabId']})"
+    return method
 
 
 def _log_task_error(task: asyncio.Task[Any]) -> None:
@@ -524,6 +544,10 @@ class CdpRelay:
             ) from exc
         if self._bridge is None or self._bridge.closed:
             raise RelayError(f"Extension disconnected: {self.disconnect_reason}")
+
+    def unanswered(self) -> list[str]:
+        """Extension calls still in flight (empty before the extension connects)."""
+        return self._bridge.unanswered() if self._bridge is not None else []
 
     async def stop(self) -> None:
         await self._close_links("Server stopped")
