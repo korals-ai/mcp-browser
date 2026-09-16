@@ -2,6 +2,8 @@
 
 A real browser an agent can drive — and a human can watch. An [MCP](https://modelcontextprotocol.io) server speaking Streamable
 HTTP: run it in a container, point your agent at `http://localhost:8096/mcp`.
+It works with the agent you already use — Claude Code, Codex, Gemini CLI,
+opencode, Cursor, VS Code, or any MCP client that talks to remote servers.
 
 A full Playwright-driven Chrome exposed as MCP tools **with the Claude-in-Chrome
 extension's tool contract, verbatim** — `computer`, `read_page`, `find`,
@@ -25,23 +27,73 @@ the platform's own React viewer imports, so the two can never disagree about the
 
 ## Quickstart
 
+**1. Choose how `find` works.** `find` turns a description ("the search box in
+the header") into an element on the page.
+
+```bash
+cp .env.example .env
+```
+
+As copied, `.env` selects **literal matching**: no model, no key, no cost —
+`find` matches the page's own words. For fuzzy descriptions, give it a small
+model instead: any endpoint that speaks the Anthropic Messages API works (see
+[Choosing a model for `find`](#choosing-a-model-for-find)). The quickest is
+[OpenRouter](https://openrouter.ai) — one key, hundreds of models, some of them
+free:
+
+```bash
+BROWSER_FIND_INFERENCE_URL=https://openrouter.ai/api
+BROWSER_FIND_INFERENCE_KEY=<your key from https://openrouter.ai/keys>
+BROWSER_FIND_MODEL=anthropic/claude-haiku-4.5
+```
+
+**2. Start the server.**
+
 ```bash
 docker compose up          # builds the image the first time
 ```
 
-Then register it with your agent. Claude Code:
+**3. Connect your agent** to `http://localhost:8096/mcp?chat_id=local`:
+
+Claude Code
 
 ```bash
 claude mcp add --transport http browser 'http://localhost:8096/mcp?chat_id=local'
 ```
 
-…or in a client config:
+Codex
 
-```json
-{"mcpServers": {"browser": {"type": "http", "url": "http://localhost:8096/mcp?chat_id=local"}}}
+```bash
+codex mcp add browser --url 'http://localhost:8096/mcp?chat_id=local'
 ```
 
-Then open **http://localhost:8096** in a browser tab to watch it work.
+Gemini CLI
+
+```bash
+gemini mcp add --transport http browser 'http://localhost:8096/mcp?chat_id=local'
+```
+
+opencode — in `opencode.json`:
+
+```json
+{"mcp": {"browser": {"type": "remote", "url": "http://localhost:8096/mcp?chat_id=local"}}}
+```
+
+Cursor — in `~/.cursor/mcp.json`:
+
+```json
+{"mcpServers": {"browser": {"url": "http://localhost:8096/mcp?chat_id=local"}}}
+```
+
+VS Code — in `.vscode/mcp.json`:
+
+```json
+{"servers": {"browser": {"type": "http", "url": "http://localhost:8096/mcp?chat_id=local"}}}
+```
+
+Any other client: a Streamable HTTP MCP server at that URL.
+
+**4. Watch it work** — open **http://localhost:8096** in a browser tab.
 
 **The `?chat_id=` is required, not decorative.** Each id gets its own browser
 session and its own persisted profile, and the server rejects a tool call that
@@ -112,13 +164,36 @@ than picking a default.
 
 | variable | meaning |
 | --- | --- |
-| `BROWSER_FIND_INFERENCE_URL` | base URL of an Anthropic-compatible `/v1/messages` endpoint for `find`'s model tier; `""` = literal matching only |
+| `BROWSER_FIND_INFERENCE_URL` | base URL of an endpoint speaking the Anthropic Messages API (`/v1/messages` is appended) for `find`'s model tier — e.g. `https://openrouter.ai/api`, `https://api.anthropic.com`; `""` = literal matching only |
 | `BROWSER_FIND_INFERENCE_KEY` | its API key (`""` when the URL is empty) |
-| `BROWSER_FIND_MODEL` | the model `find` asks, e.g. `claude-haiku-4-5-20251001` |
+| `BROWSER_FIND_MODEL` | the model `find` asks, in that provider's own naming — `anthropic/claude-haiku-4.5` on OpenRouter, `claude-haiku-4-5-20251001` on Anthropic; required with a URL, `""` without one |
 | `BROWSER_ATTACH` | `launch` (the server runs its own Chromium — what the image does) or `extension` (drive YOUR browser through a browser extension; see below) |
 | `BROWSER_EXTENSION_ID` | extension mode only: the extension you installed — `ipjfogjeagnpojnjignlhfapffkdpahi` (this repo's `extension/`) or `mmlmfjhmonkocbjadbfplnigmagldckm` (the Playwright Extension) |
 | `BROWSER_EXTENSION_TOKEN` | extension mode only: the token the extension's connect page shows, so it connects without asking each time; `""` = approve in the browser every time |
 | `BROWSER_HEADLESS`, `BROWSER_EXECUTABLE_PATH`, `BROWSER_MAX_SESSIONS`, `BROWSER_VIEWER_DIR`, `WORKSPACE_TOOL_HOST`, `WORKSPACE_TOOL_PORT`, `CONNECTORS_CREDS_DIR` | see `docker-compose.yml` |
+
+## Choosing a model for `find`
+
+`find` first matches the accessibility tree's own words; only a query those
+words cannot answer goes to the model, with the tree and the query, and the
+answer is checked against the refs that exist — a model can pick the wrong
+element, but never one that is not on the page. So the model tier needs a
+small, fast model, not a large one.
+
+- **Provider.** Any endpoint that speaks the Anthropic Messages API:
+  [OpenRouter](https://openrouter.ai/models), Anthropic itself, or a gateway
+  you run. Switching is three variables — nothing in the server knows which
+  provider it is talking to.
+- **Model.** `anthropic/claude-haiku-4.5` on OpenRouter
+  (`claude-haiku-4-5-20251001` on Anthropic) is what `find` is written against.
+  OpenRouter's free models (ids ending `:free`) cost nothing, but they are
+  rate-limited, the list changes, and they have not been measured on `find`
+  here — try one on your own sites before relying on it.
+- **Attribution.** Model calls carry `HTTP-Referer` and `X-OpenRouter-Title`
+  headers naming this project, which OpenRouter uses for its public app
+  rankings; other providers ignore them. The content sent is the page's
+  accessibility tree (with any password `login` typed blanked out) and your
+  query — nothing else.
 
 ## Driving your own browser (extension mode)
 

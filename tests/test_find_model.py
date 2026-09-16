@@ -6,7 +6,14 @@ from typing import Any
 
 import pytest
 
-from src.find_model import FindConfig, build_prompt, find_with_model, parse_answer
+from src.find_model import (
+    APP_TITLE,
+    APP_URL,
+    FindConfig,
+    build_prompt,
+    find_with_model,
+    parse_answer,
+)
 
 
 def test_config_enabled_only_with_a_url() -> None:
@@ -69,7 +76,18 @@ async def test_find_with_model_posts_to_v1_messages_with_the_key() -> None:
     assert url == "https://gw.example/v1/messages"
     assert payload["model"] == "claude-haiku-4-5-20251001"
     assert headers["x-api-key"] == "vk-1"
+    assert headers["authorization"] == "Bearer vk-1"
     assert payload["messages"][0]["content"].startswith("You are locating elements")
+    # Attribution rides on every call, whichever provider the URL names.
+    assert headers["HTTP-Referer"] == APP_URL == "https://github.com/korals-ai/mcp-browser"
+    assert headers["X-OpenRouter-Title"] == APP_TITLE
+
+
+def test_an_endpoint_without_a_model_is_refused_at_construction() -> None:
+    with pytest.raises(ValueError, match="BROWSER_FIND_MODEL is empty"):
+        FindConfig(url="https://openrouter.ai/api", key="sk-or-x", model="")
+    # The literal-only tier names no model, and needs none.
+    assert FindConfig(url="", key="", model="").enabled is False
 
 
 async def test_find_with_model_raises_on_a_bad_status() -> None:

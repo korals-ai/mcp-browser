@@ -10,3 +10,5 @@ __pycache__/
 *.egg-info/
 # The viewer's local toolchain (npm install in viewer/).
 node_modules/
+# docker compose's local settings — carries find's API key (.env.example is the template).
+.env

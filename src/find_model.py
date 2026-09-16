@@ -3,9 +3,9 @@
 The extension's ``find`` is model-backed: the accessibility tree plus the
 query go to a small fast model that answers with refs and a one-line reason
 each, so the main model never pays 20-50k tokens of tree to locate one
-control. This module is that call, against any Anthropic-compatible
-``/v1/messages`` endpoint (the platform's AI gateway is one; a local user's
-own key is another).
+control. This module is that call, against any endpoint that speaks the
+Anthropic Messages API (``/v1/messages``): an AI gateway, OpenRouter, or
+Anthropic itself — which one is the operator's choice, never this code's.
 
 Configured by :class:`FindConfig`, built from env in ``server.py``. The
 endpoint URL is REQUIRED and an explicit empty value is the declared sentinel
@@ -29,6 +29,14 @@ _ANSWER_RE = re.compile(r"^\s*[-*]?\s*(?P<ref>[A-Za-z]+\d+(?:e\d+)?)\s*[:—-]\s
 _MAX_HITS = 20
 _TIMEOUT_S = 20.0
 
+# Who is calling. OpenRouter ranks and attributes apps by these two headers
+# (the Referer is the app's identity, the title its display name — both, for
+# an app that runs locally with no site of its own); every other Messages
+# endpoint ignores headers it does not know. So they ride on every call
+# rather than branching on the configured provider.
+APP_URL = "https://github.com/korals-ai/mcp-browser"
+APP_TITLE = "mcp-browser"
+
 
 @dataclass(frozen=True)
 class FindConfig:
@@ -37,6 +45,17 @@ class FindConfig:
     url: str
     key: str
     model: str
+
+    def __post_init__(self) -> None:
+        # Model ids are the provider's own (`anthropic/claude-haiku-4.5` on
+        # OpenRouter, `claude-haiku-4-5-20251001` on Anthropic), so an endpoint
+        # without one is a misconfiguration to stop at startup, not a call to
+        # fail on the first `find`.
+        if self.url and not self.model:
+            raise ValueError(
+                "BROWSER_FIND_INFERENCE_URL names an endpoint but BROWSER_FIND_MODEL is "
+                "empty — name the model find should ask, in that provider's own naming"
+            )
 
     @property
     def enabled(self) -> bool:
@@ -93,6 +112,8 @@ async def find_with_model(
     headers = {
         "content-type": "application/json",
         "anthropic-version": "2023-06-01",
+        "HTTP-Referer": APP_URL,
+        "X-OpenRouter-Title": APP_TITLE,
     }
     if config.key:
         headers["x-api-key"] = config.key
