@@ -7,8 +7,12 @@
 mcp>=1.2,<2
 
 # The real browser. Chromium is installed separately in the Dockerfile via
-# `playwright install`; this is just the driver library.
-playwright>=1.40
+# `playwright install`; this is just the driver library. Pinned EXACTLY: in
+# extension mode the relay (src/cdp_relay.py) emulates a Chrome CDP endpoint
+# for this driver's connect_over_cdp, so a driver bump is a deliberate change
+# re-measured with the extension tool-coverage matrix, never a silent one at
+# image build.
+playwright==1.63.0
 
 # ASGI server for the combined /mcp + /cobrowse app. `standard` bundles the
 # websockets impl the co-browse plane needs.

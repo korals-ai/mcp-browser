@@ -34,7 +34,7 @@ from collections import deque
 from typing import TYPE_CHECKING, Any, NamedTuple, Protocol
 
 from src import metrics
-from src.cdp_relay import PLAYWRIGHT_EXTENSION_ID, CdpRelay, RelayError
+from src.cdp_relay import MCP_BROWSER_EXTENSION_ID, CdpRelay, RelayError
 from src.input_map import to_cdp_command
 from src.keys import to_playwright_combo
 from src.page_state import classify_page_state
@@ -143,6 +143,9 @@ _EXTENSION_APPROVE_TIMEOUT_S = 180.0
 # tab otherwise hangs start() forever under the session lock — every later
 # call on that session waits on it, and the relay is never released.
 _EXTENSION_ATTACH_TIMEOUT_S = 20.0
+# Extension mode: how long a click may take to turn into a finished download
+# in the user's browser (chrome.downloads), polled every quarter second.
+_EXTENSION_DOWNLOAD_TIMEOUT_S = 30.0
 
 
 def _env_headless() -> bool:
@@ -756,6 +759,42 @@ class BrowserDriver(Protocol):
     async def close(self) -> None: ...
 
 
+def _own_download_id(
+    reported: dict[int, dict[str, Any]],
+    known: set[int],
+    started: float,
+    page_url: str,
+) -> int | None:
+    """The id of the download the click started, out of what chrome.downloads
+    has announced: an id we had not seen before the click, started no earlier
+    than it. A page that starts several gives the lowest (Chrome's ids
+    increase), and one whose ``referrer`` is the page we clicked on wins over
+    one the user happened to start at the same moment."""
+    fresh = [
+        i
+        for i, item in reported.items()
+        if i not in known and _download_started_at(item) >= started - 1.0
+    ]
+    if not fresh:
+        return None
+    ours = [i for i in fresh if str(reported[i].get("referrer") or "") == page_url]
+    return min(ours or fresh)
+
+
+def _download_started_at(item: dict[str, Any]) -> float:
+    """chrome.downloads' ``startTime`` (ISO 8601, e.g. 2026-09-16T14:22:33.123Z)
+    as a Unix timestamp; unparseable → 0 (treated as older than any click)."""
+    raw = str(item.get("startTime") or "")
+    if not raw:
+        return 0.0
+    try:
+        from datetime import datetime
+
+        return datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return 0.0
+
+
 def _read_cgroup_memory() -> tuple[int, int] | None:
     """This container's ``(used, limit)`` memory in bytes, or None where the
     cgroup files aren't readable (macOS dev, CI). Pure filesystem — run it on a
@@ -863,7 +902,7 @@ class PlaywrightDriver:
         executable_path: str | None = None,
         attach: str = "launch",
         extension_token: str = "",
-        extension_id: str = PLAYWRIGHT_EXTENSION_ID,
+        extension_id: str = MCP_BROWSER_EXTENSION_ID,
         connect_opener: Callable[[str], Awaitable[None]] | None = None,
     ) -> None:
         if attach not in ATTACH_MODES:
@@ -2235,17 +2274,7 @@ class PlaywrightDriver:
 
     async def download(self, ref: str, dest_path: str) -> dict[str, Any]:
         if self._attach == "extension":
-            # S1 (2026-09-16): chrome.debugger refuses both Browser.setDownloadBehavior
-            # and the tab-level Page.setDownloadBehavior ("Cannot not access
-            # browser-level commands"), so nothing here can observe or place the
-            # file. A plain click still downloads it — into the user's own
-            # Downloads folder, where only the user can see it.
-            raise NotInThisRuntimeError(
-                "download is not available when attached to the user's own browser: "
-                "the tool cannot capture the file. A `computer` left_click on the link "
-                "downloads it into the browser's Downloads folder; tell the user that is "
-                "where to find it."
-            )
+            return await self._download_via_extension(ref, dest_path)
         tab = self._active()
         loc = self._ref_locator(tab, ref)
         async with tab.page.expect_download() as dl:
@@ -2253,6 +2282,90 @@ class PlaywrightDriver:
         download = await dl.value
         await download.save_as(dest_path)
         return {"filename": download.suggested_filename, "saved": True}
+
+    async def _download_via_extension(self, ref: str, dest_path: str) -> dict[str, Any]:
+        """chrome.debugger has no download control ("Cannot not access
+        browser-level commands" for both Browser.* and the tab-level
+        Page.setDownloadBehavior), so the click saves the file where the
+        user's browser saves files; chrome.downloads then says where, and
+        the server — on the same machine in this runtime — copies it into
+        the data volume."""
+        if self._relay is None:
+            raise RelayError("Extension not connected")
+        if self._extension_id != MCP_BROWSER_EXTENSION_ID:
+            # An extension without chrome.downloads would answer the search with
+            # "Unknown method" — AFTER the click had already saved the file
+            # somewhere only the user can see. Say so before doing anything.
+            raise NotInThisRuntimeError(
+                "this browser extension has no download control, so the file cannot be "
+                "captured here; the extension that can is the one this server ships "
+                "(BROWSER_EXTENSION_ID), or tell the user to click the link themselves"
+            )
+        tab = self._active()
+        loc = self._ref_locator(tab, ref)
+        # Downloads are a property of the BROWSER, not of a tab: the ids known
+        # before the click are how our own is told apart afterwards.
+        known = set(self._relay.downloads)
+        started = time.time()
+        await loc.click(timeout=_ACTION_TIMEOUT_MS)
+        item = await self._await_browser_download(known, started, tab)
+        source = str(item.get("filename") or "")
+        if not source or not await asyncio.to_thread(os.path.isfile, source):
+            raise NotInThisRuntimeError(
+                f"the browser saved the download as {source or '(unknown)'} on its own "
+                "machine, which this server cannot read; tell the user it is in their "
+                "browser's Downloads folder"
+            )
+        await asyncio.to_thread(shutil.copyfile, source, dest_path)
+        return {"filename": os.path.basename(source), "saved": True}
+
+    async def _await_browser_download(
+        self, known: set[int], started: float, tab: _Tab
+    ) -> dict[str, Any]:
+        """The download THIS click started, waited to ``complete``.
+
+        Identified by the id ``chrome.downloads.onCreated`` announced after the
+        click (the relay records those events), never by "the newest item":
+        the download list is browser-wide, so the newest item can be one the
+        user started in a tab the agent was never given — copying that would
+        hand the agent someone else's file under a success.
+        """
+        assert self._relay is not None
+        deadline = time.monotonic() + _EXTENSION_DOWNLOAD_TIMEOUT_S
+        item_id: int | None = None
+        seen_state: str | None = None
+        while time.monotonic() < deadline:
+            if item_id is None:
+                item_id = _own_download_id(self._relay.downloads, known, started, tab.page.url)
+            if item_id is not None:
+                item = await self._search_download(item_id)
+                if item is not None:
+                    seen_state = str(item.get("state") or "")
+                    if seen_state == "complete":
+                        return item
+                    if seen_state == "interrupted":
+                        raise RelayError(
+                            "the browser interrupted the download: "
+                            f"{item.get('error') or 'unknown'}"
+                        )
+            await asyncio.sleep(0.25)
+        raise RelayError(
+            f"no download finished within {_EXTENSION_DOWNLOAD_TIMEOUT_S:.0f}s of the click"
+            + (
+                f" (it is still {seen_state})"
+                if seen_state
+                else " — the click started no download; if the browser asks where to "
+                "save files, that dialog is open"
+            )
+        )
+
+    async def _search_download(self, item_id: int) -> dict[str, Any] | None:
+        assert self._relay is not None
+        items = await self._relay.call_extension("chrome.downloads.search", [{"id": item_id}])
+        for item in items if isinstance(items, list) else []:
+            if isinstance(item, dict):
+                return item
+        return None
 
     async def eval_js(self, js: str) -> dict[str, Any]:
         # The wrapper stringifies + length-caps INSIDE the page and returns

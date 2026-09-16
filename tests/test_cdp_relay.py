@@ -21,7 +21,14 @@ from urllib.parse import parse_qs, urlparse
 
 import pytest
 
-from src.cdp_relay import PROTOCOL_VERSION, CdpRelay, ExtensionBridge, RelayError
+from src import cdp_relay
+from src.cdp_relay import (
+    MCP_BROWSER_EXTENSION_ID,
+    PROTOCOL_VERSION,
+    CdpRelay,
+    ExtensionBridge,
+    RelayError,
+)
 
 
 class FakeExtension:
@@ -485,6 +492,39 @@ async def test_unanswered_names_the_extension_calls_still_in_flight() -> None:
     await task  # the failed attach is swallowed like upstream; the reply is still sent
 
 
+async def test_keepalive_and_download_events_are_absorbed_into_the_model() -> None:
+    bridge, ext = _make()
+    await _handshake(bridge, 7)
+    await bridge.on_extension_message({"method": "extension.keepalive", "params": []})
+    await bridge.on_extension_message(
+        {
+            "method": "chrome.downloads.onCreated",
+            "params": [{"id": 5, "url": "https://x/f.pdf", "state": "in_progress", "filename": ""}],
+        }
+    )
+    await bridge.on_extension_message(
+        {
+            "method": "chrome.downloads.onChanged",
+            "params": [
+                {
+                    "id": 5,
+                    "filename": {"previous": "", "current": "/Users/u/Downloads/f.pdf"},
+                    "state": {"previous": "in_progress", "current": "complete"},
+                }
+            ],
+        }
+    )
+    assert bridge.downloads == {
+        5: {
+            "id": 5,
+            "url": "https://x/f.pdf",
+            "state": "complete",
+            "filename": "/Users/u/Downloads/f.pdf",
+        }
+    }
+    assert ext.cdp_out == []  # none of it is CDP; Playwright never sees it
+
+
 async def test_close_fails_every_in_flight_extension_call() -> None:
     bridge, ext = _make()
     await _handshake(bridge, 7)
@@ -506,6 +546,14 @@ async def test_close_fails_every_in_flight_extension_call() -> None:
 
 
 # --- CdpRelay over real loopback sockets ---------------------------------------------
+
+
+def test_connect_url_names_the_local_target_and_defaults_to_our_extension() -> None:
+    relay = CdpRelay(client_name="MCP browser tool", token="")
+    relay._port = 4321
+    url = relay.connect_url()
+    assert url.startswith(f"chrome-extension://{MCP_BROWSER_EXTENSION_ID}/connect.html?")
+    assert parse_qs(urlparse(url).query)["target"] == ["local"]
 
 
 def test_connect_url_carries_the_upstream_query_shape() -> None:
@@ -569,6 +617,47 @@ async def test_relay_end_to_end_over_sockets() -> None:
         with pytest.raises(Exception, match="Playwright client disconnected"):
             while True:
                 await ext.recv()
+    finally:
+        await relay.stop()
+
+
+async def test_call_extension_goes_through_the_live_bridge_over_sockets() -> None:
+    relay = CdpRelay(client_name="test", token="")
+    await relay.start()
+    try:
+        with pytest.raises(RelayError, match="Extension not connected"):
+            await relay.call_extension("chrome.downloads.search", [{}])
+        ext = await _connect(relay.extension_url)
+        await ext.send(json.dumps({"method": "extension.initialized", "params": []}))
+        await relay.wait_for_extension(5)
+        task = asyncio.ensure_future(
+            relay.call_extension("chrome.downloads.search", [{"limit": 5}])
+        )
+        cmd = json.loads(await ext.recv())
+        assert cmd["method"] == "chrome.downloads.search" and cmd["params"] == [{"limit": 5}]
+        await ext.send(json.dumps({"id": cmd["id"], "result": [{"id": 1, "state": "complete"}]}))
+        assert await task == [{"id": 1, "state": "complete"}]
+    finally:
+        await relay.stop()
+
+
+async def test_an_extension_that_never_answers_fails_the_call_instead_of_hanging(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A service worker can stop answering with its socket still open. The
+    caller's own deadline cannot fire while it awaits a future nobody will
+    resolve, so the call carries the bound — and stops being listed as
+    in-flight, or a later attach would report it as what it is stuck on."""
+    monkeypatch.setattr(cdp_relay, "_EXTENSION_CALL_TIMEOUT_S", 0.05)
+    relay = CdpRelay(client_name="test", token="")
+    await relay.start()
+    try:
+        ext = await _connect(relay.extension_url)
+        await ext.send(json.dumps({"method": "extension.initialized", "params": []}))
+        await relay.wait_for_extension(5)
+        with pytest.raises(RelayError, match=r"did not answer chrome\.downloads\.search within"):
+            await relay.call_extension("chrome.downloads.search", [{"id": 7}])
+        assert relay.unanswered() == []
     finally:
         await relay.stop()
 

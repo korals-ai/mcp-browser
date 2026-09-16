@@ -1,0 +1,7 @@
+MCP Browser Bridge
+
+This extension is derived from `packages/extension` of the Playwright project
+(https://github.com/microsoft/playwright), Copyright (c) Microsoft Corporation,
+licensed under the Apache License, Version 2.0. The files under src/ that
+carry a "Derived from" note are modified copies; the rest is original work.
+The whole is distributed under the Apache License, Version 2.0 (see ../LICENSE).

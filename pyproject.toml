@@ -6,7 +6,7 @@ requires-python = ">=3.11"
 # Runtime deps. Mirror requirements.txt (the image installs that, not this).
 dependencies = [
     "mcp>=1.2,<2",
-    "playwright>=1.40",
+    "playwright==1.63.0",
     "uvicorn[standard]>=0.30",
     "prometheus_client>=0.20",
     "httpx>=0.27",

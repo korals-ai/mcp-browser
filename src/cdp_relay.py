@@ -2,13 +2,19 @@
 
 The third runtime of the browser tool is the user's OWN browser, reached through
 an extension that holds the ``debugger`` permission. The extension cannot speak
-CDP to Playwright directly — an extension may only issue five ``chrome.*``
-calls (``debugger.attach/detach/sendCommand``, ``tabs.create/remove``) and
-forward four ``chrome.*`` events — so this relay sits between the two and
-translates. It is the Playwright Extension's protocol v2, implemented verbatim
-(``packages/extension`` + ``tools/mcp/cdpRelay.ts`` in microsoft/playwright);
-the extension side is unmodified upstream code, so a divergence here is a bug
-here.
+CDP to Playwright directly — it may only issue an allow-listed set of
+``chrome.*`` calls and forward a few ``chrome.*`` events — so this relay sits
+between the two and translates.
+
+The wire contract is the Playwright Extension's protocol v2
+(``packages/extension`` + ``tools/mcp/cdpRelay.ts`` in microsoft/playwright),
+which this relay implements, plus three additions the extension in
+``extension/`` makes: ``chrome.downloads.search`` as a sixth allowed call with
+``chrome.downloads.onCreated``/``onChanged`` forwarded (so ``download`` can
+find the file a click saved), an ``extension.keepalive`` notification, and a
+``target`` parameter on the connect URL. The upstream extension still pairs
+with this relay — it simply never sends the additions, and ``download`` fails
+loud there.
 
 Two WebSocket endpoints on a loopback-only ephemeral port:
 
@@ -43,10 +49,22 @@ from urllib.parse import quote
 
 log = logging.getLogger("workspace-tool-browser")
 
-# The Web Store id of the upstream Playwright Extension (Apache-2.0), the
-# bridge used until our own fork ships. A fork carries a different id.
+# Our extension (``extension/`` next to this package; its manifest pins the
+# id with a public key so a `Load unpacked` gets the same id on every machine)
+# and the upstream Playwright Extension it was forked from (Apache-2.0), which
+# still works with this relay minus our additions (downloads, keepalive).
+MCP_BROWSER_EXTENSION_ID = "ipjfogjeagnpojnjignlhfapffkdpahi"
+
+# A chrome.* call made outside CDP (chrome.downloads.search) — see
+# CdpRelay.call_extension. A healthy one answers in milliseconds.
+_EXTENSION_CALL_TIMEOUT_S = 10.0
 PLAYWRIGHT_EXTENSION_ID = "mmlmfjhmonkocbjadbfplnigmagldckm"
 PROTOCOL_VERSION = 2
+# Our additions to the wire protocol: what the extension sends unprompted
+# (a keepalive on its alarm, download events) and the one command
+# ``download`` needs.
+KEEPALIVE_METHOD = "extension.keepalive"
+DOWNLOAD_EVENTS = ("chrome.downloads.onCreated", "chrome.downloads.onChanged")
 
 # CDP frames carry base64 screenshots / screencast frames; the default 1 MiB
 # would drop them mid-session with a 1009 and no message.
@@ -106,6 +124,9 @@ class ExtensionBridge:
         # Set by `extension.initialized`; CDP commands are not processed before.
         self.initialized = asyncio.Event()
         self.closed = False
+        # chrome.downloads items as the extension reported them, merged from
+        # onCreated (the whole item) and onChanged (deltas: {key: {current}}).
+        self.downloads: dict[int, dict[str, Any]] = {}
 
     # --- extension → bridge -------------------------------------------------
 
@@ -138,8 +159,23 @@ class ExtensionBridge:
             await self._detach_tab(int(params[0].get("tabId", -1)))
         elif method == "extension.initialized":
             self.initialized.set()
+        elif method == KEEPALIVE_METHOD:
+            log.debug("cdp-relay: extension keepalive")  # its worker staying awake; no answer
+        elif method in DOWNLOAD_EVENTS and params:
+            self._on_download_event(params[0])
         elif method is None and "error" in msg:
             log.warning("cdp-relay: extension protocol error %s", msg["error"])
+
+    def _on_download_event(self, item: Any) -> None:
+        if not isinstance(item, dict) or item.get("id") is None:
+            return
+        current = self.downloads.setdefault(int(item["id"]), {})
+        for key, value in item.items():
+            # onChanged carries {key: {previous, current}}; onCreated plain values.
+            if isinstance(value, dict) and "current" in value:
+                current[key] = value["current"]
+            else:
+                current[key] = value
 
     def _on_tab_created(self, tab: dict[str, Any]) -> None:
         tab_id = tab.get("id")
@@ -416,7 +452,9 @@ class ExtensionBridge:
 
     # --- extension RPC ------------------------------------------------------
 
-    async def _call_extension(self, method: str, params: list[Any]) -> Any:
+    async def _call_extension(
+        self, method: str, params: list[Any], bound_s: float | None = None
+    ) -> Any:
         if self.closed:
             raise RelayError("Extension not connected")
         self._ext_last_id += 1
@@ -425,7 +463,21 @@ class ExtensionBridge:
         self._ext_pending[msg_id] = fut
         self._ext_inflight[msg_id] = _describe_call(method, params)
         await self._send_ext({"id": msg_id, "method": method, "params": params})
-        return await fut
+        if bound_s is None:
+            # A CDP command: Playwright's own call already bounds it, and the
+            # attach path bounds the handshake (see BrowserDriver).
+            return await fut
+        try:
+            async with asyncio.timeout(bound_s):
+                return await fut
+        except TimeoutError as exc:
+            # Drop the future: a late reply must not resolve it, and
+            # `unanswered()` should stop naming a call nobody waits for.
+            self._ext_pending.pop(msg_id, None)
+            self._ext_inflight.pop(msg_id, None)
+            raise RelayError(
+                f"the browser extension did not answer {method} within {bound_s:.0f}s"
+            ) from exc
 
     def unanswered(self) -> list[str]:
         """The extension calls still waiting for a reply, oldest first — what
@@ -516,16 +568,19 @@ class CdpRelay:
     def extension_url(self) -> str:
         return f"ws://127.0.0.1:{self._port}{self._ext_path}"
 
-    def connect_url(self, extension_id: str = PLAYWRIGHT_EXTENSION_ID) -> str:
+    def connect_url(self, extension_id: str = MCP_BROWSER_EXTENSION_ID) -> str:
         """The extension's connect page, parameterised the way upstream's
-        relay does it. With a matching token the extension auto-approves
-        (no tab picker); without one the user picks a tab."""
+        relay does it plus ``target=local`` (our extension refuses any other
+        target by name; upstream's ignores the parameter). With a matching
+        token the extension auto-approves (no tab picker); without one the
+        user picks a tab."""
         client = json.dumps({"name": self._client_name})
         url = (
             f"chrome-extension://{extension_id}/connect.html"
             f"?mcpRelayUrl={quote(self.extension_url, safe='')}"
             f"&client={quote(client, safe='')}"
             f"&protocolVersion={PROTOCOL_VERSION}"
+            "&target=local"
         )
         if self._token:
             url += f"&token={quote(self._token, safe='')}"
@@ -548,6 +603,21 @@ class CdpRelay:
     def unanswered(self) -> list[str]:
         """Extension calls still in flight (empty before the extension connects)."""
         return self._bridge.unanswered() if self._bridge is not None else []
+
+    async def call_extension(self, method: str, params: list[Any]) -> Any:
+        """One allow-listed chrome.* call through the extension, outside CDP
+        (``download`` asks chrome.downloads what the click saved).
+
+        Bounded: nothing else stands between this and a service worker that
+        stops answering with its socket still open — the caller's own deadline
+        cannot fire while it is awaiting a future that will never resolve."""
+        if self._bridge is None or self._bridge.closed:
+            raise RelayError("Extension not connected")
+        return await self._bridge._call_extension(method, params, bound_s=_EXTENSION_CALL_TIMEOUT_S)
+
+    @property
+    def downloads(self) -> dict[int, dict[str, Any]]:
+        return self._bridge.downloads if self._bridge is not None else {}
 
     async def stop(self) -> None:
         await self._close_links("Server stopped")

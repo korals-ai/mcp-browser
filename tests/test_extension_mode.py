@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+from collections.abc import Callable
 from typing import Any, ClassVar
 
 import pytest
@@ -125,6 +126,29 @@ class _FakeRelay:
     def unanswered(self) -> list[str]:
         return ["Page.getFrameTree (tab 7)"]
 
+    # What chrome.downloads.onCreated/onChanged reported, as the real relay
+    # records it — this is what tells the click's own download from the rest.
+    reported: ClassVar[dict[int, dict[str, Any]]] = {}
+    # Per download id, the states a search returns, one per call (last repeats).
+    states: ClassVar[dict[int, list[dict[str, Any]]]] = {}
+    searched: ClassVar[list[Any]] = []
+    call_outcome: ClassVar[Exception | None] = None
+
+    @property
+    def downloads(self) -> dict[int, dict[str, Any]]:
+        return _FakeRelay.reported
+
+    async def call_extension(self, method: str, params: list[Any]) -> Any:
+        assert method == "chrome.downloads.search", method
+        if _FakeRelay.call_outcome is not None:
+            raise _FakeRelay.call_outcome
+        _FakeRelay.searched.append(params[0])
+        want = int(params[0]["id"])
+        seq = _FakeRelay.states.get(want) or []
+        if len(seq) > 1:
+            return [seq.pop(0)]
+        return [seq[0]] if seq else []
+
     async def stop(self) -> None:
         self.stopped = True
 
@@ -133,6 +157,10 @@ class _FakeRelay:
 def fake_relay(monkeypatch: pytest.MonkeyPatch) -> type[_FakeRelay]:
     _FakeRelay.instances = []
     _FakeRelay.wait_outcome = None
+    _FakeRelay.reported = {}
+    _FakeRelay.states = {}
+    _FakeRelay.searched = []
+    _FakeRelay.call_outcome = None
     monkeypatch.setattr(browser_driver, "CdpRelay", _FakeRelay)
     return _FakeRelay
 
@@ -256,7 +284,7 @@ async def test_default_opener_spawns_the_browser_with_the_connect_url(
     assert spawned == [
         [
             "/Apps/Chrome",
-            fake_relay.instances[0].connect_url(browser_driver.PLAYWRIGHT_EXTENSION_ID),
+            fake_relay.instances[0].connect_url(browser_driver.MCP_BROWSER_EXTENSION_ID),
         ]
     ]
 
@@ -460,9 +488,19 @@ async def test_user_closing_the_last_tab_does_not_spawn_a_replacement(
     assert ctx.new_pages == 0
 
 
-async def test_download_is_refused_loudly_in_extension_mode(
-    monkeypatch: pytest.MonkeyPatch, fake_relay: type[_FakeRelay]
-) -> None:
+def _stamp(offset_s: float) -> str:
+    import time as _time
+    from datetime import UTC, datetime
+
+    return (
+        datetime.fromtimestamp(_time.time() + offset_s, tz=UTC).isoformat().replace("+00:00", "Z")
+    )
+
+
+async def _driver_with_a_clickable_ref(
+    monkeypatch: pytest.MonkeyPatch,
+    on_click: Callable[[], None] | None = None,
+) -> tuple[PlaywrightDriver, list[str]]:
     async def opener(_url: str) -> None:
         pass
 
@@ -475,8 +513,127 @@ async def test_download_is_refused_loudly_in_extension_mode(
     )
     _wire(d, monkeypatch)
     await d.start()
+    clicked: list[str] = []
+
+    class _Loc:
+        async def click(self, **_kw: Any) -> None:
+            clicked.append("e1")
+            if on_click is not None:
+                on_click()  # chrome.downloads.onCreated arrives with the click
+
+    monkeypatch.setattr(d, "_ref_locator", lambda _tab, ref: _Loc())
+    monkeypatch.setattr(browser_driver, "_EXTENSION_DOWNLOAD_TIMEOUT_S", 1.0)
+    return d, clicked
+
+
+async def test_download_in_extension_mode_copies_what_the_browser_saved(
+    monkeypatch: pytest.MonkeyPatch, fake_relay: type[_FakeRelay], tmp_path: Any
+) -> None:
+    """The click saves the file where the user's browser saves files;
+    chrome.downloads names it; the server (same machine) copies it in.
+    An in-progress download is waited for."""
+    saved = tmp_path / "report.pdf"
+    saved.write_bytes(b"%PDF-1.4 fake")
+    ours = {
+        "id": 2,
+        "state": "in_progress",
+        "startTime": _stamp(0),
+        "filename": str(saved),
+        "referrer": "https://example.com/",
+    }
+    fake_relay.states = {2: [ours, {**ours, "state": "complete"}]}
+    d, clicked = await _driver_with_a_clickable_ref(
+        monkeypatch, on_click=lambda: fake_relay.reported.update({2: ours})
+    )
+    out = await d.download("e1", str(tmp_path / "dest.pdf"))
+    assert clicked == ["e1"]
+    assert out == {"filename": "report.pdf", "saved": True}
+    assert (tmp_path / "dest.pdf").read_bytes() == b"%PDF-1.4 fake"
+    # Only OUR id was ever asked about — never "the newest download".
+    assert fake_relay.searched == [{"id": 2}, {"id": 2}]
+
+
+async def test_download_ignores_a_download_the_click_did_not_start(
+    monkeypatch: pytest.MonkeyPatch, fake_relay: type[_FakeRelay], tmp_path: Any
+) -> None:
+    """The download list is the whole browser's. A file the user saved a moment
+    before the click — already complete while ours is still downloading — must
+    not be handed to the agent as the file it asked for, whether it was known
+    before the click (id) or only announced after it (referrer)."""
+    theirs = tmp_path / "their-taxes.pdf"
+    theirs.write_bytes(b"not for the agent")
+    ours = tmp_path / "report.pdf"
+    ours.write_bytes(b"%PDF-1.4 fake")
+    before = {
+        "id": 8,
+        "state": "complete",
+        "startTime": _stamp(-0.3),
+        "filename": str(theirs),
+        "referrer": "https://bank.example/",
+    }
+    after = {**before, "id": 9, "startTime": _stamp(0.01), "referrer": ""}
+    mine = {
+        "id": 10,
+        "state": "in_progress",
+        "startTime": _stamp(0),
+        "filename": str(ours),
+        "referrer": "https://example.com/",
+    }
+    fake_relay.reported = {8: before}  # known before the click
+    fake_relay.states = {
+        8: [before],
+        9: [after],
+        10: [mine, {**mine, "state": "complete"}],
+    }
+    d, _clicked = await _driver_with_a_clickable_ref(
+        monkeypatch,
+        # Their second download and ours are announced together, ours last.
+        on_click=lambda: fake_relay.reported.update({9: after, 10: mine}),
+    )
+    d._tabs[0].page.url = "https://example.com/"  # the page the agent clicked on
+    out = await d.download("e1", str(tmp_path / "dest.pdf"))
+    assert out == {"filename": "report.pdf", "saved": True}
+    assert (tmp_path / "dest.pdf").read_bytes() == b"%PDF-1.4 fake"
+    assert {int(q["id"]) for q in fake_relay.searched} == {10}
+
+
+async def test_download_through_an_extension_without_downloads_refuses_before_the_click(
+    monkeypatch: pytest.MonkeyPatch, fake_relay: type[_FakeRelay], tmp_path: Any
+) -> None:
+    """The upstream Playwright Extension has no chrome.downloads: the search
+    would fail AFTER the click had already saved a file the server cannot find.
+    Fail first, and say where a click would put it."""
+    d, clicked = await _driver_with_a_clickable_ref(monkeypatch)
+    d._extension_id = "mmlmfjhmonkocbjadbfplnigmagldckm"
+    with pytest.raises(NotInThisRuntimeError, match="no download control"):
+        await d.download("e1", str(tmp_path / "dest.pdf"))
+    assert clicked == []
+
+
+async def test_download_in_extension_mode_reports_an_interrupted_or_missing_download(
+    monkeypatch: pytest.MonkeyPatch, fake_relay: type[_FakeRelay], tmp_path: Any
+) -> None:
+    item = {"id": 3, "state": "interrupted", "startTime": _stamp(0), "error": "USER_CANCELED"}
+    fake_relay.states = {3: [item]}
+    d, _clicked = await _driver_with_a_clickable_ref(
+        monkeypatch, on_click=lambda: fake_relay.reported.update({3: item})
+    )
+    with pytest.raises(RelayError, match="USER_CANCELED"):
+        await d.download("e1", str(tmp_path / "x"))
+
+    # The click started no download at all.
+    fake_relay.reported = {}
+    fake_relay.states = {}
+    with pytest.raises(RelayError, match="no download finished within 1s"):
+        await d.download("e1", str(tmp_path / "x"))
+
+    # Complete on a machine this server cannot read: honest about where it is.
+    gone = {"id": 4, "state": "complete", "startTime": _stamp(0), "filename": "/nope/gone.bin"}
+    fake_relay.reported = {4: gone}
+    fake_relay.states = {4: [gone]}
+    monkeypatch.setattr(browser_driver, "_own_download_id", lambda *_a: 4)
     with pytest.raises(NotInThisRuntimeError, match="Downloads folder"):
-        await d.download("e1", "/tmp/x")
+        await d.download("e1", str(tmp_path / "x"))
 
 
 # --- the server's contract ---------------------------------------------------------
@@ -513,11 +670,25 @@ def test_server_extension_mode_requires_the_token_var(
         reload_server()
 
 
+def test_server_extension_mode_requires_a_non_empty_extension_id(
+    monkeypatch: pytest.MonkeyPatch, reload_server: Any
+) -> None:
+    monkeypatch.setenv("BROWSER_ATTACH", "extension")
+    monkeypatch.setenv("BROWSER_EXTENSION_TOKEN", "")
+    monkeypatch.delenv("BROWSER_EXTENSION_ID", raising=False)
+    with pytest.raises(KeyError, match="BROWSER_EXTENSION_ID"):
+        reload_server()
+    monkeypatch.setenv("BROWSER_EXTENSION_ID", "  ")
+    with pytest.raises(SystemExit, match="non-empty BROWSER_EXTENSION_ID"):
+        reload_server()
+
+
 async def test_server_extension_mode_builds_an_extension_driver_without_a_profile(
     monkeypatch: pytest.MonkeyPatch, reload_server: Any
 ) -> None:
     monkeypatch.setenv("BROWSER_ATTACH", "extension")
     monkeypatch.setenv("BROWSER_EXTENSION_TOKEN", " tok ")
+    monkeypatch.setenv("BROWSER_EXTENSION_ID", "ipjfogjeagnpojnjignlhfapffkdpahi")
     monkeypatch.setenv("BROWSER_PROFILE_DIR", "/work/.cobrowse/profile")
     server = reload_server()
     built: list[dict[str, Any]] = []
@@ -532,7 +703,13 @@ async def test_server_extension_mode_builds_an_extension_driver_without_a_profil
     monkeypatch.setattr(server, "PlaywrightDriver", _Rec)
     monkeypatch.setattr(server, "_schedule_profile_gc", lambda *a, **k: None)
     await server._playwright_factory("local")
-    assert built == [{"attach": "extension", "extension_token": "tok"}]
+    assert built == [
+        {
+            "attach": "extension",
+            "extension_token": "tok",
+            "extension_id": "ipjfogjeagnpojnjignlhfapffkdpahi",
+        }
+    ]
 
 
 async def test_server_launch_mode_keeps_the_profile_factory(

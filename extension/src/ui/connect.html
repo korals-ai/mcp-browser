@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>MCP Browser Bridge · connect</title>
+  <link rel="stylesheet" href="lib/ui/ui.css">
+</head>
+<body>
+  <main class="page">
+    <div id="status" class="status status-info">Checking the request…</div>
+    <div id="body" hidden>
+      <div class="warning">
+        <strong>What you are allowing.</strong> The client gets a debugger session on the tab you pick — and on
+        any tab you later drag into its group. It sees those tabs as you do, including sessions you are
+        signed in to. Other tabs stay out of reach. Disconnect any time from the toolbar icon, or by
+        closing the group's tabs.
+      </div>
+      <p class="hint">Pick the tab the client should start from. You can drag more tabs into its group later.</p>
+      <div id="tabs" class="tab-list"></div>
+    </div>
+    <div id="token" hidden></div>
+  </main>
+  <script type="module" src="lib/ui/connect.js"></script>
+</body>
+</html>

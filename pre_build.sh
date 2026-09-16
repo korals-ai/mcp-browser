@@ -66,23 +66,23 @@ export BROWSER_FIND_INFERENCE_URL=""
 export BROWSER_FIND_INFERENCE_KEY=""
 export BROWSER_FIND_MODEL=claude-haiku-4-5-20251001
 
-log "1/6 Format check (ruff format)..."
+log "1/7 Format check (ruff format)..."
 "$RUFF" format --check src tests || fail "ruff format (run: ruff format src tests)"
 log "  ✓ ruff format passed"
 
-log "2/6 Linting (ruff)..."
+log "2/7 Linting (ruff)..."
 "$RUFF" check src tests || fail "ruff"
 log "  ✓ ruff passed"
 
-log "3/6 Static typing (mypy)..."
+log "3/7 Static typing (mypy)..."
 "$MYPY" src || fail "mypy"
 log "  ✓ mypy passed"
 
-log "4/6 Dependency CVE scan (pip-audit)..."
+log "4/7 Dependency CVE scan (pip-audit)..."
 PIP_INDEX_URL=https://pypi.org/simple/ "$PIP_AUDIT" --no-deps -r requirements.txt || fail "pip-audit"
 log "  ✓ pip-audit passed"
 
-log "5/6 Running unit tests (with coverage)..."
+log "5/7 Running unit tests (with coverage)..."
 if "$PYTEST" --help 2>&1 | grep "coverage reporting" > /dev/null; then
   "$PYTEST" -q --cov=src --cov-report=term --cov-fail-under=0 || fail "pytest"
 else
@@ -92,7 +92,7 @@ fi
 log "  ✓ pytest passed"
 
 
-log "6/6 Viewer typecheck (tsc over viewer/src)..."
+log "6/7 Viewer typecheck (tsc over viewer/src)..."
 # standalone.ts is imported by nothing in chat-ui, so no other gate typechecks
 # it; without this step its first checker is the Docker viewer-builder stage —
 # after every pre-build gate is green. Guarded like it's chart-render guard:
@@ -104,6 +104,21 @@ if command -v node >/dev/null 2>&1 && command -v npm >/dev/null 2>&1; then
   log "  ✓ viewer tsc passed"
 else
   log "  (node not on PATH; viewer tsc skipped — runs in ci-runner)"
+fi
+
+log "7/7 Extension (typecheck, build, tests over extension/)..."
+# The browser extension the user installs (extension/). Not part of the image
+# — it runs in the human's browser — but it ships from this directory, so its
+# typecheck, its build and its protocol tests gate here. Same node guard.
+if command -v node >/dev/null 2>&1 && command -v npm >/dev/null 2>&1; then
+  ( cd "$SCRIPT_DIR/extension" \
+      && npm ci --no-audit --no-fund >/dev/null 2>&1 \
+      && npx tsc --noEmit \
+      && node build.mjs >/dev/null \
+      && npm test --silent ) || fail "extension (cd extension && npm ci && npm run typecheck && npm run build && npm test)"
+  log "  ✓ extension passed"
+else
+  log "  (node not on PATH; extension gate skipped — runs in ci-runner)"
 fi
 
 log "Gating the shared toollog package..."

@@ -1,0 +1,36 @@
+{
+  "manifest_version": 3,
+  "name": "MCP Browser Bridge",
+  "version": "0.1.0",
+  "description": "Lets an agent drive tabs you choose in this browser through the browser tool's MCP server, with your logins. Nothing connects until you click Allow.",
+  "permissions": [
+    "debugger",
+    "tabs",
+    "tabGroups",
+    "downloads",
+    "alarms"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "lib/background.js",
+    "type": "module"
+  },
+  "action": {
+    "default_title": "MCP Browser Bridge",
+    "default_icon": {
+      "16": "icons/icon-16.png",
+      "32": "icons/icon-32.png",
+      "48": "icons/icon-48.png",
+      "128": "icons/icon-128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon-16.png",
+    "32": "icons/icon-32.png",
+    "48": "icons/icon-48.png",
+    "128": "icons/icon-128.png"
+  },
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAt0tlVRLgrzZjlXGOebTBVM007VCKg1TdVy3rRYqTqwoHhwNsn4s81s8VKrsstgWM48ecKPzLlWGRHQOikGN4Pn9mIS4mBbhqxlehOo4PDlcKnO/BSPE5o30azsahN3ta1a5KkAZP+vm1XhD0cfTSdr420kEClqZlV+hymS2ZaUT1WBmvGB2g3LzDhdBs7609U8WS6PSTtp1PuwuhXLcZW1eJ9JNR+kOp0yCM8/V1S9FQQvGyoRZ1OW2fmg29MuLvX29qv4PdK6v68S3qBflkLaoNdqkcmT2fGxcKbUOsKKL0F/5hFNOYiPti1JJON2nMjROcdNM6FfR1bA40i6BN7wIDAQAB"
+}

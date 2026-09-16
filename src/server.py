@@ -92,6 +92,13 @@ if ATTACH not in browser_driver.ATTACH_MODES:
 # string is the declared "ask me in the browser each time" — a missing var in
 # extension mode is a crash, not a mode.
 EXTENSION_TOKEN = os.environ["BROWSER_EXTENSION_TOKEN"].strip() if ATTACH == "extension" else ""
+# Extension mode only: which extension's connect page to open — ours
+# (cdp_relay.MCP_BROWSER_EXTENSION_ID) or the upstream Playwright
+# Extension it was forked from. Declared, not inferred: the id names what
+# the human installed.
+EXTENSION_ID = os.environ["BROWSER_EXTENSION_ID"].strip() if ATTACH == "extension" else ""
+if ATTACH == "extension" and not EXTENSION_ID:
+    raise SystemExit("BROWSER_ATTACH=extension needs a non-empty BROWSER_EXTENSION_ID")
 
 
 def _data_root() -> str:
@@ -248,7 +255,9 @@ async def _playwright_factory(session_id: str) -> BrowserDriver:
     gone and the manager ends the session on its next use
     (:class:`BrowserGoneError`)."""
     if ATTACH == "extension":
-        driver = PlaywrightDriver(attach="extension", extension_token=EXTENSION_TOKEN)
+        driver = PlaywrightDriver(
+            attach="extension", extension_token=EXTENSION_TOKEN, extension_id=EXTENSION_ID
+        )
     else:
         driver = PlaywrightDriver(
             profile_dir=_profile_dir_for(session_id),
