@@ -742,10 +742,58 @@ def _bare(name: str) -> str:
     return name.rsplit("__", 1)[-1]
 
 
-async def run_batch(actions: list[dict[str, Any]], dispatch: Dispatch) -> list[dict[str, Any]]:
+AfterItem = Callable[[str, dict[str, Any]], Awaitable[None]]
+
+# Between two batch items, how long a navigation the first item started gets to
+# COMMIT before the second item runs, and how long the new document then gets
+# to load. An item's own settle window is 100 ms; a click whose page load
+# committed after it left the next item on a detached frame (acceptance run,
+# 2026-09-15). navigate / wait_for / login wait on their own.
+BATCH_NAV_WINDOW_S = 0.4
+BATCH_NAV_LOAD_TIMEOUT_MS = 10000
+_MAY_NAVIGATE = frozenset({"form_input", "javascript_tool", "file_upload"})
+# A click, a keystroke or a drag can follow a link or submit a form; a
+# scroll, a hover or a screenshot cannot.
+_NAVIGATING_COMPUTER_ACTIONS = frozenset(
+    {"left_click", "right_click", "double_click", "triple_click", "type", "key", "left_click_drag"}
+)
+
+
+def item_may_navigate(name: str, inp: Mapping[str, Any]) -> bool:
+    """Whether a batch item can start a navigation its own settle window may
+    have missed: a click/keystroke/drag ``computer`` action or a
+    form/script/upload."""
+    if name == "computer":
+        return str(inp.get("action") or "") in _NAVIGATING_COMPUTER_ACTIONS
+    return name in _MAY_NAVIGATE
+
+
+async def settle_after_batch_item(
+    manager: SessionManager, session_id: str, name: str, inp: Mapping[str, Any]
+) -> None:
+    """The batch's between-items wait: if the item just run could have started
+    a navigation, give it :data:`BATCH_NAV_WINDOW_S` to commit and the new
+    document time to load, so the next item acts on the new page (or is refused
+    by name as a stale ref) rather than on a detached frame."""
+    if not item_may_navigate(name, inp):
+        return
+    try:
+        session = await _session(manager, session_id, act=False)
+    except Exception:  # no session/tab any more — the next item reports that itself
+        return
+    await session.driver.await_navigation(
+        window_s=BATCH_NAV_WINDOW_S, timeout_ms=BATCH_NAV_LOAD_TIMEOUT_MS
+    )
+
+
+async def run_batch(
+    actions: list[dict[str, Any]], dispatch: Dispatch, *, after_item: AfterItem | None = None
+) -> list[dict[str, Any]]:
     """Run ``actions`` in order through the tool handlers; stop at the first
     error. Every item's result is returned as ``{name, status, result|error}``
-    so the model sees exactly where a sequence stopped. Nesting is refused."""
+    so the model sees exactly where a sequence stopped. Nesting is refused.
+    ``after_item`` runs between two items (never after the last) — the
+    navigation wait above."""
     results: list[dict[str, Any]] = []
     for i, item in enumerate(actions):
         if not isinstance(item, dict) or not isinstance(item.get("name"), str):
@@ -776,6 +824,8 @@ async def run_batch(actions: list[dict[str, Any]], dispatch: Dispatch) -> list[d
             )
             break
         results.append({"name": name, "status": "ok", "result": out})
+        if after_item is not None and i < len(actions) - 1:
+            await after_item(name, inp)
     return results
 
 

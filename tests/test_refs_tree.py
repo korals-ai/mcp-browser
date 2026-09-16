@@ -85,7 +85,42 @@ def test_literal_matches_are_case_insensitive_and_carry_ref_path_context() -> No
 
 def test_literal_matches_accept_regex_and_fall_back_on_a_bad_one() -> None:
     assert [h["ref"] for h in literal_matches(DEFAULT_TREE, r"search|sign")] == ["e2", "e4"]
-    assert literal_matches(DEFAULT_TREE, "sign (") == []  # invalid regex → literal, no hit
+    # an invalid regex falls back to plain text (no hit for "sign ("); the word
+    # tier then reads it as the word "sign" and finds the button
+    assert [h["ref"] for h in literal_matches(DEFAULT_TREE, "sign (")] == ["e4"]
+    assert literal_matches(DEFAULT_TREE, "zzz (") == []
+
+
+def test_literal_word_tier_reads_role_words_as_roles() -> None:
+    """The extension's kind of query — "search box", "sign in button" — hits
+    the node whose ROLE the generic word names, even when the name never says
+    "box" or "button"; stop words never cause a miss."""
+    assert [h["ref"] for h in literal_matches(DEFAULT_TREE, "search box")] == ["e2"]
+    assert [h["ref"] for h in literal_matches(DEFAULT_TREE, "the sign in button")] == ["e4"]
+    assert [h["ref"] for h in literal_matches(DEFAULT_TREE, "password field")] == ["e3"]
+    assert [h["ref"] for h in literal_matches(DEFAULT_TREE, "links on the page")] == ["e1"]
+
+
+def test_literal_word_tier_needs_every_content_word_and_reads_ancestor_names() -> None:
+    tree = (
+        '- list "Search results":\n'
+        "  - listitem:\n"
+        '    - link "BELDEN 1694A Coaxial Cable" [ref=e7]\n'
+        "  - listitem:\n"
+        '    - link "BELDEN 8281 Coaxial Cable" [ref=e8]\n'
+        '- link "Belden catalogue" [ref=e9]\n'
+    )
+    # "results" is only in an ANCESTOR's name; "1694a" only in one line
+    assert [h["ref"] for h in literal_matches(tree, "result links for belden 1694a")] == ["e7"]
+    assert literal_matches(tree, "add to cart") == []
+    assert literal_matches(tree, "the of a") == []
+
+
+def test_literal_regex_tier_still_wins_over_the_word_tier() -> None:
+    # "Sign in" matches the button line literally — one hit, not the word tier's
+    hits = literal_matches(DEFAULT_TREE, "Sign in")
+    assert [h["ref"] for h in hits] == ["e4"]
+    assert hits[0]["path"] == "main"
 
 
 def test_literal_matches_cap_at_twenty() -> None:

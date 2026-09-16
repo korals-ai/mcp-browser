@@ -20,7 +20,7 @@ tool names, argument names and semantics (``computer``, ``read_page``,
 ``find``, ``browser_batch``, …) plus a few sandbox-only extras (``login``,
 ``wait_for``, ``download``, frames, dialogs, ``run_recipe``) documented as
 "not in the extension" — so a browser skill written against Anthropic's own
-surface runs here unchanged. docs/plan/20260914-cobrowse-extension-parity.md.
+surface runs here unchanged. docs/plan/archive/20260914-cobrowse-extension-parity.md.
 """
 
 from __future__ import annotations
@@ -388,7 +388,12 @@ async def navigate(url: str, tabId: int, reason: str = "") -> dict[str, Any]:
 # --- reading the page ------------------------------------------------------------------
 
 
-@mcp.tool()
+# structured_output=False on every tool that returns TEXT: FastMCP wraps a
+# ``str`` return as ``structuredContent {"result": …}`` and the client hands the
+# model that JSON in place of the text block — the whole tree arrived quoted and
+# escaped on every read (measured on the parity cut's acceptance run). The
+# extension returns plain text; so do we. Tools returning a dict keep theirs.
+@mcp.tool(structured_output=False)
 async def read_page(
     tabId: int,
     filter: str = "interactive",
@@ -433,7 +438,7 @@ async def read_page(
     )
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False)
 async def get_page_text(tabId: int) -> str:
     """The readable text of tab ``tabId`` — the main content (article/main first),
     with a ``Title / URL / Source element`` header. Use it to actually READ what a
@@ -443,16 +448,20 @@ async def get_page_text(tabId: int) -> str:
     return await _run(agent_ops.get_page_text(manager, _session_id(), tabId))
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False)
 async def find(tabId: int, query: str) -> str:
-    """Find elements on tab ``tabId`` by description — "the search box in the
-    header", "add to cart", "the price".
+    """Find elements on tab ``tabId`` by description — "search box", "add to
+    cart", "the price".
 
-    A literal/regex match over the page's tree runs first (free); on a miss a small
-    model reads the tree and names the refs, each with a one-line reason. Up to
-    20 hits as ``ref: role "name"`` lines, tagged ``source: literal`` or
-    ``source: model``; the refs are ready to use with ``computer``. Cheaper than
-    reading a large page yourself.
+    A literal pass runs first and is free: it matches the tree's OWN words — a
+    node's role and name and its ancestors' names — case-insensitively (a regex
+    works too), and reads "box"/"field"/"button"/"link"/"dropdown"/"image" as
+    roles, so "search box" finds a searchbox whose name never says "box". On a
+    miss, when a model tier is configured, a small model reads the tree and names
+    the refs, each with a one-line reason; without one the reply says so — then
+    ``read_page`` and look yourself. Up to 20 hits as ``ref: role "name"`` lines,
+    tagged ``source: literal`` or ``source: model``; the refs are ready to use
+    with ``computer``. Cheaper than reading a large page yourself.
     """
     return await _run(agent_ops.find(manager, _session_id(), tabId, query, config=FIND_CONFIG))
 
@@ -526,7 +535,7 @@ async def computer(
     return _image_result(out)
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False)
 async def form_input(tabId: int, ref: str, value: str | bool | float) -> str:
     """Set a form field's value on tab ``tabId``: fill a text field (replacing its
     content), choose a ``<select>`` option by label or value, or check/uncheck a
@@ -854,7 +863,7 @@ async def browser_batch(actions: list[dict[str, Any]]) -> Any:
     """
     if not isinstance(actions, list) or not actions:
         raise ToolError("browser_batch needs a non-empty actions list of {name, input}")
-    results = await agent_ops.run_batch(actions, _DISPATCH)
+    results = await agent_ops.run_batch(actions, _DISPATCH, after_item=_settle_batch_item)
     content: list[Any] = []
     for i, item in enumerate(results, 1):
         if item["status"] != "ok":
@@ -871,6 +880,10 @@ async def browser_batch(actions: list[dict[str, Any]]) -> Any:
         else:
             content.append(f"#{i} {item['name']}: {json.dumps(out, ensure_ascii=False)}")
     return content
+
+
+async def _settle_batch_item(name: str, inp: dict[str, Any]) -> None:
+    await agent_ops.settle_after_batch_item(manager, _session_id(), name, inp)
 
 
 # The handlers a batch item (and a recipe step) can name, by bare tool name.

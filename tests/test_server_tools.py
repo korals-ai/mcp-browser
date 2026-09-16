@@ -10,7 +10,7 @@ import pytest
 from mcp.server.fastmcp import Image
 from mcp.server.fastmcp.exceptions import ToolError
 
-from src import server
+from src import agent_ops, server
 from tests.conftest import DEFAULT_TREE, FakeDriver, make_manager
 
 EXTENSION_TOOLS = {
@@ -211,6 +211,38 @@ async def test_browser_batch_reports_the_failing_item_and_stops(fake: FakeDriver
     assert content[0].startswith("#1 read_page: ERROR — No tab 9 is open")
     with pytest.raises(ToolError):
         await server.browser_batch([])
+
+
+async def test_browser_batch_waits_for_a_navigation_after_an_acting_item(fake: FakeDriver) -> None:
+    """Between items, an item that could have started a navigation (a click)
+    gets the driver's navigation wait before the next item runs; a read or a
+    view-only action does not, and nothing waits after the last item."""
+    await server.browser_batch(
+        [
+            {"name": "computer", "input": {"tabId": 1, "action": "left_click", "ref": "e4"}},
+            {"name": "read_page", "input": {"tabId": 1}},
+            {"name": "computer", "input": {"tabId": 1, "action": "screenshot"}},
+            {"name": "read_page", "input": {"tabId": 1}},
+            {"name": "computer", "input": {"tabId": 1, "action": "key", "text": "Return"}},
+        ]
+    )
+    assert fake.nav_waits == [(agent_ops.BATCH_NAV_WINDOW_S, agent_ops.BATCH_NAV_LOAD_TIMEOUT_MS)]
+
+
+async def test_text_tools_return_plain_text_not_a_structured_result(fake: FakeDriver) -> None:
+    """A tool that returns text returns a TEXT block. With FastMCP's default a
+    ``str`` return also becomes ``structuredContent {"result": …}`` and the
+    client hands the model that JSON — the whole tree quoted and escaped on
+    every read (the parity cut's acceptance run). The dict-returning tools keep
+    their structured shape."""
+    tools = {t.name: t for t in await server.mcp.list_tools()}
+    for name in ("read_page", "get_page_text", "find", "form_input"):
+        assert tools[name].outputSchema is None, name
+    assert tools["navigate"].outputSchema is not None
+    result = await server.mcp.call_tool("get_page_text", {"tabId": 1})
+    assert isinstance(result, list)  # content blocks only — no (content, structured) pair
+    assert result[0].text.startswith("Title: ")  # type: ignore[union-attr]
+    assert not result[0].text.startswith("{")  # type: ignore[union-attr]
 
 
 async def test_domain_errors_become_tool_errors(fake: FakeDriver) -> None:

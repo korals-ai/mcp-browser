@@ -78,8 +78,9 @@ The 15 the extension has, same names, same argument shapes:
 - `read_page` — the accessibility tree with refs (`filter: interactive|all`,
   `max_chars`, `depth`, `ref_id`, `boxes`)
 - `get_page_text` — the readable text
-- `find` — refs matching a description: a literal tier over the tree, then a
-  model tier if configured (below)
+- `find` — refs matching a description: a literal tier over the tree's own
+  words (role + name, "box"/"button"/"link" read as roles), then a model tier
+  if configured (below)
 - `form_input` — set a field / checkbox / select by ref
 - `computer` — `left_click`, `right_click`, `double_click`, `triple_click`,
   `type`, `key`, `screenshot`, `zoom`, `wait`, `scroll`, `scroll_to`, `hover`,

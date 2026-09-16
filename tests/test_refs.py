@@ -88,6 +88,22 @@ def test_action_error_without_a_named_cover_says_not_interactable() -> None:
     assert "not interactable right now" in str(err)
 
 
+def test_a_frame_detached_by_a_racing_navigation_reads_as_a_stale_ref() -> None:
+    """The ref check passed (same epoch), then a navigation the previous click
+    started committed and the aria-ref selector resolved in a detached frame.
+    Playwright's words for that become the stale-ref message, so the agent
+    reads the page again instead of retrying the ref."""
+    for text in (
+        'Locator.click: Invalid frame in aria-ref selector "aria-ref=e5"',
+        "Frame was detached",
+        "Execution context was destroyed, most likely because of a navigation",
+    ):
+        err = _action_error("click", "e5", Exception(text))
+        assert isinstance(err, StaleRefError), text
+        assert "e5 is from a previous page" in str(err)
+        assert "read_page again" in str(err)
+
+
 def test_action_error_passes_other_exceptions_through() -> None:
     original = RuntimeError("browser crashed")
     assert _action_error("click", "e5", original) is original

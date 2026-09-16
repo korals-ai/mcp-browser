@@ -62,6 +62,7 @@ class FakeDriver(BrowserDriver):
         self.changes: list[str] = []
         self.markers: list[dict[str, Any]] = []
         self.settled = 0
+        self.nav_waits: list[tuple[float, int]] = []  # await_navigation(window_s, timeout_ms)
         self.secrets: list[str] = []  # password values typed on the page
         self.screenshot_png = b"\x89PNG\r\n\x1a\n-fake"
         self.screenshots: list[dict[str, Any]] = []
@@ -293,6 +294,10 @@ class FakeDriver(BrowserDriver):
         self.settled += 1
         changes, self.changes = list(self.changes), []
         return changes
+
+    async def await_navigation(self, *, window_s: float, timeout_ms: int) -> bool:
+        self.nav_waits.append((window_s, timeout_ms))
+        return False
 
     # --- history / waiting ---
 

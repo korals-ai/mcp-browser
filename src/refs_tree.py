@@ -92,9 +92,68 @@ def redact_values(text: str, secrets: Iterable[str]) -> str:
     return out
 
 
+# Query words the literal tier reads as a ROLE rather than as text, so "search
+# box" finds a `searchbox` whose name never says "box". Every other word must
+# appear in the node's line or its ancestors' names.
+_ROLE_WORDS: dict[str, frozenset[str]] = {
+    "box": frozenset({"textbox", "searchbox", "combobox", "checkbox", "spinbutton"}),
+    "field": frozenset({"textbox", "searchbox", "combobox", "spinbutton"}),
+    "input": frozenset(
+        {"textbox", "searchbox", "combobox", "spinbutton", "checkbox", "radio", "slider", "switch"}
+    ),
+    "search": frozenset({"searchbox", "search"}),
+    "button": frozenset({"button"}),
+    "link": frozenset({"link"}),
+    "links": frozenset({"link"}),
+    "dropdown": frozenset({"combobox", "listbox", "menu"}),
+    "select": frozenset({"combobox", "listbox"}),
+    "menu": frozenset({"menu", "menubar", "menuitem"}),
+    "checkbox": frozenset({"checkbox"}),
+    "radio": frozenset({"radio"}),
+    "image": frozenset({"img"}),
+    "picture": frozenset({"img"}),
+    "img": frozenset({"img"}),
+    "heading": frozenset({"heading"}),
+    "title": frozenset({"heading"}),
+    "tab": frozenset({"tab"}),
+    "tabs": frozenset({"tab", "tablist"}),
+    "row": frozenset({"row"}),
+    "table": frozenset({"table", "grid"}),
+    "dialog": frozenset({"dialog", "alertdialog"}),
+    "form": frozenset({"form"}),
+}
+# Words that carry no target: dropped before matching, never a reason to miss.
+_STOP_WORDS = frozenset(
+    {
+        "the",
+        "a",
+        "an",
+        "of",
+        "in",
+        "on",
+        "for",
+        "to",
+        "at",
+        "this",
+        "that",
+        "with",
+        "and",
+        "or",
+        "page",
+        "site",
+        "element",
+    }
+)
+_WORD_RE = re.compile(r"[a-z0-9#'&./-]+")
+
+
 def literal_matches(tree: str, query: str, *, limit: int = 20) -> list[dict[str, object]]:
-    """The literal tier of ``find``: case-insensitive regex (or plain text
-    when the query is not a valid regex) over every line of the tree.
+    """The literal tier of ``find``, two passes over the tree's own words:
+    a case-insensitive regex (or plain text when the query is not a valid
+    regex) over every line first; on a miss, every query word must be found
+    in the node's line or its ancestors' names, with :data:`_ROLE_WORDS`
+    ("box", "button", "link", …) matching the node's ROLE instead — the shape
+    of the extension's queries ("search box", "sign in button").
 
     Each hit carries the node's ref (``""`` for a text node), its line, its
     ancestor path (``role "name" > role "name"``) and three lines of context
@@ -110,16 +169,44 @@ def literal_matches(tree: str, query: str, *, limit: int = 20) -> list[dict[str,
         if not rx.search(line):
             continue
         parsed = parse_line(line)
-        hits.append(
-            {
-                "ref": (parsed or {}).get("ref", "") or "",
-                "line": line.strip(),
-                "path": _ancestor_path(lines, i),
-                "context": [ln.strip() for ln in lines[max(0, i - 3) : i + 4]],
-            }
-        )
+        hits.append(_hit(lines, i, (parsed or {}).get("ref", "") or "", _ancestor_path(lines, i)))
         if len(hits) >= limit:
             break
+    return hits or _word_matches(lines, query, limit)
+
+
+def _hit(lines: list[str], i: int, ref: object, path: str) -> dict[str, object]:
+    return {
+        "ref": ref,
+        "line": lines[i].strip(),
+        "path": path,
+        "context": [ln.strip() for ln in lines[max(0, i - 3) : i + 4]],
+    }
+
+
+def _word_matches(lines: list[str], query: str, limit: int) -> list[dict[str, object]]:
+    words = [w for w in _WORD_RE.findall(query.lower()) if w not in _STOP_WORDS]
+    if not words:
+        return []
+    hits: list[dict[str, object]] = []
+    stack: list[tuple[int, str]] = []  # (indent, `role "name"`) of the open ancestors
+    for i, line in enumerate(lines):
+        parsed = parse_line(line)
+        if parsed is None:
+            continue
+        indent = int(parsed["indent"])
+        while stack and stack[-1][0] >= indent:
+            stack.pop()
+        path = " > ".join(label for _, label in stack)
+        role = str(parsed["role"]).lower()
+        hay = line.lower()
+        path_lower = path.lower()
+        if all(w in hay or w in path_lower or role in _ROLE_WORDS.get(w, ()) for w in words):
+            hits.append(_hit(lines, i, parsed["ref"] or "", path))
+            if len(hits) >= limit:
+                break
+        name = str(parsed["name"])
+        stack.append((indent, str(parsed["role"]) + (f' "{name}"' if name else "")))
     return hits
 
 

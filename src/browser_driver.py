@@ -66,6 +66,7 @@ _ACTION_TIMEOUT_MS = 5000
 # reply is built, and how long a started one gets to reach domcontentloaded.
 _SETTLE_WINDOW_S = 0.1
 _SETTLE_LOAD_TIMEOUT_MS = 10000
+_NAV_POLL_S = 0.025
 _DIALOG_LOG = 20
 _WAIT_MAX_S = 10.0
 
@@ -195,12 +196,28 @@ class UnknownTabError(ValueError):
     """No open tab has that number."""
 
 
+# Playwright's words for "the document this ref belonged to is gone": a
+# navigation committed between the ref check and the action, so the frame the
+# aria-ref selector resolves in is detached. The epoch bump that would have
+# refused the ref by name lands a beat later.
+_DETACHED_RE = re.compile(
+    r"Invalid frame in aria-ref selector|[Ff]rame (?:was|got|has been) detached"
+    r"|Execution context was destroyed|Target (?:page|frame|context).{0,40}closed"
+)
+
+
 def _action_error(action: str, ref: str, exc: Exception) -> Exception:
     """Rewrite a Playwright actionability timeout into an error that tells the
     agent WHY and what to do. The covering element, when Playwright names it
     (``<div class="overlay"> intercepts pointer events``), is the whole
-    diagnosis; without it the element is hidden, disabled or detached. Any
-    other failure passes through untouched."""
+    diagnosis; without it the element is hidden, disabled or detached. A frame
+    detached by a navigation that raced the action is the stale-ref case and
+    gets that message. Any other failure passes through untouched."""
+    if _DETACHED_RE.search(str(exc)):
+        return StaleRefError(
+            f"{ref} is from a previous page (the tab navigated while the {action} ran) — "
+            "call read_page again for fresh refs."
+        )
     if type(exc).__name__ != "TimeoutError":
         return exc
     m = re.search(r"(<[^>]{1,200}>)[^\n]*intercepts pointer events", str(exc))
@@ -572,6 +589,12 @@ class BrowserDriver(Protocol):
     async def settle(self, marker: dict[str, Any]) -> list[str]:
         """Wait for the page to settle after an action and return what changed
         since ``marker``: a navigation, a new tab, a dialog."""
+        ...
+
+    async def await_navigation(self, *, window_s: float, timeout_ms: int) -> bool:
+        """Between batch items: if the active tab's document changes within
+        ``window_s`` (a navigation the previous item started), wait up to
+        ``timeout_ms`` for the new one to load. True when one was seen."""
         ...
 
     # --- history / waiting -------------------------------------------------
@@ -2122,6 +2145,19 @@ class PlaywrightDriver:
             if int(d.get("seq", 0)) > since
         )
         return changes
+
+    async def await_navigation(self, *, window_s: float, timeout_ms: int) -> bool:
+        tab = self._active()
+        epoch, url = tab.doc_epoch, str(tab.page.url)
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + window_s
+        while tab.doc_epoch == epoch and str(tab.page.url) == url:
+            if loop.time() >= deadline:
+                return False
+            await asyncio.sleep(_NAV_POLL_S)
+        with contextlib.suppress(Exception):
+            await tab.page.wait_for_load_state("domcontentloaded", timeout=timeout_ms)
+        return True
 
     # --- history / waiting --------------------------------------------------
 
