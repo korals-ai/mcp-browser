@@ -50,8 +50,13 @@ BROWSER_FIND_MODEL=anthropic/claude-haiku-4.5
 **2. Start the server.**
 
 ```bash
-docker compose up          # builds the image the first time
+docker compose up          # pulls ghcr.io/korals-ai/mcp-browser the first time
 ```
+
+The image is public, so the pull needs no login. It is published for
+`linux/amd64` only; on an ARM machine (Apple silicon) Docker runs it under
+emulation, which works but is slower. `docker compose pull` fetches a newer
+release.
 
 **3. Connect your agent** to `http://localhost:8096/mcp?chat_id=local`:
 
@@ -241,7 +246,7 @@ browser running first, or use `BROWSER_EXTENSION_TOKEN=""` and click.
 
 ## Requirements
 
-Chrome for Testing, Xvfb and Playwright — the largest image here (~1.5 GB).
+Docker. The image carries Chrome for Testing, Xvfb and Playwright (~2.2 GB).
 
 ## Portal logins
 

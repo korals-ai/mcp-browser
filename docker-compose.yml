@@ -7,8 +7,13 @@
 # http://localhost:8096 in a tab to watch the browser the agent is driving.
 services:
   browser:
-    build: .
-    image: mcp-browser
+    # The published image. This directory is a mirror of the tool's source, and
+    # its Dockerfile builds from the monorepo it is mirrored from (it copies
+    # shared packages that sit beside it there), so it cannot build on its own.
+    image: ghcr.io/korals-ai/mcp-browser:latest
+    # The only architecture published. Docker on an ARM machine (Apple silicon)
+    # runs it under emulation: it works, more slowly.
+    platform: linux/amd64
     ports:
       - "8096:8096"
     volumes:
