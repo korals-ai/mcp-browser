@@ -526,3 +526,80 @@ async def test_login_on_a_named_tab_activates_it_first() -> None:
     portals = {"acme": PortalCred("acme", "https://acme/", "u", "p4ssword")}
     await agent_ops.login(manager, "c1", "acme", portals, ref="e2", tab_id=1)
     assert driver.active_num() == 1 and driver.logins_at == [("e2", "u", "p4ssword")]
+
+
+# --- read: act and look in ONE reply ---------------------------------------------------
+#
+# Under a large harness prompt every extra round trip re-reads the prompt, so
+# "click, then read" costing two turns was the single biggest line in the
+# measured runs (a saved turn was worth more than the page it fetched). An
+# acting call that hands the page back collapses them.
+
+
+async def test_navigate_without_a_tab_uses_the_active_one_and_says_which() -> None:
+    driver, manager = _setup()
+    await driver.new_tab()  # tab 2 is now active
+    out = await agent_ops.navigate(manager, "c1", "https://x.com/a", None)
+    assert out["tabId"] == 2 and driver.opened == ["https://x.com/a"]
+    assert "page" not in out  # nothing asked for, nothing added
+
+
+async def test_navigate_read_carries_the_page_in_the_asked_shape() -> None:
+    driver, manager = _setup()
+    driver.page_text_value = "Some prose on the page"
+    tree = await agent_ops.navigate(manager, "c1", "https://x.com/a", 1, read="interactive")
+    assert tree["page_state"] == "ok"
+    assert tree["page"].startswith('  - link "Home" [ref=e1]')
+    assert "text: Some prose" not in tree["page"]
+    assert tree["page"].endswith('Page: https://x.com/a — "Fake" (tab 1)')
+    whole = await agent_ops.navigate(manager, "c1", "https://x.com/a", 1, read="all")
+    assert "text: Some prose" in whole["page"]
+    text = await agent_ops.navigate(manager, "c1", "https://x.com/a", 1, read="text")
+    assert text["page"].startswith("Title: Fake\nURL: https://x.com/a\n")
+    assert text["page"].endswith("Some prose on the page")
+
+
+async def test_read_is_checked_by_name_before_anything_acts() -> None:
+    driver, manager = _setup()
+    with pytest.raises(ToolInputError, match="read must be one of interactive, all, text"):
+        await agent_ops.navigate(manager, "c1", "https://x.com/a", 1, read="html")
+    assert driver.opened == []
+    with pytest.raises(ToolInputError, match="read must be"):
+        await agent_ops.computer(manager, "c1", 1, "left_click", ref="e4", read="page")
+    assert driver.clicks == []
+
+
+async def test_computer_read_appends_the_page_after_what_changed() -> None:
+    driver, manager = _setup()
+    driver.changes = ['Page navigated to https://x.com/next — "Next"']
+    out = await agent_ops.computer(manager, "c1", 1, "left_click", ref="e4", read="interactive")
+    did, page = out["text"].split("\n\n", 1)
+    assert did == 'Clicked e4\nPage navigated to https://x.com/next — "Next"'
+    assert page.startswith('  - link "Home" [ref=e1]')
+    # The page is read AFTER the action settled, never before.
+    assert driver.settled == 1 and len(driver.read_pages) == 1
+    shot = await agent_ops.computer(manager, "c1", 1, "screenshot", read="text")
+    assert shot["png"] is not None and "\n\nTitle: Fake" in shot["text"]
+
+
+async def test_form_input_wait_for_and_switch_frame_take_read_too() -> None:
+    _driver, manager = _setup()
+    filled = await agent_ops.form_input(manager, "c1", 1, "e2", "pumps", read="interactive")
+    assert filled.startswith("Set e2 to 'pumps'\n\n  - link")
+    waited = await agent_ops.wait_for(manager, "c1", 1, text="Done", read="text")
+    assert waited["ready"] is True and waited["page"].startswith("Title: ")
+    switched = await agent_ops.switch_frame(manager, "c1", 1, "main", read="interactive")
+    assert switched["status"] == "reset" and switched["page"].startswith("  - link")
+    assert "page" not in await agent_ops.wait_for(manager, "c1", 1, text="Done")
+
+
+async def test_the_page_an_action_hands_back_is_redacted_like_any_read() -> None:
+    driver, manager = _setup()
+    portals = {"acme": PortalCred("acme", "https://acme/", "user1", "s3cret!!")}
+    await agent_ops.login(manager, "c1", "acme", portals)
+    driver.tree = DEFAULT_TREE + '  - textbox "Password" [ref=e3]: s3cret!!\n'
+    driver.page_text_value = "your password is s3cret!!"
+    clicked = await agent_ops.computer(manager, "c1", 1, "left_click", ref="e4", read="all")
+    assert "s3cret!!" not in clicked["text"] and REDACTED in clicked["text"]
+    landed = await agent_ops.navigate(manager, "c1", "https://acme/home", 1, read="text")
+    assert "s3cret!!" not in landed["page"] and REDACTED in landed["page"]

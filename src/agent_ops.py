@@ -8,9 +8,10 @@ FastMCP. Each function takes a :class:`SessionManager`, a ``session_id`` and
 data / raises a domain error the handler maps.
 
 The contract is the Claude-in-Chrome extension's: a mutating action replies
-with what it did plus ONLY what changed (a navigation, a new tab, a dialog) — never the page. The model
-chains ``computer`` + ``read_page`` in one ``browser_batch`` when it wants the
-page back.
+with what it did plus ONLY what changed (a navigation, a new tab, a dialog).
+One addition over the extension: ``read`` on an acting call hands the page
+back in the same reply (:data:`READ_MODES`), because on a large-prompt
+harness the second round trip costs more than the page does.
 """
 
 from __future__ import annotations
@@ -180,14 +181,22 @@ async def tabs_close(manager: SessionManager, session_id: str, tab_id: int) -> d
 
 
 async def navigate(
-    manager: SessionManager, session_id: str, url: str, tab_id: int
+    manager: SessionManager,
+    session_id: str,
+    url: str,
+    tab_id: int | None,
+    *,
+    read: str | None = None,
 ) -> dict[str, Any]:
-    """Open ``url`` in tab ``tab_id`` (``"back"`` / ``"forward"`` walk history).
+    """Open ``url`` in tab ``tab_id`` (``"back"`` / ``"forward"`` walk history);
+    ``None`` is the active tab, so the first call of a chat needs no tab list.
 
     Returns the landed state with ``page_state`` — a wall (challenge, 403,
     429, 5xx) is named in the result itself so the agent never has to infer
     "blocked" from re-reading a challenge page; left to infer it, the model
-    reliably retried the same navigation."""
+    reliably retried the same navigation. With ``read`` the result also
+    carries ``page`` (see :func:`page_after`)."""
+    _check_read_mode(read)
     session = await manager.get_or_create(session_id)
     # A fresh navigation is the user redirecting the agent — it RESUMES
     # control. Clear any pause (a takeover the human never handed back from)
@@ -195,6 +204,8 @@ async def navigate(
     was_paused = session.agent_paused
     session.agent_paused = False
     session.touch(actor="agent")
+    if tab_id is None:
+        tab_id = int(session.driver.active_num())
     if not await session.driver.activate_num(int(tab_id)):
         raise UnknownTabError(
             f"No tab {tab_id} is open in this browser — call tabs_context_mcp to list "
@@ -218,7 +229,7 @@ async def navigate(
     if was_paused:
         await session.broadcast(BrowserAgentState(state="idle", last_actor="agent").to_json())
     changes = [c for c in await driver.settle(marker) if not c.startswith("Page navigated")]
-    return {
+    out = {
         "tabId": int(tab_id),
         "url": nav.get("url", ""),
         "title": nav.get("title", ""),
@@ -226,14 +237,45 @@ async def navigate(
         "page_state": page_state,
         "changes": changes,
     }
+    return await _with_page(out, session, tab_id, read)
 
 
 # --- reading -----------------------------------------------------------------------
 
+# What an acting call may hand back in the SAME reply, so "act, then look" is
+# one round trip instead of two. Under a large harness prompt every saved
+# turn is worth more than any trimming of the page itself (measured
+# 2026-09-17: ~50k cached tokens per turn on Claude Code).
+READ_MODES = ("interactive", "all", "text")
 
-async def read_page(
-    manager: SessionManager,
-    session_id: str,
+
+def _check_read_mode(read: str | None) -> None:
+    if read is not None and read not in READ_MODES:
+        raise ToolInputError(f"read must be one of {', '.join(READ_MODES)} (or omitted)")
+
+
+async def page_after(session: Any, tab_id: int, read: str | None) -> str | None:
+    """The page as ``read`` asks for it — the interactive tree, the whole tree,
+    or the readable text — on the tab an action just acted on; ``None`` when
+    the caller did not ask."""
+    if read is None:
+        return None
+    if read == "text":
+        return await _text_reply(session)
+    return await _tree_reply(session, tab_id, filter=read)
+
+
+async def _with_page(
+    out: dict[str, Any], session: Any, tab_id: int, read: str | None
+) -> dict[str, Any]:
+    page = await page_after(session, tab_id, read)
+    if page is not None:
+        out["page"] = page
+    return out
+
+
+async def _tree_reply(
+    session: Any,
     tab_id: int,
     *,
     filter: str = "interactive",
@@ -242,7 +284,6 @@ async def read_page(
     ref_id: str | None = None,
     boxes: bool = False,
 ) -> str:
-    session = await _on_tab(manager, session_id, tab_id, act=False)
     tree = await session.driver.read_page(depth=depth, boxes=boxes, ref_id=ref_id or None)
     if filter != "all":
         tree = interactive_only(tree)
@@ -259,8 +300,7 @@ async def read_page(
     return body + trailer
 
 
-async def get_page_text(manager: SessionManager, session_id: str, tab_id: int) -> str:
-    session = await _on_tab(manager, session_id, tab_id, act=False)
+async def _text_reply(session: Any) -> str:
     got = await session.driver.page_text()
     text = _redact(session, str(got.get("text", "")))
     total = len(text)
@@ -272,6 +312,28 @@ async def get_page_text(manager: SessionManager, session_id: str, tab_id: int) -
     if cut:
         body += f"\n[truncated at a line boundary: showing {len(body)} of {total} chars]"
     return head + body
+
+
+async def read_page(
+    manager: SessionManager,
+    session_id: str,
+    tab_id: int,
+    *,
+    filter: str = "interactive",
+    depth: int | None = None,
+    max_chars: int = READ_PAGE_MAX_CHARS,
+    ref_id: str | None = None,
+    boxes: bool = False,
+) -> str:
+    session = await _on_tab(manager, session_id, tab_id, act=False)
+    return await _tree_reply(
+        session, tab_id, filter=filter, depth=depth, max_chars=max_chars, ref_id=ref_id, boxes=boxes
+    )
+
+
+async def get_page_text(manager: SessionManager, session_id: str, tab_id: int) -> str:
+    session = await _on_tab(manager, session_id, tab_id, act=False)
+    return await _text_reply(session)
 
 
 async def find(
@@ -378,12 +440,23 @@ async def computer(
     **kw: Any,
 ) -> dict[str, Any]:
     """One tool, thirteen actions. Returns ``{"text": …}`` plus ``"png"``
-    bytes for screenshot/zoom. Mutating actions report only what changed."""
+    bytes for screenshot/zoom. Mutating actions report only what changed —
+    plus the page itself when ``read`` asks for it."""
     if action not in COMPUTER_ACTIONS:
         raise ToolInputError(
             f"unknown computer action {action!r}; one of {', '.join(sorted(COMPUTER_ACTIONS))}"
         )
+    read = kw.get("read")
+    _check_read_mode(read)
     session = await _on_tab(manager, session_id, tab_id, act=action not in _COMPUTER_VIEW_ACTIONS)
+    out = await _computer_action(session, action, kw)
+    page = await page_after(session, tab_id, read)
+    if page is not None:
+        out["text"] = f"{out['text']}\n\n{page}"
+    return out
+
+
+async def _computer_action(session: Any, action: str, kw: Mapping[str, Any]) -> dict[str, Any]:
     driver = session.driver
     ref = str(kw.get("ref") or "") or None
     coordinate = _coordinate(kw.get("coordinate"))
@@ -467,10 +540,17 @@ async def computer(
 
 
 async def form_input(
-    manager: SessionManager, session_id: str, tab_id: int, ref: str, value: str | bool | float
+    manager: SessionManager,
+    session_id: str,
+    tab_id: int,
+    ref: str,
+    value: str | bool | float,
+    *,
+    read: str | None = None,
 ) -> str:
     if not ref:
         raise ToolInputError("form_input needs a ref")
+    _check_read_mode(read)
     session = await _on_tab(manager, session_id, tab_id, act=True)
     marker = session.driver.state_marker()
     note = await session.driver.form_input(ref, value)
@@ -479,7 +559,9 @@ async def form_input(
     if note != "ok":
         did += f" — {note.removeprefix('ok — ')}"
     changes = await session.driver.settle(marker)
-    return "\n".join([did, *changes])
+    reply = "\n".join([did, *changes])
+    page = await page_after(session, tab_id, read)
+    return reply if page is None else f"{reply}\n\n{page}"
 
 
 async def javascript(
@@ -701,7 +783,9 @@ async def wait_for(
     url: str | None = None,
     response: str | None = None,
     timeout_ms: int = 8000,
+    read: str | None = None,
 ) -> dict[str, Any]:
+    _check_read_mode(read)
     session = await _on_tab(manager, session_id, tab_id, act=False)
     ready = await session.driver.wait_for(
         text=text or None,
@@ -710,7 +794,7 @@ async def wait_for(
         response=response or None,
         timeout_ms=int(timeout_ms),
     )
-    return {"ready": ready}
+    return await _with_page({"ready": ready}, session, tab_id, read)
 
 
 async def list_frames(
@@ -721,14 +805,22 @@ async def list_frames(
 
 
 async def switch_frame(
-    manager: SessionManager, session_id: str, tab_id: int, target: str
+    manager: SessionManager,
+    session_id: str,
+    tab_id: int,
+    target: str,
+    *,
+    read: str | None = None,
 ) -> dict[str, Any]:
+    _check_read_mode(read)
     session = await _on_tab(manager, session_id, tab_id, act=False)
     is_reset = (target or "").strip().lower() in ("", "main", "0")
     ok = await session.driver.switch_frame(target)
     if is_reset:
-        return {"status": "reset", "target": target}
-    return {"status": "switched" if ok else "unknown_frame", "target": target}
+        out = {"status": "reset", "target": target}
+    else:
+        out = {"status": "switched" if ok else "unknown_frame", "target": target}
+    return await _with_page(out, session, tab_id, read)
 
 
 async def set_dialog_mode(manager: SessionManager, session_id: str, mode: str) -> dict[str, Any]:
@@ -890,6 +982,9 @@ async def run_recipe(
         try:
             inp = dict(recipes.substitute(step.get("input", {}), params))
             inp.setdefault("tabId", tab_id)
+            # No model reads between recipe steps, and a page-carrying reply
+            # would hide the dict `_step_refusal` judges a step by.
+            inp.pop("read", None)
             if "target" in step:
                 if last_tree is None:
                     raise recipes.RecipeError(

@@ -272,11 +272,12 @@ async def test_text_tools_return_plain_text_not_a_structured_result(fake: FakeDr
     ``str`` return also becomes ``structuredContent {"result": …}`` and the
     client hands the model that JSON — the whole tree quoted and escaped on
     every read (the parity cut's acceptance run). The dict-returning tools keep
-    their structured shape."""
+    their structured shape; a tool that MAY carry a page (``read``) is a text
+    tool for the same reason."""
     tools = {t.name: t for t in await server.mcp.list_tools()}
-    for name in ("read_page", "get_page_text", "find", "form_input"):
+    for name in ("read_page", "get_page_text", "find", "form_input", "navigate", "wait_for"):
         assert tools[name].outputSchema is None, name
-    assert tools["navigate"].outputSchema is not None
+    assert tools["tabs_context_mcp"].outputSchema is not None
     result = await server.mcp.call_tool("get_page_text", {"tabId": 1})
     assert isinstance(result, list)  # content blocks only — no (content, structured) pair
     assert result[0].text.startswith("Title: ")  # type: ignore[union-attr]
@@ -296,3 +297,57 @@ async def test_computer_returns_text_or_text_plus_image(fake: FakeDriver) -> Non
     assert await server.computer("left_click", 1, ref="e1") == "Clicked e1"
     shot = await server.computer("screenshot", 1)
     assert isinstance(shot, list) and isinstance(shot[1], Image)
+
+
+# --- read: the page in the same reply ---------------------------------------------------
+
+READ_TOOLS = {"navigate", "computer", "form_input", "wait_for", "switch_frame"}
+
+
+async def test_exactly_the_acting_tools_take_read_and_every_one_documents_it() -> None:
+    tools = {t.name: t for t in await server.mcp.list_tools()}
+    takes_read = {n for n, t in tools.items() if "read" in t.inputSchema.get("properties", {})}
+    assert takes_read == READ_TOOLS
+    for name in READ_TOOLS:
+        desc = " ".join((tools[name].description or "").split())
+        assert "SAME reply" in desc, name  # the decorator ran BEFORE registration
+        assert '"interactive"' in desc and '"text"' in desc, name
+    assert not tools["navigate"].inputSchema.get("required", []) or "tabId" not in tools[
+        "navigate"
+    ].inputSchema.get("required", [])
+
+
+async def test_navigate_read_renders_the_json_line_then_the_page_as_text(
+    fake: FakeDriver,
+) -> None:
+    bare = await server.navigate("https://x.com/a")
+    assert bare == {
+        "tabId": 1,
+        "url": "https://x.com/a",
+        "title": "Fake",
+        "loaded": True,
+        "page_state": "ok",
+        "changes": [],
+    }
+    result = await server.mcp.call_tool("navigate", {"url": "https://x.com/a", "read": "text"})
+    assert isinstance(result, list)  # content only — never a structured pair
+    text = result[0].text  # type: ignore[union-attr]
+    head, page = text.split("\n\n", 1)
+    assert json.loads(head)["page_state"] == "ok" and "page" not in json.loads(head)
+    assert page.startswith("Title: Fake\nURL: https://x.com/a\n")
+
+
+async def test_read_rides_a_batch_item_and_is_refused_by_name(fake: FakeDriver) -> None:
+    out = await server.browser_batch(
+        [
+            {"name": "mcp__browser__form_input", "input": {"tabId": 1, "ref": "e2", "value": "x"}},
+            {
+                "name": "computer",
+                "input": {"tabId": 1, "action": "key", "text": "Return", "read": "interactive"},
+            },
+        ]
+    )
+    assert out[0] == "#1 form_input:\nSet e2 to 'x'"
+    assert out[1].startswith("#2 computer:\nPressed Return\n\n  - link")
+    with pytest.raises(ToolError, match="read must be one of"):
+        await server.computer("left_click", 1, ref="e1", read="tree")

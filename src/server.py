@@ -33,7 +33,7 @@ import os
 import re
 import time
 from collections.abc import Awaitable, Callable
-from typing import Any
+from typing import Any, TypeVar
 
 import loopwatch
 import toollog
@@ -372,6 +372,33 @@ def _image_result(out: dict[str, Any]) -> Any:
     return [out["text"], Image(data=png, format="png")]
 
 
+_READ_DOC = (
+    "``read`` hands the page back in this SAME reply, saving the round trip of a "
+    'separate read: ``"interactive"`` (what you can click, as read_page), '
+    '``"all"`` (the whole tree) or ``"text"`` (what the page says, as '
+    "get_page_text). Pass it whenever your next step would be to look."
+)
+
+_ToolFn = TypeVar("_ToolFn", bound=Callable[..., Any])
+
+
+def _documents_read(fn: _ToolFn) -> _ToolFn:
+    """Append the ``read`` paragraph to a tool's docstring BEFORE ``mcp.tool``
+    reads it (a ``"…" + X`` expression is not a docstring — ``__doc__`` would be
+    None). One paragraph, five tools, no drift."""
+    fn.__doc__ = f"{fn.__doc__}\n{_READ_DOC}\n"
+    return fn
+
+
+def _render_with_page(out: dict[str, Any]) -> Any:
+    """A dict result that carries ``page`` becomes text — the JSON line, then the
+    page — so the tree is not handed to the model escaped inside a string."""
+    page = out.pop("page", None)
+    if page is None:
+        return out
+    return f"{json.dumps(out, ensure_ascii=False)}\n\n{page}"
+
+
 # --- tabs ---------------------------------------------------------------------------
 
 
@@ -379,8 +406,9 @@ def _image_result(out: dict[str, Any]) -> Any:
 async def tabs_context_mcp(createIfEmpty: bool = False) -> dict[str, Any]:
     """List the browser's open tabs: ``{tabs: [{tabId, url, title, active, loaded}]}``.
 
-    Every other tool names its tab by ``tabId`` — call this first in a chat to
-    learn them. The browser runs server-side; the user watches it live in their
+    Every other tool names its tab by ``tabId``; ``navigate`` without one uses
+    the active tab and returns its id, so a chat that starts by opening a URL
+    does not need this call first. The browser runs server-side; the user watches it live in their
     viewer and can take over at any time. ``loaded`` is False for a tab restored
     from a previous session that has not been opened yet (its URL is real, the
     page loads when you first act on it). ``createIfEmpty`` is accepted for
@@ -407,9 +435,14 @@ async def tabs_close_mcp(tabId: int) -> dict[str, Any]:
 # --- navigation ------------------------------------------------------------------------
 
 
-@mcp.tool()
-async def navigate(url: str, tabId: int, reason: str = "") -> dict[str, Any]:
-    """Navigate tab ``tabId`` to ``url`` (``"back"`` / ``"forward"`` walk history).
+@mcp.tool(structured_output=False)
+@_documents_read
+async def navigate(
+    url: str, tabId: int | None = None, reason: str = "", read: str | None = None
+) -> Any:
+    """Navigate to ``url`` (``"back"`` / ``"forward"`` walk history) in tab
+    ``tabId`` — the active tab when omitted, so this can be your first call.
+    Pass ``read`` to get the landed page back in the same reply (below).
 
     **Not your default way to reach the web.** This spins up a real browser the
     user watches live — heavier and slower than it needs to be for anything that
@@ -431,8 +464,10 @@ async def navigate(url: str, tabId: int, reason: str = "") -> dict[str, Any]:
     ``rate_limited`` (429), ``server_error``, or ``unknown``. Retrying a blocked
     page will not change it — tell the user and suggest they take over in the
     live view, or use another source.
+
     """
-    return await _run(agent_ops.navigate(manager, _session_id(), url, tabId))
+    out = await _run(agent_ops.navigate(manager, _session_id(), url, tabId, read=read))
+    return _render_with_page(out)
 
 
 # --- reading the page ------------------------------------------------------------------
@@ -521,6 +556,7 @@ async def find(tabId: int, query: str) -> str:
 
 
 @mcp.tool()
+@_documents_read
 async def computer(
     action: str,
     tabId: int,
@@ -536,8 +572,10 @@ async def computer(
     duration: float | None = None,
     start_coordinate: list[int] | None = None,
     save_to_disk: bool = False,
+    read: str | None = None,
 ) -> Any:
-    """Act on tab ``tabId`` — every pointer and keyboard action in one tool.
+    """Act on tab ``tabId`` — every pointer and keyboard action in one tool —
+    and, with ``read``, look at the result in the same reply (below).
 
     Actions: ``left_click`` / ``right_click`` / ``double_click`` / ``triple_click``
     (by ``ref`` from read_page/find, or by ``coordinate`` [x, y] in page CSS px;
@@ -557,8 +595,8 @@ async def computer(
     Clicks, typing, keys, drags, hover, scroll and scroll_to act on the page and
     are approved by the user in chat before they run; screenshot, zoom and wait are
     not. A mutating action replies with what it did plus ONLY what changed — a
-    navigation, a new tab, a dialog — never the page: chain it with ``read_page``
-    in one ``browser_batch`` when you want the page back.
+    navigation, a new tab, a dialog — and the page itself only when asked:
+
     """
     out = await _run(
         agent_ops.computer(
@@ -577,6 +615,7 @@ async def computer(
             repeat=repeat,
             duration=duration,
             start_coordinate=start_coordinate,
+            read=read,
         )
     )
     if save_to_disk and out.get("png") is not None:
@@ -587,15 +626,19 @@ async def computer(
 
 
 @mcp.tool(structured_output=False)
-async def form_input(tabId: int, ref: str, value: str | bool | float) -> str:
+@_documents_read
+async def form_input(
+    tabId: int, ref: str, value: str | bool | float, read: str | None = None
+) -> str:
     """Set a form field's value on tab ``tabId``: fill a text field (replacing its
     content), choose a ``<select>`` option by label or value, or check/uncheck a
     box with a boolean. Prefer this over ``computer`` ``type`` for forms. Approved
     in chat. The reply notes when the page reformatted or restricted the value,
     or the field is an autocomplete (read_page and click the suggestion instead
     of pressing Enter).
+
     """
-    return await _run(agent_ops.form_input(manager, _session_id(), tabId, ref, value))
+    return await _run(agent_ops.form_input(manager, _session_id(), tabId, ref, value, read=read))
 
 
 @mcp.tool()
@@ -771,7 +814,8 @@ async def login(portal_id: str, ref: str | None = None, tabId: int | None = None
     )
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False)
+@_documents_read
 async def wait_for(
     tabId: int,
     text: str | None = None,
@@ -779,14 +823,16 @@ async def wait_for(
     url: str | None = None,
     response: str | None = None,
     timeout_ms: int = 8000,
-) -> dict[str, Any]:
+    read: str | None = None,
+) -> Any:
     """Wait until tab ``tabId`` is ready before reading/acting: for ``text`` to
     appear, a CSS ``selector`` to match, the page ``url`` to contain a string
     (after a submit), or a ``response`` whose URL contains a string (an async
     save landing); with none, for the network to go idle. Returns ``{ready}``
     (False on timeout). Not in the extension.
+
     """
-    return await _run(
+    out = await _run(
         agent_ops.wait_for(
             manager,
             _session_id(),
@@ -796,8 +842,10 @@ async def wait_for(
             url=url,
             response=response,
             timeout_ms=int(timeout_ms),
+            read=read,
         )
     )
+    return _render_with_page(out)
 
 
 @mcp.tool()
@@ -823,14 +871,17 @@ async def list_frames(tabId: int) -> list[dict[str, Any]]:
     return await _run(agent_ops.list_frames(manager, _session_id(), tabId))
 
 
-@mcp.tool()
-async def switch_frame(tabId: int, frame: str = "") -> dict[str, Any]:
+@mcp.tool(structured_output=False)
+@_documents_read
+async def switch_frame(tabId: int, frame: str = "", read: str | None = None) -> Any:
     """Choose which frame of tab ``tabId`` ``read_page`` / ``computer`` /
     ``form_input`` act inside — a frame ``index`` or ``name`` from ``list_frames``;
     empty, "main" or "0" resets to the top page. Returns ``{status, target}``:
     ``switched`` / ``reset`` / ``unknown_frame``. Not in the extension.
+
     """
-    return await _run(agent_ops.switch_frame(manager, _session_id(), tabId, frame))
+    out = await _run(agent_ops.switch_frame(manager, _session_id(), tabId, frame, read=read))
+    return _render_with_page(out)
 
 
 @mcp.tool()
@@ -909,8 +960,9 @@ async def browser_batch(actions: list[dict[str, Any]]) -> Any:
     order, screenshots interleaved. Each item carries the SAME approval it would
     standalone, so a batch with a click prompts the user once for the whole set.
 
-    This is the cheap way to act and look: ``[{computer left_click e5},
-    {read_page}]`` clicks and returns the new page in one call.
+    Use it for a SEQUENCE of actions (fill three fields, then submit). To act
+    once and look, pass ``read`` to that one call instead — the same round trip
+    without the list.
     """
     if not isinstance(actions, list) or not actions:
         raise ToolError("browser_batch needs a non-empty actions list of {name, input}")

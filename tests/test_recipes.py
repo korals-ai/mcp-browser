@@ -176,6 +176,18 @@ async def test_runner_resolves_targets_against_its_own_read_page() -> None:
     assert [e["tool"] for e in out["extracted"]] == ["read_page", "get_page_text"]
 
 
+async def test_runner_drops_read_so_a_wall_is_still_judged_by_its_dict() -> None:
+    """No model reads between steps; a stored `read` would turn navigate's
+    reply into text and hide the `page_state` the runner stops on."""
+    calls: list[tuple[str, dict[str, Any]]] = []
+    recipe = recipes.parse(
+        {"steps": [{"name": "navigate", "input": {"url": "https://x", "read": "text"}}]}
+    )
+    out = await agent_ops.run_recipe(recipe, {}, tab_id=1, dispatch=_dispatch(calls))
+    assert out["status"] == "ok"
+    assert calls == [("navigate", {"url": "https://x", "tabId": 1})]
+
+
 async def test_runner_refuses_a_target_before_any_read_page() -> None:
     calls: list[tuple[str, dict[str, Any]]] = []
     recipe = recipes.parse(
