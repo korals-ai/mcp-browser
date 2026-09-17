@@ -184,9 +184,6 @@ async def test_find_falls_to_the_model_tier_on_a_miss() -> None:
     class _Resp:
         status_code = 200
 
-        def raise_for_status(self) -> None:
-            pass
-
         def json(self) -> dict[str, Any]:
             return {
                 "content": [{"type": "text", "text": "e4: the sign-in control\ne77: not real"}],
@@ -202,6 +199,26 @@ async def test_find_falls_to_the_model_tier_on_a_miss() -> None:
     assert "source: model" in out
     assert 'e4: - button "Sign in"' in out and "the sign-in control" in out
     assert "e77" not in out
+
+
+async def test_find_explains_a_failed_model_tier_instead_of_no_match() -> None:
+    _driver, manager = _setup()
+
+    class _Resp:
+        status_code = 429
+
+        def json(self) -> dict[str, Any]:
+            return {"error": {"message": "temporarily rate-limited upstream"}}
+
+    class _Client:
+        async def post(self, url: str, *, json: Any, headers: Any) -> _Resp:
+            return _Resp()
+
+    config = FindConfig(url="https://gw", key="k", model="m")
+    out = await agent_ops.find(manager, "c1", 1, "log me in", config=config, client=_Client())  # type: ignore[arg-type]
+    assert out.startswith("No literal match, and the model tier failed: m is rate-limited")
+    assert "temporarily rate-limited upstream" in out
+    assert "read_page" in out
 
 
 # --- computer -----------------------------------------------------------------------

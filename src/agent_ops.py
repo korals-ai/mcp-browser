@@ -24,7 +24,7 @@ import httpx
 
 from src import recipes
 from src.browser_driver import UnknownTabError
-from src.find_model import FindConfig, find_with_model
+from src.find_model import FindConfig, ModelTierFailed, find_with_model
 from src.portal_creds import PortalCred
 from src.protocol import BrowserAgentState, BrowserNav, BrowserTabs
 from src.refs_tree import (
@@ -299,7 +299,18 @@ async def find(
             "configured). Try other words, or read_page and look yourself."
         )
     known = set(ref_lines(tree))
-    model_hits = await find_with_model(config, tree=tree, query=q, known_refs=known, client=client)
+    try:
+        model_hits = await find_with_model(
+            config, tree=tree, query=q, known_refs=known, client=client
+        )
+    except ModelTierFailed as exc:
+        # An answer, not a tool error: the word match did run and missed, and
+        # the agent can still read_page. "No match" here would claim the model
+        # looked and found nothing.
+        return (
+            f"No literal match, and the model tier failed: {exc} Meanwhile, try other "
+            "words, or read_page and look yourself."
+        )
     if not model_hits:
         return (
             "No match — neither a literal match nor the model found an element for the "

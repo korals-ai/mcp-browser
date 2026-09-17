@@ -199,9 +199,14 @@ small, fast model, not a large one.
   provider it is talking to.
 - **Model.** `anthropic/claude-haiku-4.5` on OpenRouter
   (`claude-haiku-4-5-20251001` on Anthropic) is what `find` is written against.
-  OpenRouter's free models (ids ending `:free`) cost nothing, but they are
-  rate-limited, the list changes, and they have not been measured on `find`
-  here — try one on your own sites before relying on it.
+  OpenRouter's free models (ids ending `:free`) cost nothing. Measured on 16
+  descriptions across 6 public sites (2026-09-17), the free
+  `nvidia/nemotron-3-super-120b-a12b:free` put the right element first
+  **81%** of the time, against Haiku's **88%**, and took a median of 6 s
+  against Haiku's 2 s. About 1 call in 12 failed because the free service was
+  overloaded, and `find` says so when that happens. Free models are
+  rate-limited (a new account gets 50 calls a day), the list changes, and some
+  log prompts for training, so don't send them private pages.
 - **Attribution.** Model calls carry `HTTP-Referer` and `X-OpenRouter-Title`
   headers naming this project, which OpenRouter uses for its public app
   rankings; other providers ignore them. The content sent is the page's
