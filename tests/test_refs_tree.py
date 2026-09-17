@@ -56,6 +56,35 @@ def test_interactive_only_keeps_ref_lines_with_indentation() -> None:
     ]
 
 
+# Real Chromium output (the bench portal's tender list): every node carries a
+# ref, so only the role can tell a control from a cell.
+CHROMIUM_TABLE_TREE = """- generic [active] [ref=f1e1]:
+  - heading "Open tenders" [level=1] [ref=f1e2]
+  - navigation [ref=f1e3]:
+    - link "Home" [ref=f1e4] [cursor=pointer]:
+      - /url: /tenders
+  - textbox "Search title" [ref=f1e24]
+  - button "Search" [ref=f1e25] [cursor=pointer]
+  - paragraph [ref=f1e26]: 60 of 60 tenders
+  - table [ref=f1e27]:
+    - rowgroup [ref=f1e28]:
+      - row "T-2291 CCTV upgrade" [ref=f1e29]:
+        - cell "T-2291" [ref=f1e30]:
+          - link "T-2291" [ref=f1e31] [cursor=pointer]:
+        - cell "CCTV upgrade — Terminal 3" [ref=f1e32]
+        - generic "Details" [ref=f1e33] [cursor=pointer]"""
+
+
+def test_interactive_only_drops_ref_carrying_rows_cells_and_text() -> None:
+    assert interactive_only(CHROMIUM_TABLE_TREE).splitlines() == [
+        '    - link "Home" [ref=f1e4] [cursor=pointer]:',
+        '  - textbox "Search title" [ref=f1e24]',
+        '  - button "Search" [ref=f1e25] [cursor=pointer]',
+        '          - link "T-2291" [ref=f1e31] [cursor=pointer]:',
+        '        - generic "Details" [ref=f1e33] [cursor=pointer]',
+    ]
+
+
 def test_truncate_at_line_cuts_on_a_line_boundary() -> None:
     text = "line one\nline two\nline three"
     body, cut = truncate_at_line(text, 14)

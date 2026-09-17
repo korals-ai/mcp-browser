@@ -58,10 +58,47 @@ def parse_line(line: str) -> dict[str, str | int] | None:
     }
 
 
+# ARIA widget roles, plus iframe so a frame's controls still show where they sit.
+# Selecting by role, not by ref: real Chromium gives EVERY node a ref (rows,
+# cells, generics), so a ref filter kept 87% of a 60-row table page, and the
+# agent paid for every cell on every later turn.
+INTERACTIVE_ROLES = frozenset(
+    {
+        "button",
+        "checkbox",
+        "combobox",
+        "iframe",
+        "link",
+        "listbox",
+        "menuitem",
+        "menuitemcheckbox",
+        "menuitemradio",
+        "option",
+        "radio",
+        "searchbox",
+        "slider",
+        "spinbutton",
+        "switch",
+        "tab",
+        "textbox",
+        "treeitem",
+    }
+)
+
+
+def _is_interactive(line: str) -> bool:
+    node = parse_line(line)
+    if node is None or not node["ref"]:
+        return False
+    return node["role"] in INTERACTIVE_ROLES or "[cursor=pointer]" in line
+
+
 def interactive_only(tree: str) -> str:
-    """Keep the lines that carry a ref (the nodes the agent can act on),
-    with their indentation, so the structure still reads."""
-    return "\n".join(line for line in tree.splitlines() if _REF_RE.search(line))
+    """Keep the nodes the agent can act on — a widget role, or anything the
+    page styles as clickable — with their indentation, so the structure still
+    reads. Text, rows, cells and containers are for ``filter="all"`` or
+    ``get_page_text``."""
+    return "\n".join(line for line in tree.splitlines() if _is_interactive(line))
 
 
 def truncate_at_line(text: str, max_chars: int) -> tuple[str, bool]:

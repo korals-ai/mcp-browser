@@ -463,8 +463,9 @@ async def read_page(
 
     Args:
         tabId: The tab to read.
-        filter: ``"interactive"`` (default) — only nodes with a ref, the things you
-            can act on; ``"all"`` — the whole tree including text, for reading.
+        filter: ``"interactive"`` (default) — only controls you can act on (links,
+            buttons, fields, anything clickable); ``"all"`` — the whole tree
+            including text, rows and cells, for reading.
         depth: Limit nesting depth (a cheap overview of a huge page).
         max_chars: Cap on the reply (default 50000); cut at a line boundary with
             the full size stated.
