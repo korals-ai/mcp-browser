@@ -7,6 +7,7 @@ from typing import Any
 import pytest
 
 from src.find_model import (
+    ANSWER_EXAMPLE,
     APP_TITLE,
     APP_URL,
     FindConfig,
@@ -26,6 +27,29 @@ def test_prompt_carries_query_and_tree_and_the_answer_shape() -> None:
     assert "Query: the go button" in p
     assert "[ref=e1]" in p
     assert "<ref>: <one short reason it matches>" in p
+
+
+def test_parse_answer_reads_refs_in_the_trees_own_notation() -> None:
+    # The shape a real model returned (Claude Haiku through OpenRouter,
+    # 2026-09-16): it copies `[ref=eN]` from the tree it was shown.
+    text = (
+        "[ref=e31]: Primary button to sign in with credentials\n"
+        "[ref=e36]: Button to sign in with Google\n"
+        "ref=e46 — Link to create a new account\n"
+        "`e49`: passkey button\n"
+        "**f2e7**: inside the frame\n"
+        "[ref=e999]: hallucinated"
+    )
+    hits = parse_answer(text, {"e31", "e36", "e46", "e49", "f2e7"})
+    assert [h["ref"] for h in hits] == ["e31", "e36", "e46", "e49", "f2e7"]
+    assert hits[0]["reason"] == "Primary button to sign in with credentials"
+
+
+def test_the_prompts_example_answer_is_one_the_parser_reads() -> None:
+    assert ANSWER_EXAMPLE in build_prompt('- searchbox "Search" [ref=e12]', "search")
+    assert parse_answer(ANSWER_EXAMPLE, {"e12"}) == [
+        {"ref": "e12", "reason": "the search box in the header"}
+    ]
 
 
 def test_parse_answer_keeps_only_refs_that_exist_in_the_tree() -> None:

@@ -24,8 +24,19 @@ import httpx
 log = logging.getLogger("workspace-tool-browser")
 
 # Answer lines look like ``e12: the search box in the header``. Refs may carry
-# a frame prefix (``f3e12``), so the class is wider than ``e\d+``.
-_ANSWER_RE = re.compile(r"^\s*[-*]?\s*(?P<ref>[A-Za-z]+\d+(?:e\d+)?)\s*[:—-]\s*(?P<reason>.+?)\s*$")
+# a frame prefix (``f3e12``), so the class is wider than ``e\d+``. Models copy
+# the tree's own notation back — measured 2026-09-16: Claude Haiku answered
+# ``[ref=e31]: …`` on every line, and a bare-ref-only pattern turned every real
+# answer into "No match" — so the ref may arrive wrapped as ``[ref=e31]``,
+# ``ref=e31``, `` `e31` `` or ``**e31**``.
+_ANSWER_RE = re.compile(
+    r"^\s*[-*]?\s*[\[`*]*\s*(?:ref\s*=\s*)?"
+    r"(?P<ref>[A-Za-z]+\d+(?:e\d+)?)"
+    r"\s*[\]`*]*\s*[:—-]\s*(?P<reason>.+?)\s*$"
+)
+# The one line the prompt shows as the answer's shape; a test holds that the
+# parser reads it, so the instruction and the parser cannot drift apart.
+ANSWER_EXAMPLE = "e12: the search box in the header"
 _MAX_HITS = 20
 _TIMEOUT_S = 20.0
 
@@ -70,6 +81,7 @@ def build_prompt(tree: str, query: str) -> str:
         f"Query: {query}\n\n"
         "Answer with up to 20 lines, best match first, each exactly:\n"
         "<ref>: <one short reason it matches>\n"
+        f"with the bare ref, no brackets, for example:\n{ANSWER_EXAMPLE}\n"
         "Use only refs that appear in the tree. If nothing matches, answer exactly: "
         "NO MATCH, then one line naming the closest candidates.\n\n"
         f"Tree:\n{tree}"
