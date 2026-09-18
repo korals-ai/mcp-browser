@@ -592,6 +592,11 @@ async def computer(
     required, at 2x detail by default). ``save_to_disk`` also writes a
     screenshot/zoom to the workspace and returns the path.
 
+    A page that grows as you scroll (an endless list, a load-more feed) is the
+    one case where scrolling a screen at a time and reading after each is the
+    expensive path: one ``javascript_tool`` call can scroll to the end, wait for
+    the loaded content and return the count or text you need.
+
     Clicks, typing, keys, drags, hover, scroll and scroll_to act on the page and
     are approved by the user in chat before they run; screenshot, zoom and wait are
     not. A mutating action replies with what it did plus ONLY what changed — a

@@ -317,6 +317,15 @@ async def test_exactly_the_acting_tools_take_read_and_every_one_documents_it() -
     ].inputSchema.get("required", [])
 
 
+async def test_computer_steers_a_growing_page_to_javascript_not_scroll_and_read() -> None:
+    # The measured regression: with ``read`` on scroll the model scrolled and
+    # read a screen at a time on an endless list where one JS call was cheaper.
+    tools = {t.name: t for t in await server.mcp.list_tools()}
+    desc = " ".join((tools["computer"].description or "").split())
+    assert "grows as you scroll" in desc
+    assert "javascript_tool" in desc
+
+
 async def test_navigate_read_renders_the_json_line_then_the_page_as_text(
     fake: FakeDriver,
 ) -> None:
