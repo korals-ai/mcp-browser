@@ -16,6 +16,7 @@ harness the second round trip costs more than the page does.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import Awaitable, Callable, Mapping
 from typing import Any
@@ -36,6 +37,7 @@ from src.refs_tree import (
     ref_lines,
     truncate_at_line,
 )
+from src.scroll_hint import format_scroll_hint
 from src.sessions import SessionManager
 
 log = logging.getLogger("workspace-tool-browser")
@@ -336,6 +338,10 @@ async def get_page_text(manager: SessionManager, session_id: str, tab_id: int) -
     return await _text_reply(session)
 
 
+_REFLESS_REREADS = 4
+_REFLESS_REREAD_S = 0.25
+
+
 async def find(
     manager: SessionManager,
     session_id: str,
@@ -353,8 +359,28 @@ async def find(
     session = await _on_tab(manager, session_id, tab_id, act=False)
     tree = _redact(session, await session.driver.read_page())
     hits = literal_matches(tree, q)
+    for _ in range(_REFLESS_REREADS):
+        if not hits or all(hit.get("ref") for hit in hits):
+            break
+        # A row read right after a scroll can come back without a ref
+        # (reproduced 2026-09-18: no ref at once, a ref 0.5s later, the DOM
+        # unchanged in between) — a hit the agent cannot click. Re-read briefly.
+        await asyncio.sleep(_REFLESS_REREAD_S)
+        tree = _redact(session, await session.driver.read_page())
+        hits = literal_matches(tree, q)
     if hits:
         return format_matches(hits, source="literal")
+    # A literal miss is the moment the target may simply be scrolled out of
+    # the tree — say so whatever the model tier answers, since it only ever
+    # sees the same tree (2026-09-18: it picked three wrong folders).
+    answer = await _find_after_literal_miss(tree, q, config=config, client=client)
+    hint = _redact(session, format_scroll_hint(await session.driver.scroll_regions()))
+    return f"{answer}\n\n{hint}"
+
+
+async def _find_after_literal_miss(
+    tree: str, q: str, *, config: FindConfig, client: httpx.AsyncClient | None
+) -> str:
     if not config.enabled:
         return (
             "No match for the query in the page's tree (literal tier; no model tier is "

@@ -53,6 +53,12 @@ class FakeDriver(BrowserDriver):
         self.logins_at: list[tuple[str, str, str]] = []  # (ref, username, password)
         self.login_at_result = True  # fill_login_at return value; tests can flip
         self.evals: list[str] = []
+        self.scroll_region_reads = 0
+        self.scroll_regions_value: dict[str, Any] | None = {
+            "in_main_frame": True,
+            "page": {"pages_above": 0.0, "pages_below": 0.0},
+            "regions": [],
+        }
         self.eval_result: dict[str, Any] = {"result": ""}
         self.page_state = "ok"
         self.type_note = "ok"
@@ -182,6 +188,10 @@ class FakeDriver(BrowserDriver):
 
     async def secret_values(self) -> list[str]:
         return list(self.secrets)
+
+    async def scroll_regions(self) -> dict[str, Any] | None:
+        self.scroll_region_reads += 1
+        return self.scroll_regions_value
 
     async def page_text(self) -> dict[str, Any]:
         return {

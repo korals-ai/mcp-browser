@@ -178,6 +178,65 @@ async def test_find_without_a_model_tier_says_so_on_a_miss() -> None:
         await agent_ops.find(manager, "c1", 1, "  ", config=_NO_MODEL)
 
 
+async def test_find_miss_names_the_scroll_box_the_target_may_hide_in() -> None:
+    driver, manager = _setup()
+    driver.scroll_regions_value = {
+        "in_main_frame": True,
+        "page": {"pages_above": 0.0, "pages_below": 0.0},
+        "regions": [
+            {
+                "label": "div",
+                "pages_above": 0.0,
+                "pages_below": 20.5,
+                "first": "tender-leads",
+                "last": "080.pdf",
+                "on_screen": True,
+                "x": 200,
+                "y": 700,
+            }
+        ],
+    }
+    out = await agent_ops.find(manager, "c1", 1, "skills folder", config=_NO_MODEL)
+    assert "no model tier is configured" in out
+    assert "20.5 pages below — computer scroll at coordinate [200, 700]" in out
+
+
+async def test_find_rereads_a_hit_that_came_back_without_a_ref(monkeypatch: Any) -> None:
+    # Right after a scroll the row is in the tree but without a ref, so the
+    # agent cannot click it; half a second later it has one.
+    driver, manager = _setup('- treeitem "skills Actions for skills" [level=1]\n')
+    monkeypatch.setattr(agent_ops, "_REFLESS_REREAD_S", 0)
+    reads = 0
+    real_read = driver.read_page
+
+    async def settling_read(**kw: Any) -> str:
+        nonlocal reads
+        reads += 1
+        if reads == 3:
+            driver.tree = '- treeitem "skills Actions for skills" [level=1] [ref=f1e9]\n'
+        return await real_read(**kw)
+
+    monkeypatch.setattr(driver, "read_page", settling_read)
+    out = await agent_ops.find(manager, "c1", 1, 'treeitem "skills', config=_NO_MODEL)
+    assert "\nf1e9: " in out and reads == 3
+
+
+async def test_find_gives_up_rereading_and_still_reports_the_refless_hit(
+    monkeypatch: Any,
+) -> None:
+    driver, manager = _setup('- treeitem "skills Actions for skills" [level=1]\n')
+    monkeypatch.setattr(agent_ops, "_REFLESS_REREAD_S", 0)
+    out = await agent_ops.find(manager, "c1", 1, 'treeitem "skills', config=_NO_MODEL)
+    assert "(no ref)" in out
+    assert len(driver.read_pages) == 1 + agent_ops._REFLESS_REREADS
+
+
+async def test_find_hit_does_not_pay_for_a_scroll_measurement() -> None:
+    driver, manager = _setup()
+    await agent_ops.find(manager, "c1", 1, "sign in", config=_NO_MODEL)
+    assert driver.scroll_region_reads == 0
+
+
 async def test_find_falls_to_the_model_tier_on_a_miss() -> None:
     _driver, manager = _setup()
 
@@ -199,6 +258,9 @@ async def test_find_falls_to_the_model_tier_on_a_miss() -> None:
     assert "source: model" in out
     assert 'e4: - button "Sign in"' in out and "the sign-in control" in out
     assert "e77" not in out
+    # Model hits come from the same tree a literal miss just searched, so the
+    # scroll fact rides along — on 2026-09-18 the model's hits were all wrong.
+    assert "Nothing on this page is scrolled out of view" in out
 
 
 async def test_find_explains_a_failed_model_tier_instead_of_no_match() -> None:

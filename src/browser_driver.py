@@ -39,6 +39,7 @@ from src.input_map import to_cdp_command
 from src.keys import to_playwright_combo
 from src.page_state import classify_page_state
 from src.refs_tree import redact_values, refs_in
+from src.scroll_hint import SCROLL_REGIONS_JS
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
@@ -541,6 +542,11 @@ class BrowserDriver(Protocol):
     async def page_text(self) -> dict[str, Any]:
         """``{title, url, source, text}`` — the readable text of the main
         content (article/main first), uncapped."""
+        ...
+
+    async def scroll_regions(self) -> dict[str, Any] | None:
+        """What is scrolled out of view in the active frame — see
+        :mod:`src.scroll_hint`. None when the page could not be measured."""
         ...
 
     async def screenshot(
@@ -2080,6 +2086,14 @@ class PlaywrightDriver:
                 vals = await fr.evaluate(_MASKED_FIELD_VALUES_JS)
                 out.extend(str(v) for v in vals if v)
         return out
+
+    async def scroll_regions(self) -> dict[str, Any] | None:
+        try:
+            raw = await self._active_frame().evaluate(SCROLL_REGIONS_JS)
+        except Exception:
+            log.warning("scroll_regions: measurement failed", exc_info=True)
+            return None
+        return raw if isinstance(raw, dict) else None
 
     async def page_text(self) -> dict[str, Any]:
         raw = await self._active().page.evaluate(_PAGE_TEXT_JS)

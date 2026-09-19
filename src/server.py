@@ -548,6 +548,12 @@ async def find(tabId: int, query: str) -> str:
     ``read_page`` and look yourself. Up to 20 hits as ``ref: role "name"`` lines,
     tagged ``source: literal`` or ``source: model``; the refs are ready to use
     with ``computer``. Cheaper than reading a large page yourself.
+
+    A miss only covers what is RENDERED: long lists often render just the rows
+    in view. So a miss also lists the scroll boxes holding hidden content
+    (pages above/below, what they show now, where to scroll) — when your target
+    plausibly lives in one, scroll it and find again before concluding it is
+    absent. "Nothing … scrolled out of view" means it is not rendered anywhere.
     """
     return await _run(agent_ops.find(manager, _session_id(), tabId, query, config=FIND_CONFIG))
 
