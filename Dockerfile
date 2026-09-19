@@ -77,7 +77,7 @@ COPY --from=py-builder /usr/local/bin /usr/local/bin
 ARG CHROME_FOR_TESTING_VERSION=151.0.7922.47
 RUN playwright install-deps chromium \
  && apt-get update \
- && apt-get install -y --no-install-recommends xvfb xauth unzip curl ca-certificates \
+ && apt-get install -y --no-install-recommends xvfb xauth unzip curl ca-certificates tini \
       fonts-liberation fonts-dejavu-core fonts-noto-core \
  && curl -fsSL -o /tmp/chrome.zip \
       "https://storage.googleapis.com/chrome-for-testing-public/${CHROME_FOR_TESTING_VERSION}/linux64/chrome-linux64.zip" \
@@ -157,4 +157,6 @@ USER tool
 # Headed Chrome needs an X server. The entrypoint starts Xvfb on a fixed display
 # and execs the server (see docker-entrypoint.sh). We do NOT use `xvfb-run` — its
 # --auto-servernum path hangs at container boot as PID 1, wedging the pod at 0/1.
-ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
+# PID 1 drops any signal it has no handler for, so our code never runs as
+# PID 1: tini does, forwarding SIGTERM and reaping orphans.
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/docker-entrypoint.sh"]
